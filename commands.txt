@@ -11,6 +11,10 @@ git add .
 git commit -m "commit"
 git push -u origin main
 
+git add .
+git commit -m "new log"
+git push -u origin main
+
 cd flood_preprototype
 floodenv\Scripts\activate
 pip install -r requirements.txt
