@@ -12,7 +12,7 @@ git commit -m "commit"
 git push -u origin main
 
 git add .
-git commit -m "new log"
+git commit -m "new logs"
 git push -u origin main
 
 cd flood_preprototype

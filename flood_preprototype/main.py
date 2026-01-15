@@ -1,14 +1,22 @@
 import pandas as pd
 from datetime import datetime
+from scripts.eo_downloader import update_eo_data
 
 from models.calibrator import load_thresholds, calibrate_thresholds
 from models.predictor import predict
 from alerts.notifier import notify
+from data.sensor import sensor_data
 
 SENSOR_DATA_PATH = "data/sensor/simulated.csv"
 LOG_PATH = "logs/events.csv"
 
 def main():
+    #for i in range(10):
+    
+    sensor_data.main()
+
+    update_eo_data()
+
     # Load and calibrate thresholds (EO-informed, offline)
     base_thresholds = load_thresholds()
     thresholds = calibrate_thresholds(base_thresholds)
