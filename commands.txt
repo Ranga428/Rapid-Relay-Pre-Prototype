@@ -1,0 +1,12 @@
+python -m venv floodenv
+floodenv\Scripts\activate
+
+pip install numpy pandas scipy scikit-learn
+pip install pyserial matplotlib
+pip install pystac-client rasterio shapely
+
+pip freeze > requirements.txt
+
+git add .
+git commit -m "commit"
+git push -u origin main
