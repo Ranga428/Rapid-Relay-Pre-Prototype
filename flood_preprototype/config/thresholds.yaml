@@ -1,0 +1,4 @@
+base_water_level: 50        # cm
+rainfall_limit: 15          # mm/hr
+humidity_limit: 85          # %
+flood_risk_factor: 1.2
