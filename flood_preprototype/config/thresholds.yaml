@@ -1,4 +1,15 @@
-base_water_level: 50        # cm
-rainfall_limit: 15          # mm/hr
-humidity_limit: 85          # %
-flood_risk_factor: 1.2
+rainfall_mm: 50
+humidity_pct: 85
+water_level_m: 1.5
+flood_index: 0.75
+
+eo:
+  # Threshold above which soil saturation is considered high (0-1)
+  soil_saturation_threshold: 0.7
+  # Flood extent ratio above which extent is considered significant (0-1)
+  flood_extent_threshold: 0.3
+  # Mapping for wetness trend to numeric score (increasing, stable, decreasing)
+  wetness_trend_weights:
+    increasing: 1.0
+    stable: 0.5
+    decreasing: 0.0

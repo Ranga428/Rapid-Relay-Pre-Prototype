@@ -5,7 +5,7 @@ import os
 EO_DIR = "data/sentinel1/"
 COLLECTION = "sentinel-1-grd"
 
-def download_recent_sentinel1(days=0.1, max_items=1):
+def download_recent_sentinel1(days, max_items):
     os.makedirs(EO_DIR, exist_ok=True)
 
     end = datetime.utcnow()
