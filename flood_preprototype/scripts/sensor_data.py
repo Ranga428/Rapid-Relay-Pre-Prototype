@@ -13,8 +13,8 @@ def generate_sensor_data():
         "humidity": humidity
     }
 
-# CSV file to save simulated sensor readings (same folder as this script)
-CSV_PATH = Path(__file__).resolve().parent / "simulated.csv"
+# CSV file to save simulated sensor readings (in project's data/sensor folder)
+CSV_PATH = Path(__file__).resolve().parents[1] / "data" / "sensor" / "simulated.csv"
 
 
 def save_sensor_data(data, file_path=None):
