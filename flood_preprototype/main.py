@@ -5,15 +5,16 @@ from scripts.eo_downloader import update_eo_data
 from models.calibrator import load_thresholds, calibrate_thresholds
 from models.predictor import predict
 from alerts.notifier import notify
-from data.sensor import sensor_data
+from data.sensor import sensor_data as sensor_module
 
 SENSOR_DATA_PATH = "data/sensor/simulated.csv"
 LOG_PATH = "logs/events.csv"
 
 def main():
-    #for i in range(10):
-    
-    sensor_data.main()
+    for i in range(20):
+        d = sensor_module.generate_sensor_data()
+        sensor_module.save_sensor_data(d)
+    print(f"Saved sensor data to {sensor_module.CSV_PATH}")
 
     update_eo_data()
 
@@ -25,25 +26,25 @@ def main():
     df = pd.read_csv(SENSOR_DATA_PATH)
 
     for _, row in df.iterrows():
-        sensor_data = {
+        sensor_record = {
             "timestamp": row["timestamp"],
             "water_level": row["water_level"],
             "rainfall": row["rainfall"],
             "humidity": row["humidity"],
         }
 
-        alert = predict(sensor_data, thresholds)
-        notify(alert, sensor_data)
+        alert = predict(sensor_record, thresholds)
+        notify(alert, sensor_record)
 
-        log_event(sensor_data, alert)
+        log_event(sensor_record, alert)
 
-def log_event(sensor_data, alert):
+def log_event(sensor_record, alert):
     with open(LOG_PATH, "a") as f:
         f.write(
-            f"{sensor_data['timestamp']},"
-            f"{sensor_data['water_level']},"
-            f"{sensor_data['rainfall']},"
-            f"{sensor_data['humidity']},"
+            f"{sensor_record['timestamp']},"
+            f"{sensor_record['water_level']},"
+            f"{sensor_record['rainfall']},"
+            f"{sensor_record['humidity']},"
             f"{alert}\n"
         )
 
