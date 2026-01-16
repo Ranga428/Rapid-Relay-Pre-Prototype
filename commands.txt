@@ -19,3 +19,10 @@ cd flood_preprototype
 floodenv\Scripts\activate
 pip install -r requirements.txt
 python main.py
+
+
+//Run if using different machine//
+python -m venv floodenv
+floodenv\Scripts\activate
+pip install -r requirements.txt
+python main.py
