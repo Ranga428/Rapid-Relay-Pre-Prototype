@@ -1,7 +1,7 @@
 from pathlib import Path
 import yaml
 import csv
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Load thresholds from config/thresholds.yaml relative to the project package root
 _THRESHOLDS_PATH = Path(__file__).resolve().parents[1] / "config" / "thresholds.yaml"
@@ -10,25 +10,35 @@ with _THRESHOLDS_PATH.open("r", encoding="utf-8") as _f:
 
 
 def _parse_iso(iso_str):
-    """Parse ISO 8601 string to datetime, handle Z and +00:00 UTC offsets."""
+    """Parse ISO 8601 string to an aware datetime in UTC.
+
+    Returns None if parsing fails. If the string has no timezone info it is
+    assumed to be UTC.
+    """
     if iso_str is None:
         return None
     try:
         # Replace 'Z' with '+00:00' for consistent parsing
         if iso_str.endswith("Z"):
             iso_str = iso_str[:-1] + "+00:00"
-        return datetime.fromisoformat(iso_str)
+        dt = datetime.fromisoformat(iso_str)
+        # If naive, assume UTC
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        # Convert aware datetimes to UTC
+        return dt.astimezone(timezone.utc)
     except Exception:
         return None
 
 
-def load_eo_features(csv_path=None, match_timestamp=None, n_recent=1, max_delta_seconds=60):
+def load_eo_features(csv_path=None, match_timestamp=None, n_recent=None, max_delta_seconds=60):
     """Load EO features from CSV.
 
-    If match_timestamp is provided (ISO string or datetime), the function will return up to
-    `n_recent` rows closest to that timestamp. Rows within `max_delta_seconds` are preferred;
-    if none fall within the tolerance the nearest rows are returned.
-    If match_timestamp is None, the function returns the last `n_recent` rows (averaged).
+    Behavior changes:
+    - If `n_recent` is None (the default), the function will use the whole CSV when
+      `match_timestamp` is None, or all rows within `max_delta_seconds` when a
+      `match_timestamp` is provided (falls back to nearest rows if none within tol).
+    - If `n_recent` is an int, it behaves as before (selects that many recent/nearest rows).
     """
     if csv_path is None:
         csv_path = Path(__file__).resolve().parents[1] / "data" / "sentinel1" / "eo_features.csv"
@@ -59,46 +69,55 @@ def load_eo_features(csv_path=None, match_timestamp=None, n_recent=1, max_delta_
         })
 
     def select_rows():
-        if match_timestamp:
-            # normalize match_timestamp to datetime
-            if isinstance(match_timestamp, str):
-                try:
-                    target = _parse_iso(match_timestamp)
-                except Exception:
-                    target = None
-            elif isinstance(match_timestamp, datetime):
-                target = match_timestamp
-            else:
+        # If no timestamp provided
+        if not match_timestamp:
+            if n_recent is None:
+                # use whole CSV
+                return rows
+            # else last n_recent rows
+            return rows[-n_recent:]
+
+        # normalize match_timestamp to datetime
+        if isinstance(match_timestamp, str):
+            try:
+                target = _parse_iso(match_timestamp)
+            except Exception:
                 target = None
+        elif isinstance(match_timestamp, datetime):
+            target = match_timestamp
+        else:
+            target = None
 
-            if target is None:
-                return rows[-n_recent:]
+        if target is None:
+            # fallback to last n_recent or all
+            return rows if n_recent is None else rows[-n_recent:]
 
-            # compute delta for rows with timestamps
-            rows_with_delta = []
-            for r in rows:
-                if r["timestamp"] is None:
-                    continue
-                delta = abs((r["timestamp"] - target).total_seconds())
-                rows_with_delta.append((delta, r))
+        # compute delta for rows with timestamps
+        rows_with_delta = []
+        for r in rows:
+            if r["timestamp"] is None:
+                continue
+            delta = abs((r["timestamp"] - target).total_seconds())
+            rows_with_delta.append((delta, r))
 
-            if not rows_with_delta:
-                return rows[-n_recent:]
+        if not rows_with_delta:
+            return rows if n_recent is None else rows[-n_recent:]
 
-            # Prefer rows within tolerance
+        # If n_recent is None - prefer all rows within tolerance, otherwise use nearest n
+        if n_recent is None:
             within_tol = [r for d, r in rows_with_delta if d <= max_delta_seconds]
             if within_tol:
-                # sort by proximity and return up to n_recent
+                # sort by proximity
                 within_with_delta = [(d, r) for d, r in rows_with_delta if d <= max_delta_seconds]
                 within_with_delta.sort(key=lambda x: x[0])
-                return [r for _, r in within_with_delta[:n_recent]]
-
-            # fallback: return nearest rows by delta
+                return [r for _, r in within_with_delta]
+            # fallback: return all rows sorted by proximity
             rows_with_delta.sort(key=lambda x: x[0])
-            return [r for _, r in rows_with_delta[:n_recent]]
-        else:
-            # last N rows
-            return rows[-n_recent:]
+            return [r for _, r in rows_with_delta]
+
+        # n_recent is an int -> return nearest n_recent rows
+        rows_with_delta.sort(key=lambda x: x[0])
+        return [r for _, r in rows_with_delta[:n_recent]]
 
     chosen = select_rows()
     if not chosen:
@@ -176,6 +195,24 @@ def load_latest_eo_features(csv_path=None):
     }
 
 
+def compute_alert_level(flood_risk, thresholds=thresholds):
+    """Map flood_risk (0-1) to an alert level string.
+
+    Uses thresholds from config if available, otherwise defaults:
+      - RED: risk >= 0.75
+      - YELLOW: 0.4 <= risk < 0.75
+      - GREEN: risk < 0.4
+    """
+    red_th = thresholds.get("alert_red", 0.75)
+    yellow_th = thresholds.get("alert_yellow", 0.4)
+
+    if flood_risk >= red_th:
+        return "RED"
+    if flood_risk >= yellow_th:
+        return "YELLOW"
+    return "GREEN"
+
+
 def compute_flood_risk(sensor_data, eo_features=None, thresholds=thresholds):
     """
     Combines real-time sensor data with EO-derived context
@@ -183,11 +220,14 @@ def compute_flood_risk(sensor_data, eo_features=None, thresholds=thresholds):
 
     If `eo_features` is not provided, the function will attempt to load
     EO features from `data/sentinel1/eo_features.csv` matching sensor timestamp
-    (if available) or the most recent entry.
+    (if available) or aggregate the whole file.
     """
-    # If EO features not supplied, try to match by sensor timestamp
+    # If EO features not supplied, try to match by sensor timestamp and aggregate
     if eo_features is None:
-        eo_features = load_eo_features(match_timestamp=sensor_data.get("timestamp"), n_recent=1)
+
+        # Previously matched by sensor timestamp which often returned just the latest row.
+        # Use the whole CSV by default so EO statistics reflect the dataset rather than a single row.
+        eo_features = load_eo_features(match_timestamp=None, n_recent=None)
 
     # -------------------------
     # 1. Sensor-based baseline
@@ -247,4 +287,228 @@ def compute_flood_risk(sensor_data, eo_features=None, thresholds=thresholds):
     # contribute equally (adjust weights here if needed)
     flood_risk = min(0.5 * sensor_index + 0.5 * eo_index, 1.0)
 
-    return flood_risk
+    # Normalize/prepare final sensor record (ensure timestamp parsed if possible)
+    final_sensor = dict(sensor_data)
+    try:
+        parsed_ts = _parse_iso(sensor_data.get("timestamp"))
+        final_sensor["timestamp"] = parsed_ts.isoformat() if parsed_ts is not None else sensor_data.get("timestamp")
+    except Exception:
+        final_sensor["timestamp"] = sensor_data.get("timestamp")
+
+    # Prepare final EO features used in the decision (use values extracted above)
+    final_eo = {
+        "soil_saturation": soil,
+        "flood_extent": flood,
+        "wetness_trend": trend,
+    }
+
+    # return structured result with all finalized data; no printing here
+    return {
+        "flood_risk": flood_risk,
+        "alert_level": compute_alert_level(flood_risk, thresholds),
+        "eo_features": final_eo,
+        "sensor_record": final_sensor,
+    }
+
+
+def log_event(result=None, log_path=None, sensor_csv=None, eo_csv=None):
+    """Create a merged events CSV using all rows from the sensor and EO CSVs.
+
+    - If called during runtime with a single `result` (previous behaviour), this
+      function will still produce the merged CSV (it reads the source CSVs) so
+      the `result` parameter is optional and ignored for merging.
+    - Matching is done only on exact timestamp string (normalized to ISO when
+      possible). If a timestamp exists only in one file the other columns are
+      left blank for that row.
+    """
+    # defaults for source CSVs
+    if sensor_csv is None:
+        sensor_csv = Path(__file__).resolve().parents[1] / "data" / "sensor" / "simulated.csv"
+    else:
+        sensor_csv = Path(sensor_csv)
+    if eo_csv is None:
+        eo_csv = Path(__file__).resolve().parents[1] / "data" / "sentinel1" / "eo_features.csv"
+    else:
+        eo_csv = Path(eo_csv)
+
+    if log_path is None:
+        log_path = Path(__file__).resolve().parents[1] / "logs" / "events.csv"
+    else:
+        log_path = Path(log_path)
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # helper to read CSV and normalize timestamps
+    def _read_rows(path):
+        rows = []
+        if not path.exists():
+            return rows
+        with path.open("r", encoding="utf-8") as f:
+            reader = list(csv.DictReader(f))
+        for i, r in enumerate(reader):
+            raw_ts = r.get("timestamp") or r.get("Timestamp") or ""
+            parsed = _parse_iso(raw_ts)
+            iso_ts = parsed.isoformat() if parsed is not None else raw_ts
+            rows.append({"raw": r, "iso_ts": iso_ts, "parsed": parsed, "index": i})
+        return rows
+
+    sensor_rows = _read_rows(sensor_csv)
+    eo_rows = _read_rows(eo_csv)
+
+    # build maps keyed by iso_ts (exact match). If iso_ts is empty string still use it as key
+    sensor_map = {r["iso_ts"]: r for r in sensor_rows}
+    eo_map = {r["iso_ts"]: r for r in eo_rows}
+
+    # union of keys
+    keys = set(sensor_map.keys()) | set(eo_map.keys())
+
+    # sort keys: parsed datetimes first (by value), then the rest by string
+    def _key_sort(k):
+        s = sensor_map.get(k) or eo_map.get(k)
+        dt = s.get("parsed") if s is not None else None
+        return (0, dt) if dt is not None else (1, k)
+
+    sorted_keys = sorted(keys, key=_key_sort)
+
+    fieldnames = [
+        "timestamp",
+        "warning_level",
+        "water_level",
+        "rainfall",
+        "humidity",
+        "soil_saturation",
+        "flood_extent",
+        "wetness_trend",
+        "risk",
+    ]
+
+    # write merged CSV (overwrite to keep consistent view)
+    with log_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for k in sorted_keys:
+            srow = sensor_map.get(k)
+            erow = eo_map.get(k)
+
+            # prepare sensor values (convert where possible)
+            if srow:
+                sraw = srow["raw"]
+                try:
+                    water = float(sraw.get("water_level") or sraw.get("water") or "")
+                except Exception:
+                    water = ""
+                try:
+                    rainfall = float(sraw.get("rainfall") or "")
+                except Exception:
+                    rainfall = ""
+                try:
+                    humidity = float(sraw.get("humidity") or "")
+                except Exception:
+                    humidity = ""
+                sensor_data = {
+                    "timestamp": k,
+                    "water_level": water if water != "" else None,
+                    "rainfall": rainfall if rainfall != "" else None,
+                    "humidity": humidity if humidity != "" else None,
+                }
+            else:
+                sensor_data = None
+
+            # prepare eo values
+            if erow:
+                eraw = erow["raw"]
+                def _f(x):
+                    try:
+                        return float(x)
+                    except Exception:
+                        return None
+                soil = _f(eraw.get("soil_saturation"))
+                flood = _f(eraw.get("flood_extent"))
+                try:
+                    trend = int(float(eraw.get("wetness_trend")))
+                except Exception:
+                    trend = None
+                eo_data = {"soil_saturation": soil, "flood_extent": flood, "wetness_trend": trend}
+            else:
+                eo_data = None
+
+            # compute risk only if sensor data present
+            if sensor_data is not None:
+                # when eo_data is None, compute_flood_risk will load EO by default, but we pass eo_data so none is used
+                res = compute_flood_risk({
+                    "timestamp": sensor_data["timestamp"],
+                    "water_level": sensor_data["water_level"] if sensor_data["water_level"] is not None else 0.0,
+                    "rainfall": sensor_data["rainfall"] if sensor_data["rainfall"] is not None else 0.0,
+                    "humidity": sensor_data["humidity"] if sensor_data["humidity"] is not None else 0.0,
+                }, eo_features=eo_data, thresholds=thresholds)
+                level = res.get("alert_level")
+                risk = res.get("flood_risk")
+            else:
+                level = ""
+                risk = ""
+
+            out = {
+                "timestamp": k,
+                "warning_level": level or "",
+                "water_level": sensor_data["water_level"] if sensor_data is not None and sensor_data.get("water_level") is not None else "",
+                "rainfall": sensor_data["rainfall"] if sensor_data is not None and sensor_data.get("rainfall") is not None else "",
+                "humidity": sensor_data["humidity"] if sensor_data is not None and sensor_data.get("humidity") is not None else "",
+                "soil_saturation": eo_data["soil_saturation"] if eo_data is not None and eo_data.get("soil_saturation") is not None else "",
+                "flood_extent": eo_data["flood_extent"] if eo_data is not None and eo_data.get("flood_extent") is not None else "",
+                "wetness_trend": eo_data["wetness_trend"] if eo_data is not None and eo_data.get("wetness_trend") is not None else "",
+                "risk": risk if risk != "" else "",
+            }
+
+            writer.writerow(out)
+
+
+def main(count: int = 20, delay: float = 0.0):
+    """Run a minimal end-to-end flow using the project's sensor and EO scripts.
+
+    - Generates `count` synchronized sensor + EO rows (same ISO timestamp).
+    - Rebuilds the merged `logs/events.csv` by calling `log_event()`.
+    - Prints a short summary and the path to the events file.
+    """
+    # import here to avoid circular imports at module import time
+    try:
+        from scripts import sensor_data as sensor_module
+        from scripts import eo_features as eo_module
+    except Exception:
+        # best-effort fallback for different import contexts
+        import scripts.sensor_data as sensor_module  # type: ignore
+        import scripts.eo_features as eo_module  # type: ignore
+
+    import time
+
+    for i in range(count):
+        ts = datetime.now(timezone.utc).isoformat()
+        # call generator in a backward-compatible way: prefer timestamp kw, fall back
+        try:
+            s = sensor_module.generate_sensor_data(timestamp=ts)
+        except TypeError:
+            # older signature: no timestamp arg
+            s = sensor_module.generate_sensor_data()
+            # ensure returned dict carries the timestamp
+            if isinstance(s, dict) and not s.get("timestamp"):
+                s["timestamp"] = ts
+        # save sensor row (save_sensor_data will use provided timestamp if present)
+        sensor_module.save_sensor_data(s)
+        # EO generator — try to pass timestamp, but tolerate older signatures
+        try:
+            eo_module.extract_eo_features(save_csv=True, timestamp=ts)
+        except TypeError:
+            # fallback older signature without timestamp
+            eo_module.extract_eo_features(save_csv=True)
+        if delay and i + 1 < count:
+            time.sleep(delay)
+
+    # rebuild merged events.csv
+    log_event()
+
+    events_path = Path(__file__).resolve().parents[1] / "logs" / "events.csv"
+    print(f"Completed: generated {count} synchronized rows and wrote {events_path}")
+
+
+if __name__ == "__main__":
+    main()

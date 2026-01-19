@@ -2,6 +2,7 @@ import random
 import csv
 from pathlib import Path
 from datetime import datetime, timezone
+import pandas as pd
 
 def generate_sensor_data():
     water_level = random.uniform(20, 80)
@@ -41,6 +42,41 @@ def save_sensor_data(data, file_path=None):
             writer.writeheader()
         writer.writerow(row)
 
+
+def load_sensor_records(file_path=None):
+    """Read simulated sensor CSV and return a list of normalized sensor_record dicts.
+
+    Normalizes column names (strip/lower), fills missing columns with defaults and
+    converts numeric fields to floats.
+    """
+    if file_path is None:
+        file_path = CSV_PATH
+    else:
+        file_path = Path(file_path)
+
+    # If file missing, return empty list
+    if not Path(file_path).exists():
+        return []
+
+    df = pd.read_csv(file_path)
+    # Normalize column names
+    df.columns = df.columns.str.strip().str.lower()
+
+    # Ensure expected columns exist
+    for col in ("timestamp", "water_level", "rainfall", "humidity"):
+        if col not in df.columns:
+            df[col] = None
+
+    records = []
+    for _, row in df.iterrows():
+        records.append({
+            "timestamp": row.get("timestamp"),
+            "water_level": float(row.get("water_level") or 0),
+            "rainfall": float(row.get("rainfall") or 0),
+            "humidity": float(row.get("humidity") or 0),
+        })
+
+    return records
 
 if __name__ == "__main__":
     d = generate_sensor_data()
