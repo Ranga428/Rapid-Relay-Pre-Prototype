@@ -4,22 +4,27 @@ from pathlib import Path
 from datetime import datetime, timezone
 import pandas as pd
 
-def generate_sensor_data():
+def generate_sensor_data(timestamp=None):
+    """Generate a sensor data dict. If `timestamp` (ISO string) is provided it will
+    be included in the returned dict so callers can synchronize rows across files.
+    """
     water_level = random.uniform(20, 80)
     rainfall = random.uniform(0, 30)
     humidity = random.uniform(50, 98)
     return {
+        "timestamp": timestamp,
         "water_level": water_level,
         "rainfall": rainfall,
         "humidity": humidity
     }
 
-def extract_eo_features(save_csv=True):
-    """
-    Placeholder EO-derived indicators (replace later with real EO analytics).
 
-    Generates soil_saturation, flood_extent and wetness_trend and optionally
-    appends them to the project's EO CSV using the same pattern as sensor_data.
+def extract_eo_features(save_csv=True, timestamp=None):
+    """
+    Placeholder EO-derived indicators.
+
+    If `timestamp` is provided (ISO string) it will be used for the row so the
+    caller can produce synchronized sensor + EO rows.
     """
 
     # Generate random proxies
@@ -28,7 +33,7 @@ def extract_eo_features(save_csv=True):
     wetness_trend = random.choice([-1, 0, 1])
 
     features = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
         "soil_saturation": soil_saturation_index,
         "flood_extent": flood_extent_ratio,
         "wetness_trend": wetness_trend,
@@ -65,7 +70,10 @@ def _ensure_trailing_newline(path: Path):
 
 
 def save_sensor_data(data, file_path=None):
-    """Append a sensor data dict to CSV. Writes header if file is new or empty."""
+    """Append a sensor data dict to CSV. Writes header if file is new or empty.
+
+    If `data` contains a `timestamp` it will be used; otherwise current UTC time will be added.
+    """
     if file_path is None:
         file_path = sensor_CSV_PATH
     file_path = Path(file_path)
@@ -74,9 +82,11 @@ def save_sensor_data(data, file_path=None):
     fieldnames = ["timestamp", "water_level", "rainfall", "humidity"]
     write_header = not file_path.exists() or file_path.stat().st_size == 0
 
-    # Ensure values include a timestamp and are numeric-friendly
+    # Use provided timestamp if present otherwise generate one now
+    ts = data.get("timestamp") or datetime.now(timezone.utc).isoformat()
+
     row = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": ts,
         "water_level": round(float(data.get("water_level", 0)), 3),
         "rainfall": round(float(data.get("rainfall", 0)), 3),
         "humidity": round(float(data.get("humidity", 0)), 3)
@@ -178,12 +188,27 @@ def load_eo_records(file_path=None):
             })
     return sentinel_records
 
+def try_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
+def try_int(x):
+    try:
+        return int(float(x))
+    except Exception:
+        return None
+
 def main():
-    d = generate_sensor_data()
+    # create a single synchronized timestamp and use it for both outputs
+    common_ts = datetime.now(timezone.utc).isoformat()
+    d = generate_sensor_data(timestamp=common_ts)
     save_sensor_data(d)
     print(f"Saved sensor data to {sensor_CSV_PATH}: {d}")
 
-    f = extract_eo_features(save_csv=True)
+    f = extract_eo_features(save_csv=True, timestamp=common_ts)
     print(f"Saved EO features to {sentinel_CSV_PATH}: {f}")
 
 if __name__ == "__main__":

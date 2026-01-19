@@ -346,10 +346,18 @@ def log_event(result=None, log_path=None, sensor_csv=None, eo_csv=None):
         with path.open("r", encoding="utf-8") as f:
             reader = list(csv.DictReader(f))
         for i, r in enumerate(reader):
-            raw_ts = r.get("timestamp") or r.get("Timestamp") or ""
-            parsed = _parse_iso(raw_ts)
-            iso_ts = parsed.isoformat() if parsed is not None else raw_ts
-            rows.append({"raw": r, "iso_ts": iso_ts, "parsed": parsed, "index": i})
+            # Accept multiple possible timestamp column names and strip values
+            raw_ts = (r.get("timestamp") or r.get("Timestamp") or r.get("time") or r.get("ts") or "").strip()
+            # if the CSV writer accidentally wrote empty strings, normalize to empty
+            if raw_ts == "":
+                parsed = None
+                iso_ts = ""
+            else:
+                parsed = _parse_iso(raw_ts)
+                iso_ts = parsed.isoformat() if parsed is not None else raw_ts
+            # normalize numeric fields to stripped strings (we'll parse later)
+            normalized_raw = {k: (v.strip() if isinstance(v, str) else v) for k, v in r.items()}
+            rows.append({"raw": normalized_raw, "iso_ts": iso_ts, "parsed": parsed, "index": i})
         return rows
 
     sensor_rows = _read_rows(sensor_csv)
@@ -463,51 +471,32 @@ def log_event(result=None, log_path=None, sensor_csv=None, eo_csv=None):
             writer.writerow(out)
 
 
-def main(count: int = 20, delay: float = 0.0):
-    """Run a minimal end-to-end flow using the project's sensor and EO scripts.
+def main(sensor_csv: str | None = None, eo_csv: str | None = None, log_path: str | None = None):
+    """Process existing sensor and EO CSVs and produce the merged events CSV.
 
-    - Generates `count` synchronized sensor + EO rows (same ISO timestamp).
-    - Rebuilds the merged `logs/events.csv` by calling `log_event()`.
-    - Prints a short summary and the path to the events file.
+    This function does NOT generate data. It reads the supplied CSV paths (or
+    defaults under data/) and calls `log_event` to produce the merged output.
     """
-    # import here to avoid circular imports at module import time
-    try:
-        from scripts import sensor_data as sensor_module
-        from scripts import eo_features as eo_module
-    except Exception:
-        # best-effort fallback for different import contexts
-        import scripts.sensor_data as sensor_module  # type: ignore
-        import scripts.eo_features as eo_module  # type: ignore
+    # Resolve default paths if not provided
+    if sensor_csv is None:
+        sensor_csv = Path(__file__).resolve().parents[1] / "data" / "sensor" / "simulated.csv"
+    else:
+        sensor_csv = Path(sensor_csv)
 
-    import time
+    if eo_csv is None:
+        eo_csv = Path(__file__).resolve().parents[1] / "data" / "sentinel1" / "eo_features.csv"
+    else:
+        eo_csv = Path(eo_csv)
 
-    for i in range(count):
-        ts = datetime.now(timezone.utc).isoformat()
-        # call generator in a backward-compatible way: prefer timestamp kw, fall back
-        try:
-            s = sensor_module.generate_sensor_data(timestamp=ts)
-        except TypeError:
-            # older signature: no timestamp arg
-            s = sensor_module.generate_sensor_data()
-            # ensure returned dict carries the timestamp
-            if isinstance(s, dict) and not s.get("timestamp"):
-                s["timestamp"] = ts
-        # save sensor row (save_sensor_data will use provided timestamp if present)
-        sensor_module.save_sensor_data(s)
-        # EO generator — try to pass timestamp, but tolerate older signatures
-        try:
-            eo_module.extract_eo_features(save_csv=True, timestamp=ts)
-        except TypeError:
-            # fallback older signature without timestamp
-            eo_module.extract_eo_features(save_csv=True)
-        if delay and i + 1 < count:
-            time.sleep(delay)
+    if log_path is None:
+        log_path = Path(__file__).resolve().parents[1] / "logs" / "events.csv"
+    else:
+        log_path = Path(log_path)
 
-    # rebuild merged events.csv
-    log_event()
+    # Perform processing (log_event will read the CSVs and write merged CSV)
+    log_event(result=None, log_path=log_path, sensor_csv=sensor_csv, eo_csv=eo_csv)
 
-    events_path = Path(__file__).resolve().parents[1] / "logs" / "events.csv"
-    print(f"Completed: generated {count} synchronized rows and wrote {events_path}")
+    print(f"Processed sensor='{sensor_csv}' eo='{eo_csv}' -> merged events at '{log_path}'")
 
 
 if __name__ == "__main__":
