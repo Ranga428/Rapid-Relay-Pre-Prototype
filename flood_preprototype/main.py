@@ -11,7 +11,7 @@ def main():
     # -------------------------
     # 1. Generate mock data
     # -------------------------
-    for _ in range(20):
+    for _ in range(10):
         generate_mock_data.main()
 
     # -------------------------
