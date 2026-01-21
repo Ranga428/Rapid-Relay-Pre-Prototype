@@ -1,0 +1,42 @@
+version: "3"
+
+services:
+  postgres:
+    image: postgres:14
+    environment:
+      POSTGRES_USER: chirpstack
+      POSTGRES_PASSWORD: chirpstack
+      POSTGRES_DB: chirpstack
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chirpstack"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+
+  mosquitto:
+    image: eclipse-mosquitto
+    ports:
+      - "1883:1883"
+
+  chirpstack:
+    image: chirpstack/chirpstack:latest
+    command: -c /config
+    volumes:
+      - ./config:/config
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      mosquitto:
+        condition: service_started
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+
+

@@ -1,0 +1,22 @@
+[server]
+bind = "0.0.0.0:8080"
+
+[postgresql]
+dsn = "postgres://chirpstack:chirpstack@postgres/chirpstack?sslmode=disable"
+
+[redis]
+servers = [
+  "redis://redis:6379"
+]
+
+[mqtt]
+server = "tcp://mosquitto:1883"
+
+[network]
+net_id = "000000"
+
+[regional]
+enabled_regions = ["as923"]
+
+[regional.as923]
+gateway.force_gws_private = false
