@@ -4,6 +4,7 @@
 pip install numpy pandas scipy scikit-learn
 pip install pyserial matplotlib
 pip install pystac-client rasterio shapely
+pip install sentinelsat rasterio numpy geopandas shapely scikit-image
 
 # Save dependencies to txt file
 pip freeze > requirements.txt
