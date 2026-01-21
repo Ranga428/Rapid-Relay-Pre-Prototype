@@ -1,28 +1,38 @@
-python -m venv floodenv
-floodenv\Scripts\activate
+### Git Commands ###
 
+# Dependencies
 pip install numpy pandas scipy scikit-learn
 pip install pyserial matplotlib
 pip install pystac-client rasterio shapely
 
+# Save dependencies to txt file
 pip freeze > requirements.txt
 
+# Push to Repository v1
 git add .
 git commit -m "commit"
 git push -u origin main
 
+# Push to Repository v2
 git add .
 git commit -m "new logs"
 git push -u origin main
 
-cd flood_preprototype
-floodenv\Scripts\activate
-pip install -r requirements.txt
-python main.py
-
-
-//Run if using different machine//
+# Run at start of every "Git Clone"
 python -m venv floodenv
 floodenv\Scripts\activate
 pip install -r requirements.txt
 python main.py
+
+
+### Docker Commands ###
+
+# Start
+docker compose up -d
+
+# Restart
+docker compose down
+docker compose up -d
+
+# Check Logs
+docker compose logs chirpstack --tail=100
