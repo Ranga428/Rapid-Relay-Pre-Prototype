@@ -1,39 +1,49 @@
 ### Git Commands ###
 
-# Dependencies
-pip install numpy pandas scipy scikit-learn
-pip install pyserial matplotlib
-pip install pystac-client rasterio shapely
-pip install sentinelsat rasterio numpy geopandas shapely scikit-image
+    # Push to Repository v1
+        git add .
+        git commit -m "commit"
+        git push -u origin main
 
-# Save dependencies to txt file
-pip freeze > requirements.txt
+    # Push to Repository v2
+        git add .
+        git commit -m "new logs"
+        git push -u origin main
 
-# Push to Repository v1
-git add .
-git commit -m "commit"
-git push -u origin main
 
-# Push to Repository v2
-git add .
-git commit -m "new logs"
-git push -u origin main
+### Setup Commands ###
 
-# Run at start of every "Git Clone"
-python -m venv floodenv
-floodenv\Scripts\activate
-pip install -r requirements.txt
-python main.py
+    # Dependencies
+        pip install numpy pandas scipy scikit-learn
+        pip install pyserial matplotlib
+        pip install pystac-client rasterio shapely
+        pip install sentinelsat rasterio numpy geopandas shapely scikit-image
+        pip install gdal==3.6.4
 
+    # Save dependencies to txt file
+        pip freeze > requirements.txt
+
+    # Run at start of every "Git Clone"
+        python -m venv floodenv
+        floodenv\Scripts\activate
+        pip install -r requirements.txt
+        python main.py
+
+    # GDAL Dependecy in Windows
+        https://github.com/cgohlke/geospatial-wheels/releases/download/v2025.10.25/gdal-3.11.4-cp311-cp311-win_amd64.whl
+
+        # In venv
+            pip install "C:\Users\jenel\Downloads\gdal-3.11.4-cp312-cp312-win_amd64.whl"
 
 ### Docker Commands ###
 
-# Start
-docker compose up -d
+    # Start
+        docker compose up -d
 
-# Restart
-docker compose down
-docker compose up -d
+    # Restart
+        docker compose down
+        docker compose up -d
 
-# Check Logs
-docker compose logs chirpstack --tail=100
+    # Check Logs
+        docker compose logs chirpstack --tail=100
+
