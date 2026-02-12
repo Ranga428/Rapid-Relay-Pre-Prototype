@@ -203,13 +203,10 @@ def try_int(x):
 
 def main():
     # create a single synchronized timestamp and use it for both outputs
-    common_ts = datetime.now(timezone.utc).isoformat()
+    common_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     d = generate_sensor_data(timestamp=common_ts)
     save_sensor_data(d)
     print(f"Saved sensor data to {sensor_CSV_PATH}: {d}")
-
-    f = extract_eo_features(save_csv=True, timestamp=common_ts)
-    print(f"Saved EO features to {sentinel_CSV_PATH}: {f}")
 
 if __name__ == "__main__":
     main()

@@ -6,6 +6,7 @@ from models import predictor
 from alerts.notifier import notify
 from models.calibrator import load_thresholds
 from scripts import generate_mock_data
+from scripts import sentinel1_GEE
 
 def main():
     # -------------------------
@@ -17,7 +18,7 @@ def main():
     # -------------------------
     # 2. EO ingestion (offline / contextual)
     # -------------------------
-    download_recent_sentinel1(days=0.15, max_items=1)
+    sentinel1_GEE.main()
 
     # -------------------------
     # 3. Load base thresholds
