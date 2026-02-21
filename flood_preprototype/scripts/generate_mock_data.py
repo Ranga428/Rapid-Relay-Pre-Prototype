@@ -202,8 +202,14 @@ def try_int(x):
         return None
 
 def main():
-    # create a single synchronized timestamp and use it for both outputs
-    common_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now = datetime.now(timezone.utc)
+    # Round down to nearest 15-minute interval
+    rounded = now.replace(
+        minute=(now.minute // 15) * 15,
+        second=0,
+        microsecond=0
+    )
+    common_ts = rounded.strftime("%Y-%m-%dT%H:%M:%SZ")
     d = generate_sensor_data(timestamp=common_ts)
     save_sensor_data(d)
     print(f"Saved sensor data to {sensor_CSV_PATH}: {d}")

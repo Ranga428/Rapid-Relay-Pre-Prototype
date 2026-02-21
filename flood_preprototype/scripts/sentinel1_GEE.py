@@ -288,10 +288,22 @@ def export_timeseries_to_csv(collection, aoi, output_file):
     results = []
     for feature in feature_list:
         props = feature['properties']
+        soil_sat = round(float(props.get('soil_saturation', 0)), 2)
+        flood_ext = round(float(props.get('flood_extent', 0)), 2)
+
+        # Flood label thresholding
+        if flood_ext >= 0.05:
+            label = 1
+        elif flood_ext >= 0.03 and soil_sat >= 0.45:
+            label = 1
+        else:
+            label = 0
+
         results.append({
             'timestamp': props['timestamp'] + 'T00:00:00Z',
-            'soil_saturation': round(float(props.get('soil_saturation', 0)), 2),
-            'flood_extent': round(float(props.get('flood_extent', 0)), 2)
+            'soil_saturation': soil_sat,
+            'flood_extent': flood_ext,
+            'flood_label': label
         })
     
     print(f"    Processed {len(results)} timestamps")

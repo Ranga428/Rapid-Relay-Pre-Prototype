@@ -1,7 +1,6 @@
 import pandas as pd
 from datetime import datetime
 
-from scripts.eo_downloader import download_recent_sentinel1
 from models import predictor
 from alerts.notifier import notify
 from models.calibrator import load_thresholds
