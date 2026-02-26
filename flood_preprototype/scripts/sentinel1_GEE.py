@@ -300,7 +300,8 @@ def export_timeseries_to_csv(collection, aoi, output_file):
             label = 0
 
         results.append({
-            'timestamp': props['timestamp'] + 'T00:00:00Z',
+            # props['timestamp'] already formatted as ISO with trailing 'Z'
+            'timestamp': props['timestamp'],
             'soil_saturation': soil_sat,
             'flood_extent': flood_ext,
             'flood_label': label
@@ -413,8 +414,8 @@ def main():
         exit()
     
     # Define time range
-    start_date = '2019-06-01'
-    end_date = '2020-01-15'
+    start_date = '2026-01-01'
+    end_date = '2026-02-26'
     
     # Load Sentinel-1 collection
     print(f"\n[+] Loading Sentinel-1 data...")
@@ -443,19 +444,9 @@ def main():
     # Export time series to CSV
     output_csv = os.path.join(OUTPUT_DIR, "sentinel1_timeseries.csv")
     df = export_timeseries_to_csv(collection, aoi, output_csv)
-    
-    # Optional: Export spatial maps
-    export_choice = input("\nExport full spatial maps to Google Drive? (y/n): ").lower()
-    if export_choice == 'y':
-        # Export latest image with all bands
-        latest = ee.Image(collection.sort('system:time_start', False).first())
-        export_spatial_data(
-            latest.select(['soil_saturation', 'flood_extent']),
-            aoi,
-            f"sentinel1_latest_{end_date}",
-            "Sentinel1_Latest_Analysis"
-        )
-    
+
+    # Spatial export option removed — keep export function available but do not prompt
+    print("\n[+] Spatial export to Google Drive has been disabled in this build.")
     print("\n" + "=" * 80)
     print("[+] Processing complete!")
     print(f"[+] Results saved to: {output_csv}")

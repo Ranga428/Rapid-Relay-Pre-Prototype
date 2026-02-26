@@ -1,7 +1,7 @@
 import random
 import csv
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import pandas as pd
 
 def generate_sensor_data(timestamp=None):
@@ -201,18 +201,118 @@ def try_int(x):
     except Exception:
         return None
 
-def main():
-    now = datetime.now(timezone.utc)
-    # Round down to nearest 15-minute interval
-    rounded = now.replace(
-        minute=(now.minute // 15) * 15,
-        second=0,
-        microsecond=0
-    )
-    common_ts = rounded.strftime("%Y-%m-%dT%H:%M:%SZ")
-    d = generate_sensor_data(timestamp=common_ts)
-    save_sensor_data(d)
-    print(f"Saved sensor data to {sensor_CSV_PATH}: {d}")
+def _floor_to_15(dt: datetime):
+    """Floor a timezone-aware datetime to the start of its 15-minute interval."""
+    return dt.replace(minute=(dt.minute // 15) * 15, second=0, microsecond=0)
+
+def _parse_iso(iso_str):
+    """Parse an ISO8601 string to a timezone-aware UTC datetime or return None."""
+    if iso_str is None:
+        return None
+    try:
+        if isinstance(iso_str, str) and iso_str.endswith("Z"):
+            iso_str = iso_str[:-1] + "+00:00"
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def main(minutes: int = 60, start_ts: datetime | None = None):
+    """Simulate per-minute readings and write aggregated 15-minute rows.
+
+    - minutes: number of per-minute samples to simulate (default 60 = 1 hour)
+    - start_ts: optional timezone-aware datetime to start from (defaults to now)
+
+    The script generates one sensor and one EO sample per minute, groups those
+    minute-samples into 15-minute bins, computes per-bin averages and writes
+    only the aggregated 15-minute rows to the CSV files.
+    """
+    if start_ts is None:
+        now = datetime.now(timezone.utc)
+    else:
+        now = start_ts.astimezone(timezone.utc)
+
+    # generate per-minute timestamps going back `minutes` minutes ending at `now`
+    timestamps = [now.replace(second=0, microsecond=0) - i * timedelta(minutes=1) for i in reversed(range(minutes))]
+
+    # collect samples
+    sensor_samples = []
+    eo_samples = []
+    for ts in timestamps:
+        iso = ts.isoformat() if ts.tzinfo else ts.replace(tzinfo=timezone.utc).isoformat()
+        s = generate_sensor_data(timestamp=iso)
+        e = extract_eo_features(save_csv=False, timestamp=iso)
+        sensor_samples.append(s)
+        eo_samples.append(e)
+
+    # bin into 15-minute intervals
+    bins = {}
+    for s in sensor_samples:
+        try:
+            s_ts = _parse_iso(s.get("timestamp"))
+        except Exception:
+            s_ts = None
+        if s_ts is None:
+            continue
+        b = _floor_to_15(s_ts)
+        key = b.isoformat()
+        bins.setdefault(key, {"sensor": [], "eo": []})
+        bins[key]["sensor"].append(s)
+    for e in eo_samples:
+        try:
+            e_ts = _parse_iso(e.get("timestamp"))
+        except Exception:
+            e_ts = None
+        if e_ts is None:
+            continue
+        b = _floor_to_15(e_ts)
+        key = b.isoformat()
+        bins.setdefault(key, {"sensor": [], "eo": []})
+        bins[key]["eo"].append(e)
+
+    # compute aggregates and write one row per bin
+    for key in sorted(bins.keys()):
+        b = bins[key]
+        srows = b.get("sensor", [])
+        erows = b.get("eo", [])
+
+        # aggregate sensor: mean of numeric fields
+        def mean(vals):
+            vals = [float(v) for v in vals if v is not None]
+            return sum(vals) / len(vals) if vals else None
+
+        water_avg = mean([x.get("water_level") for x in srows])
+        rain_avg = mean([x.get("rainfall") for x in srows])
+        hum_avg = mean([x.get("humidity") for x in srows])
+
+        sensor_row = {
+            "timestamp": key,
+            "water_level": round(water_avg, 3) if water_avg is not None else None,
+            "rainfall": round(rain_avg, 3) if rain_avg is not None else None,
+            "humidity": round(hum_avg, 3) if hum_avg is not None else None,
+        }
+
+        # aggregate EO: mean for soil/flood, rounded mean for trend
+        soil_avg = mean([x.get("soil_saturation") for x in erows])
+        flood_avg = mean([x.get("flood_extent") for x in erows])
+        trend_vals = [x.get("wetness_trend") for x in erows if x.get("wetness_trend") is not None]
+        trend_agg = int(round(sum(trend_vals) / len(trend_vals))) if trend_vals else None
+
+        eo_row = {
+            "timestamp": key,
+            "soil_saturation": round(soil_avg, 3) if soil_avg is not None else None,
+            "flood_extent": round(flood_avg, 3) if flood_avg is not None else None,
+            "wetness_trend": trend_agg,
+        }
+
+        # write aggregated rows (append)
+        save_sensor_data(sensor_row)
+        save_eo_features(eo_row)
+
+    print(f"Wrote {len(bins)} aggregated 15-minute rows to {sensor_CSV_PATH} and {sentinel_CSV_PATH}")
+
 
 if __name__ == "__main__":
     main()
