@@ -1,67 +1,25 @@
 """
-predict.py
-==========
-Flood Prediction — Real-Time Inference Script
+predict_rf.py
+==============
+Flood Prediction — Random Forest Real-Time Inference
 
-SENSOR-ONLY INFERENCE
----------------------
-This script predicts flood risk using SENSOR DATA ONLY.
-No satellite CSV is loaded at any point.
+Runs the deployed XGBoost sensor model (flood_rf_sensor.pkl).
+No satellite data required at inference time.
 
-The deployed model (flood_xgb_sensor.pkl / flood_rf_sensor.pkl /
-flood_lgbm_sensor.pkl) was trained on sensor features with labels
-derived from satellite data. At inference time only the sensor CSV
-is needed. Zero training-serving skew.
-
-SUPPORTED MODELS
-----------------
-    flood_xgb_sensor.pkl    XGBoost      (default)
-    flood_rf_sensor.pkl     Random Forest
-    flood_lgbm_sensor.pkl   LightGBM
-
-Switch between them by changing MODEL_FILE in the CONFIG section,
-or pass --model on the command line.
-
-The alert threshold is read from the saved artifact if present
-(RF and LGBM scripts save a val-tuned threshold). For XGBoost the
-threshold in CONFIG is used.
-
-HOW IT WORKS
-------------
-    1. Loads the sensor CSV (full history for rolling window context)
-    2. Builds sensor-only rolling-window features
-    3. Filters to rows after LAST_TRAINING_DATE (unseen data only)
-    4. Runs the sensor model on those new rows
-    5. Prints risk alerts, saves CSV and plot
+Outputs (written to ../predictions/):
+    flood_rf_sensor_predictions.csv
+    flood_rf_sensor_predictions.png
 
 Usage
 -----
-    # Run once (manually after new sensor data arrives)
-    python predict.py
-
-    # Use a specific model
-    python predict.py --model ../model/flood_lgbm_sensor.pkl
-
-    # Override the sensor CSV path (e.g. on a different machine)
-    python predict.py --sensor /data/sensor/obando_environmental_data.csv
+    python predict_rf.py
 
     # Run on a schedule (e.g. every 12 hours)
-    python predict.py --schedule --interval 12
+    python predict_rf.py --schedule --interval 12
 
-CHANGES (audit fixes)
----------------------
-FIX 1 — build_sensor_features() no longer forward-fills humidity nulls.
-         That fill now lives in load_sensor() inside prepare_dataset.py
-         so both training and inference handle nulls identically before
-         rolling windows are computed. Filling here after load_sensor()
-         already filled is harmless but redundant; the fill is removed
-         to keep the code honest about where imputation happens.
-
-FIX 2 — load_sensor() is now called with the inference sensor path
-         (SENSOR_FILE defined in this file's CONFIG) instead of
-         inheriting the hardcoded training path from prepare_dataset.py.
-         Previously importing load_sensor from prepare_dataset.py meant
-         any machine without the exact training path layout would fail.
+To switch models, use the corresponding predictor script:
+    predict_xgb.py  — XGBoost
+    predict_lgbm.py — LightGBM
 """
 
 import os
@@ -91,35 +49,33 @@ from feature_engineering import build_features
 # CONFIG — edit these if paths change or after retraining
 # ===========================================================================
 
-MODEL_FILE      = r"..\model\flood_xgb_sensor.pkl"
-OUTPUT_DIR      = r"..\predictions"
-PREDICTIONS_CSV = os.path.join(OUTPUT_DIR, "flood_predictions.csv")
-PLOT_FILE       = os.path.join(OUTPUT_DIR, "flood_predictions.png")
-
-# FIX 2 — inference-specific sensor path, resolved relative to this script.
-# load_sensor() is now called with this path so predict.py is not tied to
-# the hardcoded training path inside prepare_dataset.py.
+MODEL_FILE  = r"..\model\flood_rf_sensor.pkl"
+OUTPUT_DIR  = r"..\predictions"
 SENSOR_FILE = os.path.join(
-    SCRIPT_DIR,
-    r"..\data\sensor\obando_environmental_data.csv",
+    SCRIPT_DIR, r"..\data\sensor\obando_environmental_data.csv"
 )
 
-# Last date included in training data.
-# Predictions are generated ONLY for rows AFTER this date.
-# Update this each time you retrain on newer data.
+PREDICTIONS_CSV = os.path.join(OUTPUT_DIR, "flood_rf_sensor_predictions.csv")
+PLOT_FILE       = os.path.join(OUTPUT_DIR, "flood_rf_sensor_predictions.png")
+
+# Last date included in training. Predictions generated ONLY for rows after this.
+# Update after retraining on newer data.
 LAST_TRAINING_DATE = "2024-12-31"
 
-# Fallback threshold if none is stored in the model artifact.
+# RF artifacts store a val-tuned threshold saved by train_flood_model_rf.py.
+# DEFAULT_ALERT_THRESHOLD is only used if the artifact lacks a threshold key.
 DEFAULT_ALERT_THRESHOLD = 0.50
 
-# Risk tier thresholds (offsets from the active alert threshold)
-WATCH_OFFSET   = -0.07
-WARNING_OFFSET =  0.00
-DANGER_OFFSET  = +0.10
+# Risk tier offsets from the active alert threshold
+WATCH_OFFSET   = -0.07   # alert - 0.07
+WARNING_OFFSET =  0.00   # alert
+DANGER_OFFSET  = +0.10   # alert + 0.10
 
 # ===========================================================================
 # END CONFIG
 # ===========================================================================
+
+MODEL_LABEL = "Random Forest"
 
 RISK_TIERS = {
     "CLEAR":   {"emoji": "🟢", "color": "green"},
@@ -141,45 +97,32 @@ def separator(title=""):
 # 1. Load model
 # ---------------------------------------------------------------------------
 
-def load_model(model_path: str) -> tuple:
+def load_model() -> tuple:
     separator("Loading Model")
-    if not os.path.exists(model_path):
+    if not os.path.exists(MODEL_FILE):
         sys.exit(
             f"\n  ERROR: Model file not found.\n"
-            f"  Expected : {model_path}\n"
-            f"  Fix      : Run the appropriate training script first.\n"
-            f"  Options  : train_flood_model.py      (XGBoost)\n"
-            f"             train_flood_model_rf.py   (Random Forest)\n"
-            f"             train_flood_model_lgbm.py (LightGBM)\n"
+            f"  Expected : {MODEL_FILE}\n"
+            f"  Fix      : Run train_flood_model_rf.py first.\n"
         )
 
-    artifact     = joblib.load(model_path)
+    artifact     = joblib.load(MODEL_FILE)
     model        = artifact["model"]
     feature_cols = artifact["feature_columns"]
     threshold    = artifact.get("threshold", DEFAULT_ALERT_THRESHOLD)
 
-    model_type = type(model).__name__
-    print(f"  Model loaded     : {model_path}")
-    print(f"  Model type       : {model_type}")
+    print(f"  Model loaded     : {MODEL_FILE}")
+    print(f"  Model type       : {type(model).__name__}")
     print(f"  Feature count    : {len(feature_cols)}")
     print(f"  Alert threshold  : {threshold:.2f}"
-          f"{'  (val-tuned, from artifact)' if 'threshold' in artifact else '  (default)'}")
+          + ("  (val-tuned, from artifact)"
+             if "threshold" in artifact else "  (default)"))
 
     return model, feature_cols, threshold
 
 
 # ---------------------------------------------------------------------------
-# 2. Build sensor features from full CSV history
-#
-# FIX 1 — humidity ffill removed here. It now lives in load_sensor() inside
-#          prepare_dataset.py so training and inference share the same
-#          imputation path. Filling after load_sensor() already filled would
-#          be a no-op anyway, but removing it keeps the code clear about
-#          where imputation happens.
-#
-# FIX 2 — load_sensor() is called with SENSOR_FILE (the inference path
-#          defined in this file's CONFIG) instead of relying on the
-#          hardcoded training path inside prepare_dataset.py.
+# 2. Build sensor features
 # ---------------------------------------------------------------------------
 
 def build_sensor_features() -> pd.DataFrame:
@@ -211,9 +154,9 @@ def filter_new_rows(features: pd.DataFrame) -> pd.DataFrame:
     if len(new_df) == 0:
         sys.exit(
             f"\n  No new data found after {LAST_TRAINING_DATE}.\n"
-            f"  Append new sensor rows to your sensor CSV and re-run.\n"
+            f"  Append new sensor rows to the sensor CSV and re-run.\n"
             f"  If you have retrained on newer data, update\n"
-            f"  LAST_TRAINING_DATE in predict.py."
+            f"  LAST_TRAINING_DATE in predict_rf.py."
         )
 
     print(f"  New date range   : {new_df.index[0].date()}  ->  {new_df.index[-1].date()}")
@@ -221,7 +164,7 @@ def filter_new_rows(features: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 4. Classify probability into risk tier
+# 4. Risk tier classifier
 # ---------------------------------------------------------------------------
 
 def make_risk_classifier(threshold: float):
@@ -246,12 +189,7 @@ def make_risk_classifier(threshold: float):
 # 5. Run predictions
 # ---------------------------------------------------------------------------
 
-def run_predictions(
-    model,
-    feature_cols: list,
-    new_features: pd.DataFrame,
-    threshold: float,
-) -> tuple:
+def run_predictions(model, feature_cols, new_features, threshold) -> tuple:
     separator("Running Predictions")
 
     missing = [c for c in feature_cols if c not in new_features.columns]
@@ -259,10 +197,8 @@ def run_predictions(
         sys.exit(
             f"\n  ERROR: {len(missing)} feature column(s) missing from sensor data:\n"
             f"    {missing}\n"
-            f"  One or more sensors are offline or the sensor CSV is missing expected\n"
-            f"  columns. Cannot run inference with an incomplete feature set —\n"
-            f"  predictions would be unreliable.\n"
-            f"  Fix: restore sensor data for the missing columns and re-run."
+            f"  One or more sensors are offline or the CSV is missing expected columns.\n"
+            f"  Restore sensor data for the missing columns and re-run."
         )
 
     X     = new_features[feature_cols].values
@@ -287,7 +223,7 @@ def run_predictions(
 
 
 # ---------------------------------------------------------------------------
-# 6. Print results to terminal
+# 6. Print results
 # ---------------------------------------------------------------------------
 
 def print_results(results: pd.DataFrame) -> None:
@@ -296,38 +232,36 @@ def print_results(results: pd.DataFrame) -> None:
     tier_counts = results["risk_tier"].value_counts()
     print("  Risk tier summary:")
     for tier, info in RISK_TIERS.items():
-        count = tier_counts.get(tier, 0)
-        print(f"    {info['emoji']}  {tier:<8} : {count:>4} rows")
+        print(f"    {info['emoji']}  {tier:<8} : {tier_counts.get(tier, 0):>4} rows")
 
     latest = results.iloc[-1]
     tier   = latest["risk_tier"]
-    emoji  = RISK_TIERS[tier]["emoji"]
     print(f"\n  Latest prediction:")
     print(f"    Timestamp   : {results.index[-1].date()}")
     print(f"    Probability : {latest['flood_probability']:.1%}")
-    print(f"    Risk tier   : {emoji}  {tier}")
+    print(f"    Risk tier   : {RISK_TIERS[tier]['emoji']}  {tier}")
 
     print(f"\n  All predictions:")
     print(f"  {'Timestamp':<32} {'Probability':>12}  {'Risk':<10}")
     print(f"  {'-'*32} {'-'*12}  {'-'*10}")
     for ts, row in results.iterrows():
-        tier  = row["risk_tier"]
-        emoji = RISK_TIERS[tier]["emoji"]
-        print(f"  {str(ts.date()):<32} {row['flood_probability']:>11.1%}  {emoji} {tier}")
+        t = row["risk_tier"]
+        print(f"  {str(ts.date()):<32} {row['flood_probability']:>11.1%}  "
+              f"{RISK_TIERS[t]['emoji']} {t}")
 
     alerts = results[results["risk_tier"].isin(["WARNING", "DANGER"])]
     if len(alerts) > 0:
         print(f"\n  ⚠️  WARNING/DANGER events detected: {len(alerts)}")
         for ts, row in alerts.iterrows():
-            tier  = row["risk_tier"]
-            emoji = RISK_TIERS[tier]["emoji"]
-            print(f"    {emoji}  {ts.date()}  →  {row['flood_probability']:.1%}  {tier}")
+            t = row["risk_tier"]
+            print(f"    {RISK_TIERS[t]['emoji']}  {ts.date()}  →  "
+                  f"{row['flood_probability']:.1%}  {t}")
     else:
         print(f"\n  ✅  No WARNING or DANGER events in this prediction window.")
 
 
 # ---------------------------------------------------------------------------
-# 7. Save predictions CSV (appends, deduplicates)
+# 7. Save CSV (appends, deduplicates)
 # ---------------------------------------------------------------------------
 
 def save_csv(results: pd.DataFrame) -> None:
@@ -336,13 +270,10 @@ def save_csv(results: pd.DataFrame) -> None:
 
     if os.path.exists(PREDICTIONS_CSV):
         existing = pd.read_csv(
-            PREDICTIONS_CSV,
-            parse_dates=["timestamp"],
-            index_col="timestamp",
+            PREDICTIONS_CSV, parse_dates=["timestamp"], index_col="timestamp"
         )
         combined = pd.concat([existing, results])
-        combined = combined[~combined.index.duplicated(keep="last")]
-        combined = combined.sort_index()
+        combined = combined[~combined.index.duplicated(keep="last")].sort_index()
     else:
         combined = results
 
@@ -356,25 +287,14 @@ def save_csv(results: pd.DataFrame) -> None:
 # 8. Save plot
 # ---------------------------------------------------------------------------
 
-def save_plot(
-    results: pd.DataFrame,
-    watch_t: float,
-    warning_t: float,
-    danger_t: float,
-) -> None:
+def save_plot(results, watch_t, warning_t, danger_t) -> None:
     separator("Saving Plot")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     fig, ax = plt.subplots(figsize=(14, 5))
 
-    ax.plot(
-        results.index,
-        results["flood_probability"],
-        color="steelblue",
-        linewidth=1.5,
-        label="Flood Probability",
-        zorder=3,
-    )
+    ax.plot(results.index, results["flood_probability"],
+            color="steelblue", linewidth=1.5, label="Flood Probability", zorder=3)
 
     ax.axhline(watch_t,   color="gold",   linestyle="--", linewidth=1,
                label=f"WATCH ({watch_t:.0%})")
@@ -390,18 +310,14 @@ def save_plot(
     for tier, info in RISK_TIERS.items():
         mask = results["risk_tier"] == tier
         if mask.sum() > 0:
-            ax.scatter(
-                results.index[mask],
-                results["flood_probability"][mask],
-                color=info["color"],
-                s=50, zorder=4,
-                label=f"{info['emoji']} {tier} ({mask.sum()})",
-            )
+            ax.scatter(results.index[mask], results["flood_probability"][mask],
+                       color=info["color"], s=50, zorder=4,
+                       label=f"{info['emoji']} {tier} ({mask.sum()})")
 
     ax.set_ylim(0, 1)
     ax.set_ylabel("Flood Probability")
     ax.set_xlabel("Date")
-    ax.set_title("Flood Risk Prediction — Sensor Model (Real-Time)")
+    ax.set_title(f"Flood Risk Prediction — {MODEL_LABEL} Sensor Model")
     ax.xaxis.set_major_locator(mdates.MonthLocator())
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
     plt.xticks(rotation=45)
@@ -418,15 +334,16 @@ def save_plot(
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def run_pipeline(model_file: str = MODEL_FILE) -> None:
-    separator("Flood Prediction — Sensor Inference Pipeline")
-    print(f"  Model           : {model_file}")
+def run_pipeline() -> None:
+    separator("Flood Prediction — Random Forest Sensor Inference Pipeline")
+    print(f"  Model           : {MODEL_FILE}")
     print(f"  Sensor data     : {SENSOR_FILE}")
-    print(f"  Output          : {OUTPUT_DIR}")
+    print(f"  Output CSV      : {PREDICTIONS_CSV}")
+    print(f"  Output plot     : {PLOT_FILE}")
     print(f"  Training cutoff : {LAST_TRAINING_DATE}")
     print(f"  Satellite data  : NOT REQUIRED (sensor-only model)")
 
-    model, feature_cols, threshold = load_model(model_file)
+    model, feature_cols, threshold = load_model()
     all_features                   = build_sensor_features()
     new_features                   = filter_new_rows(all_features)
     results, watch_t, warning_t, danger_t = run_predictions(
@@ -447,12 +364,12 @@ def run_pipeline(model_file: str = MODEL_FILE) -> None:
 # Scheduled mode
 # ---------------------------------------------------------------------------
 
-def run_scheduled(interval_hours: int, model_file: str) -> None:
+def run_scheduled(interval_hours: int) -> None:
     print(f"\n  Scheduled mode — running every {interval_hours}h")
     print(f"  Press Ctrl+C to stop.\n")
     while True:
         try:
-            run_pipeline(model_file)
+            run_pipeline()
             next_run = pd.Timestamp.now() + pd.Timedelta(hours=interval_hours)
             print(f"\n  Next run : {next_run.strftime('%Y-%m-%d %H:%M')}")
             time.sleep(interval_hours * 3600)
@@ -471,17 +388,7 @@ def run_scheduled(interval_hours: int, model_file: str) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Flood Prediction — Sensor-Only Inference"
-    )
-    parser.add_argument(
-        "--model", type=str, default=MODEL_FILE,
-        help="Path to sensor model pkl. "
-             "Options: flood_xgb_sensor.pkl / flood_rf_sensor.pkl / flood_lgbm_sensor.pkl",
-    )
-    parser.add_argument(
-        "--sensor", type=str, default=None,
-        help="Path to sensor CSV. Overrides the SENSOR_FILE constant in CONFIG. "
-             "Use this when running on a machine with a different directory layout.",
+        description="Flood Prediction — Random Forest Sensor Model Inference"
     )
     parser.add_argument(
         "--schedule", action="store_true",
@@ -493,12 +400,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # Allow --sensor CLI override to update the module-level constant so
-    # build_sensor_features() picks it up without threading it through args.
-    if args.sensor:
-        SENSOR_FILE = args.sensor
-
     if args.schedule:
-        run_scheduled(args.interval, args.model)
+        run_scheduled(args.interval)
     else:
-        run_pipeline(args.model)
+        run_pipeline()
