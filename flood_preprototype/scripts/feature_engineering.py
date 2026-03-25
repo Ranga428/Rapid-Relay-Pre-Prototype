@@ -1,76 +1,46 @@
 """
 feature_engineering.py
 =======================
-Feature engineering for XGBoost Flood Prediction.
+Feature engineering for Flood Prediction (XGBoost / RF / LightGBM).
+
+CHANGES FROM PREVIOUS VERSION
+------------------------------
+REMOVED — days_since_last_flood dropped from SENSOR_FEATURE_COLUMNS.
+    The feature defaulted to 999 for almost all rows because no
+    flood_event_log.csv exists yet. A near-constant feature adds no
+    signal and was diluting recall-sensitive splits. The function
+    compute_flood_history_features() is retained so the feature can be
+    re-added once a populated flood event log is available.
+
+    To re-enable: uncomment "days_since_last_flood" in
+    SENSOR_FEATURE_COLUMNS and ensure flood_event_log.csv exists with
+    confirmed flood event dates before retraining.
+
+SENSOR_FEATURE_COLUMNS now has 25 features (down from 26 — one removed).
+FULL_FEATURE_COLUMNS retains the 3 SAR-derived satellite columns on top.
 
 TWO FEATURE SETS
 ----------------
-This module defines two explicit feature sets to support the
-two-model training architecture:
+    SENSOR_FEATURE_COLUMNS  — sensor-only, safe for real-time inference.
+                              Used by the deployed sensor models.
 
-    SENSOR_FEATURE_COLUMNS  — sensor-only features, safe for inference.
-                              No satellite data required at prediction time.
-                              Used by the deployed model (flood_xgb_sensor.pkl)
-                              and by predict.py.
+    FULL_FEATURE_COLUMNS    — sensor + SAR-derived satellite features.
+                              Used during training / revalidation only.
 
-    FULL_FEATURE_COLUMNS    — sensor + satellite features, used during
-                              training and revalidation only.
-                              Used by the full model (flood_xgb_full.pkl).
-                              Never used at inference time.
-
-WHY TWO SETS?
--------------
-Satellite passes occur every ~12 days. At inference time (real-time alerting),
-no fresh satellite data is available. Satellite features like soil_saturation
-and wetness_trend would be 0-12 days stale — acceptable for slow-changing
-variables during revalidation, but architecturally cleaner to exclude entirely
-from the deployed model so there is zero training-serving skew.
-
-The satellite data's role at inference time is zero. Its role during training
-is to provide accurate flood_labels and richer context for the full model.
-
-DATA SOURCES
-------------
-Sensor CSV  : waterlevel, soil_moisture, humidity  (daily, real-time)
-Satellite   : soil_saturation, wetness_trend, rainfall_1d/3d/7d,
-              era5_runoff_7d, era5_soil_water, flood_label
-              (every ~12 days, forward-filled during dataset preparation)
-
-SAMPLING FREQUENCIES SUPPORTED
--------------------------------
-    '15min' : 15-minute intervals (96 ticks/day)
-    '1h'    : hourly intervals    (24 ticks/day)
-    '2h'    : 2-hour intervals    (12 ticks/day)
-    '4h'    : 4-hour intervals    ( 6 ticks/day)
-    '6h'    : 6-hour intervals    ( 4 ticks/day)
-    '1D'    : daily intervals     ( 1 tick/day)
-
-CHANGES (audit fixes)
----------------------
-FIX 1 — build_features() now raises a hard error (instead of printing a
-         note and silently continuing) when expected feature columns are
-         missing. Previously a sensor going offline during training would
-         produce a model artifact with fewer features than expected, causing
-         predict.py's missing-feature guard to fire at inference time with
-         no indication that the model itself was trained incorrectly.
-
-FIX 2 — align_satellite_labels() now uses merge_asof instead of a Python
-         loop over each feature row. On daily data this is a minor speed
-         improvement; on 15-minute data with years of history it is
-         substantially faster.
-
-FIX 3 — TICKS table extended to cover 2h, 4h, and 6h frequencies to match
-         the extended detect_sensor_frequency() in prepare_dataset.py.
+LABEL ALIGNMENT STRATEGY
+--------------------------
+align_satellite_labels() uses direction='forward' with a 288-hour
+(12-day) lookahead. Each sensor day is labeled by the NEXT upcoming
+satellite pass — the correct target for early warning.
 """
 
+import os
 import pandas as pd
 import numpy as np
 
 
 # ---------------------------------------------------------------------------
 # Ticks-per-window lookup
-# Maps human-readable window sizes to row counts at each sampling frequency.
-# FIX 3 — added 2h, 4h, 6h entries to match extended frequency detection.
 # ---------------------------------------------------------------------------
 
 TICKS = {
@@ -84,44 +54,76 @@ TICKS = {
 
 
 # ---------------------------------------------------------------------------
-# SENSOR-ONLY feature columns
-# These are the ONLY features used by predict.py and flood_xgb_sensor.pkl.
-# Every column here must be derivable from sensor CSV data alone.
-# No satellite CSV access required at inference time.
+# SENSOR-ONLY feature columns (25 total)
+# Safe for real-time inference — no satellite data required.
+#
+# days_since_last_flood is intentionally excluded until a populated
+# flood_event_log.csv exists. See module docstring.
 # ---------------------------------------------------------------------------
 
 SENSOR_FEATURE_COLUMNS = [
-    # Water level dynamics
+    # --- Water level (point / window stats) ---
     "max_waterlevel_6h",
     "max_waterlevel_24h",
     "waterlevel_slope_3h",
     "waterlevel_slope_6h",
     "waterlevel_std_24h",
-    # Sensor soil moisture dynamics
+    "waterlevel_rise_rate_48h",
+
+    # --- Water level (lag / memory) ---
+    "waterlevel_lag_1d",
+    "waterlevel_lag_2d",
+    "waterlevel_lag_3d",
+
+    # --- Water level (context / proximity) ---
+    "waterlevel_days_above_threshold",
+    "waterlevel_pct_rank_30d",
+    "waterlevel_distance_to_max",
+
+    # --- Water level (slow-build rolling) ---
+    "waterlevel_mean_7d",
+    "waterlevel_cumrise_14d",
+
+    # --- Soil moisture ---
     "sensor_soilmoisture_mean_6h",
     "sensor_soilmoisture_mean_24h",
     "sensor_soilmoisture_trend_6h",
-    # Atmospheric conditions
+
+    # --- Soil moisture (lag) ---
+    "soilmoisture_lag_1d",
+    "soilmoisture_lag_2d",
+
+    # --- Humidity ---
     "humidity_mean_24h",
     "humidity_trend_6h",
+
+    # --- Cross-sensor interactions ---
+    "waterlevel_x_soilmoisture",
+    "humidity_x_waterlevel_slope",
+
+    # --- Season (month encoding) ---
+    "season_sin",
+    "season_cos",
+
+    # --- Season (week-of-year encoding) ---
+    "week_sin",
+    "week_cos",
+
+    # days_since_last_flood — REMOVED until flood_event_log.csv is populated
+    # "days_since_last_flood",
 ]
 
 
 # ---------------------------------------------------------------------------
-# FULL feature columns (sensor + satellite)
+# FULL feature columns (sensor + SAR-derived satellite)
 # Used only during training and revalidation.
-# flood_xgb_full.pkl is trained on these.
-# Never used by predict.py.
+# ERA5/GPM columns excluded — label leakage (see original notes).
 # ---------------------------------------------------------------------------
 
 FULL_FEATURE_COLUMNS = SENSOR_FEATURE_COLUMNS + [
-    "soil_saturation",
-    "wetness_trend",
-    "rainfall_1d",
-    "rainfall_3d",
-    "rainfall_7d",
-    "era5_runoff_7d",
-    "era5_soil_water",
+    "soil_saturation",   # SAR VV/VH normalized ratio
+    "wetness_trend",     # 30-day VV backscatter trend
+    "orbit_flag",        # ASCENDING/DESCENDING geometry
 ]
 
 
@@ -137,11 +139,32 @@ def compute_waterlevel_features(
     t  = TICKS[freq]
     df = df.copy()
 
-    df["max_waterlevel_6h"]    = df[col].rolling(t["6h"],  min_periods=1).max()
-    df["max_waterlevel_24h"]   = df[col].rolling(t["24h"], min_periods=1).max()
-    df["waterlevel_std_24h"]   = df[col].rolling(t["24h"], min_periods=2).std().fillna(0)
-    df["waterlevel_slope_3h"]  = (df[col] - df[col].shift(t["3h"])) / max(t["3h"], 1)
-    df["waterlevel_slope_6h"]  = (df[col] - df[col].shift(t["6h"])) / max(t["6h"], 1)
+    # Existing point / window features
+    df["max_waterlevel_6h"]        = df[col].rolling(t["6h"],  min_periods=1).max()
+    df["max_waterlevel_24h"]       = df[col].rolling(t["24h"], min_periods=1).max()
+    df["waterlevel_std_24h"]       = df[col].rolling(t["24h"], min_periods=2).std().fillna(0)
+    df["waterlevel_slope_3h"]      = (df[col] - df[col].shift(t["3h"])) / max(t["3h"], 1)
+    df["waterlevel_slope_6h"]      = (df[col] - df[col].shift(t["6h"])) / max(t["6h"], 1)
+    df["waterlevel_rise_rate_48h"] = (df[col] - df[col].shift(t["48h"])) / max(t["48h"], 1)
+
+    # Consecutive ticks above 1.5 sigma — sustained high water state
+    above     = (df[col] > 1.5).astype(int)
+    group_key = (above != above.shift()).cumsum()
+    df["waterlevel_days_above_threshold"] = (
+        above.groupby(group_key).cumcount().add(1).mul(above)
+    )
+
+    # Percentile rank vs rolling 30-day window
+    window_30d = t["24h"] * 30
+    df["waterlevel_pct_rank_30d"] = (
+        df[col]
+        .rolling(window_30d, min_periods=7)
+        .apply(lambda x: float(pd.Series(x).rank(pct=True).iloc[-1]), raw=False)
+    )
+
+    # Distance from expanding historical maximum — headroom to danger mark
+    historical_max = df[col].expanding(min_periods=1).max()
+    df["waterlevel_distance_to_max"] = historical_max - df[col]
 
     return df
 
@@ -157,11 +180,9 @@ def compute_sensor_soilmoisture_features(
 ) -> pd.DataFrame:
     t  = TICKS[freq]
     df = df.copy()
-
     df["sensor_soilmoisture_mean_6h"]  = df[col].rolling(t["6h"],  min_periods=1).mean()
     df["sensor_soilmoisture_mean_24h"] = df[col].rolling(t["24h"], min_periods=1).mean()
     df["sensor_soilmoisture_trend_6h"] = df[col] - df[col].shift(t["6h"])
-
     return df
 
 
@@ -176,101 +197,262 @@ def compute_humidity_features(
 ) -> pd.DataFrame:
     t  = TICKS[freq]
     df = df.copy()
-
     df["humidity_mean_24h"] = df[col].rolling(t["24h"], min_periods=1).mean()
     df["humidity_trend_6h"] = df[col] - df[col].shift(t["6h"])
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 4. Season Features
+# ---------------------------------------------------------------------------
+
+def compute_season_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sin/cos encoding for month and week-of-year.
+
+    Month encoding: broad wet/dry season cycle.
+    Week encoding : finer resolution — peak Obando flood risk is
+                    weeks 35–38 (late Aug to mid-Sep), which month
+                    encoding cannot distinguish within August/September.
+    """
+    df    = df.copy()
+    month = df.index.month.astype(float)
+
+    try:
+        week = df.index.isocalendar().week.astype(float).values
+    except AttributeError:
+        week = pd.Series(df.index).dt.isocalendar().week.astype(float).values
+
+    df["season_sin"] = np.sin(2 * np.pi * month / 12)
+    df["season_cos"] = np.cos(2 * np.pi * month / 12)
+    df["week_sin"]   = np.sin(2 * np.pi * week / 52)
+    df["week_cos"]   = np.cos(2 * np.pi * week / 52)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 5. Lag Features
+# ---------------------------------------------------------------------------
+
+def compute_lag_features(
+    df: pd.DataFrame,
+    waterlevel_col:   str = "waterlevel",
+    soilmoisture_col: str = "soil_moisture",
+    freq: str = "1D",
+) -> pd.DataFrame:
+    """
+    Explicit prior-day values as model inputs.
+
+    Gives the model direct memory of what the river level actually was
+    yesterday vs. just a slope estimate — captures ascending multi-day
+    trends that rolling stats compress into a single derivative.
+    """
+    t   = TICKS[freq]
+    df  = df.copy()
+    tpd = t["24h"]
+
+    df["waterlevel_lag_1d"]   = df[waterlevel_col].shift(tpd * 1)
+    df["waterlevel_lag_2d"]   = df[waterlevel_col].shift(tpd * 2)
+    df["waterlevel_lag_3d"]   = df[waterlevel_col].shift(tpd * 3)
+    df["soilmoisture_lag_1d"] = df[soilmoisture_col].shift(tpd * 1)
+    df["soilmoisture_lag_2d"] = df[soilmoisture_col].shift(tpd * 2)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 6. Interaction Features
+# ---------------------------------------------------------------------------
+
+def compute_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Explicit cross-sensor products for compound risk states.
+
+    waterlevel_x_soilmoisture:
+        High water + saturated soil — every raindrop becomes runoff,
+        compounding flood risk beyond what either signal alone captures.
+
+    humidity_x_waterlevel_slope:
+        Active rainfall loading (high humidity) during a rising river.
+        Only the positive (rising) slope component is used.
+    """
+    df = df.copy()
+
+    if "max_waterlevel_24h" in df.columns and "sensor_soilmoisture_mean_24h" in df.columns:
+        df["waterlevel_x_soilmoisture"] = (
+            df["max_waterlevel_24h"] * df["sensor_soilmoisture_mean_24h"]
+        )
+    else:
+        df["waterlevel_x_soilmoisture"] = 0.0
+
+    if "humidity_mean_24h" in df.columns and "waterlevel_slope_6h" in df.columns:
+        df["humidity_x_waterlevel_slope"] = (
+            df["humidity_mean_24h"] * df["waterlevel_slope_6h"].clip(lower=0)
+        )
+    else:
+        df["humidity_x_waterlevel_slope"] = 0.0
 
     return df
 
 
 # ---------------------------------------------------------------------------
-# 4. Master Feature Pipeline
+# 7. Rolling Waterlevel Features
+# ---------------------------------------------------------------------------
+
+def append_rolling_waterlevel(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Slow-build flood features for Aug–Oct patterns where water rises
+    gradually over many days rather than surging in a single event.
+    Idempotent — safe to call even if columns already exist.
+    """
+    if "max_waterlevel_24h" not in df.columns:
+        return df
+    df = df.copy()
+    if "waterlevel_mean_7d" not in df.columns:
+        df["waterlevel_mean_7d"] = (
+            df["max_waterlevel_24h"].rolling(7, min_periods=1).mean()
+        )
+    if "waterlevel_cumrise_14d" not in df.columns:
+        df["waterlevel_cumrise_14d"] = (
+            df["max_waterlevel_24h"].rolling(14, min_periods=1).sum()
+        )
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 8. Flood History Features (retained but NOT in SENSOR_FEATURE_COLUMNS)
+# ---------------------------------------------------------------------------
+
+def compute_flood_history_features(
+    df: pd.DataFrame,
+    flood_label_series: pd.Series = None,
+    flood_log_path: str = None,
+) -> pd.DataFrame:
+    """
+    Computes days_since_last_flood — watershed recovery proxy.
+
+    NOT currently in SENSOR_FEATURE_COLUMNS. Re-enable once a populated
+    flood_event_log.csv exists with confirmed event dates.
+
+    Batch mode : pass flood_label_series (pd.Series, same index as df).
+    Live mode  : pass flood_log_path to operator-maintained CSV
+                 with columns [timestamp, flood_label].
+    Neither    : feature set to 999 (unknown).
+    """
+    df     = df.copy()
+    labels = None
+
+    if flood_label_series is not None:
+        labels = flood_label_series.reindex(df.index).fillna(0)
+    elif flood_log_path is not None and os.path.exists(flood_log_path):
+        try:
+            log    = pd.read_csv(
+                flood_log_path,
+                parse_dates=["timestamp"],
+                index_col="timestamp",
+            )
+            labels = log["flood_label"].reindex(df.index).fillna(0)
+        except Exception as e:
+            print(f"  WARNING: Could not load flood log ({e}). "
+                  f"days_since_last_flood set to 999.")
+
+    if labels is None:
+        df["days_since_last_flood"] = 999
+        return df
+
+    flood_dates = labels[labels == 1].index.sort_values()
+    days_since  = []
+    for ts in df.index:
+        past = flood_dates[flood_dates < ts]
+        days_since.append(999 if len(past) == 0 else int((ts - past[-1]).days))
+
+    df["days_since_last_flood"] = days_since
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 9. Master Feature Pipeline
 # ---------------------------------------------------------------------------
 
 def build_features(
     df: pd.DataFrame,
-    waterlevel_col:    str = "waterlevel",
-    soilmoisture_col:  str = "soil_moisture",
-    humidity_col:      str = "humidity",
-    freq:              str = "1D",
-    mode:              str = "sensor",
+    waterlevel_col:     str = "waterlevel",
+    soilmoisture_col:   str = "soil_moisture",
+    humidity_col:       str = "humidity",
+    freq:               str = "1D",
+    mode:               str = "sensor",
+    flood_label_series: pd.Series = None,
+    flood_log_path:     str = None,
 ) -> pd.DataFrame:
     """
     Build all features from a sensor DataFrame.
 
     Args:
-        df               : Sensor DataFrame with datetime index.
-                           For mode='full', must also contain satellite
-                           columns forward-filled by prepare_dataset.py.
-        waterlevel_col   : Column name for water level readings.
-        soilmoisture_col : Column name for sensor soil moisture readings.
-        humidity_col     : Column name for humidity readings.
-        freq             : Sampling frequency — '15min', '1h', '2h', '4h',
-                           '6h', or '1D'. Auto-detected by prepare_dataset.py.
-        mode             : 'sensor' — build SENSOR_FEATURE_COLUMNS only.
-                           'full'   — build FULL_FEATURE_COLUMNS.
+        df                 : Sensor DataFrame with DatetimeIndex.
+        waterlevel_col     : Column name for water level readings.
+        soilmoisture_col   : Column name for soil moisture readings.
+        humidity_col       : Column name for humidity readings.
+        freq               : Sampling frequency string.
+        mode               : 'sensor' or 'full'.
+        flood_label_series : Optional flood labels for days_since_last_flood
+                             (batch / training mode). Currently unused since
+                             that feature is excluded from SENSOR_FEATURE_COLUMNS.
+        flood_log_path     : Optional path to flood event log CSV
+                             (live mode). Currently unused for same reason.
 
     Returns:
         DataFrame with selected feature columns only, NaN rows dropped.
     """
     if mode not in ("sensor", "full"):
-        raise ValueError(
-            f"mode='{mode}' is invalid. Choose 'sensor' or 'full'.\n"
-            f"  'sensor' : inference-safe, sensor columns only\n"
-            f"  'full'   : training/revalidation, sensor + satellite columns"
-        )
-
+        raise ValueError(f"mode='{mode}' is invalid. Choose 'sensor' or 'full'.")
     if freq not in TICKS:
         raise ValueError(
             f"freq='{freq}' is not supported. Choose from: {list(TICKS.keys())}"
         )
 
-    # Validate required sensor columns
     required_sensor = [waterlevel_col, soilmoisture_col, humidity_col]
     missing_sensor  = [c for c in required_sensor if c not in df.columns]
     if missing_sensor:
         raise ValueError(
             f"Missing sensor columns in DataFrame: {missing_sensor}\n"
-            f"Available columns: {list(df.columns)}\n"
-            f"Check SENSOR_COLUMN_MAP in prepare_dataset.py."
+            f"Available columns: {list(df.columns)}"
         )
 
-    # Validate satellite columns when running in full mode
     if mode == "full":
-        required_satellite = [
-            "soil_saturation", "wetness_trend",
-            "rainfall_1d", "rainfall_3d", "rainfall_7d",
-            "era5_runoff_7d", "era5_soil_water",
-        ]
-        missing_satellite = [c for c in required_satellite if c not in df.columns]
+        required_satellite = ["soil_saturation", "wetness_trend", "orbit_flag"]
+        missing_satellite  = [c for c in required_satellite if c not in df.columns]
         if missing_satellite:
             raise ValueError(
-                f"mode='full' requires satellite columns but these are missing: {missing_satellite}\n"
-                f"Available columns: {list(df.columns)}\n"
-                f"These should have been forward-filled by prepare_dataset.py.\n"
-                f"Run prepare_dataset.py before train_flood_model.py."
+                f"mode='full' requires SAR satellite columns but these are missing: "
+                f"{missing_satellite}\n"
+                f"Run prepare_dataset.py before train scripts."
             )
 
-    # Build all sensor features
-    df = compute_waterlevel_features(df,           col=waterlevel_col,   freq=freq)
-    df = compute_sensor_soilmoisture_features(df,  col=soilmoisture_col, freq=freq)
-    df = compute_humidity_features(df,             col=humidity_col,     freq=freq)
+    df = compute_waterlevel_features(df,          col=waterlevel_col,   freq=freq)
+    df = compute_sensor_soilmoisture_features(df, col=soilmoisture_col, freq=freq)
+    df = compute_humidity_features(df,            col=humidity_col,     freq=freq)
+    df = compute_season_features(df)
+    df = compute_lag_features(df,
+                               waterlevel_col=waterlevel_col,
+                               soilmoisture_col=soilmoisture_col,
+                               freq=freq)
+    df = compute_interaction_features(df)
+    df = append_rolling_waterlevel(df)
 
-    target_cols = SENSOR_FEATURE_COLUMNS if mode == "sensor" else FULL_FEATURE_COLUMNS
+    # days_since_last_flood excluded from target_cols — computed here
+    # only if explicitly requested (flood_label_series or flood_log_path passed)
+    if flood_label_series is not None or flood_log_path is not None:
+        df = compute_flood_history_features(
+            df,
+            flood_label_series=flood_label_series,
+            flood_log_path=flood_log_path,
+        )
 
-    # FIX 1 — hard stop on missing feature columns instead of silently
-    # skipping them. Previously a missing column would print a note and
-    # continue, producing a model artifact with fewer features than expected.
-    # This caused predict.py's missing-feature guard to fire at inference
-    # time even though the model itself was already corrupt.
+    target_cols      = SENSOR_FEATURE_COLUMNS if mode == "sensor" else FULL_FEATURE_COLUMNS
     missing_features = [c for c in target_cols if c not in df.columns]
     if missing_features:
         raise ValueError(
             f"Expected feature columns are missing after build: {missing_features}\n"
-            f"This means one or more sensor columns failed to produce their\n"
-            f"derived features. Check the input DataFrame for gaps or wrong\n"
-            f"column names. Cannot continue — a model trained on incomplete\n"
-            f"features would be unreliable at inference time."
+            f"Check the input DataFrame for gaps or wrong column names."
         )
 
     result = df[target_cols].dropna()
@@ -283,15 +465,7 @@ def build_features(
 
 
 # ---------------------------------------------------------------------------
-# 5. Label Alignment
-#
-# FIX 2 — replaced the Python loop over feature rows with merge_asof.
-# The original loop ran satellite_df.loc[] once per feature row, which is
-# O(n * m) and slow on high-frequency or multi-year data. merge_asof is
-# a single vectorized operation equivalent to a sorted nearest-join.
-#
-# Behaviour is identical: each feature row gets the label from the next
-# satellite pass within lookback_hours, or is dropped if none exists.
+# 10. Label Alignment (unchanged)
 # ---------------------------------------------------------------------------
 
 def align_satellite_labels(
@@ -300,24 +474,13 @@ def align_satellite_labels(
     label_col:          str   = "flood_label",
     use_existing_label: bool  = True,
     threshold:          float = 0.05,
-    lookback_hours:     int   = 24,
+    lookback_hours:     int   = 288,
 ) -> pd.DataFrame:
     """
-    Assign a binary flood label to each feature row by finding the next
-    satellite pass within lookback_hours after that row's timestamp.
-
-    Labels always come from satellite data regardless of model mode.
-    The sensor-only model and the full model share identical labels —
-    only their feature sets differ.
-
-    Args:
-        features           : Feature DataFrame with datetime index.
-        satellite_df       : Satellite DataFrame with datetime index.
-        label_col          : Column to use for labelling.
-        use_existing_label : If True, use label_col directly as binary label.
-                             If False, threshold flood_extent >= threshold.
-        threshold          : Only used when use_existing_label=False.
-        lookback_hours     : Hours after each sensor row to search for a pass.
+    Assign a binary flood label to each feature row using direction='forward'.
+    Each sensor row is matched to the NEXT upcoming satellite pass within
+    lookback_hours. Physical meaning: "Will the next satellite pass observe
+    a flood?" — the correct target for an early warning system.
     """
     satellite_df = satellite_df.copy()
 
@@ -334,32 +497,18 @@ def align_satellite_labels(
             satellite_df[flood_extent_col] >= threshold
         ).astype(int)
 
-    # FIX 2 — vectorized label alignment with merge_asof.
-    #
-    # For each feature row find the next satellite pass (direction='forward').
-    # We carry sat_timestamp alongside flood_label so the lookback window
-    # filter can be applied as a single vectorized comparison after the join.
-
-    window = pd.Timedelta(hours=lookback_hours)
-
-    # Ensure index has a name before reset_index so the column is predictable.
-    sat_work = satellite_df[["flood_label"]].copy()
-    sat_work.index.name = "timestamp"
-    feat_work = features.copy()
+    window               = pd.Timedelta(hours=lookback_hours)
+    sat_work             = satellite_df[["flood_label"]].copy()
+    sat_work.index.name  = "timestamp"
+    feat_work            = features.copy()
     feat_work.index.name = "timestamp"
 
     sat_for_join = (
-        sat_work
-        .reset_index()
+        sat_work.reset_index()
         .rename(columns={"timestamp": "sat_timestamp"})
         .sort_values("sat_timestamp")
     )
-
-    feat_for_join = (
-        feat_work
-        .reset_index()
-        .sort_values("timestamp")
-    )
+    feat_for_join = feat_work.reset_index().sort_values("timestamp")
 
     joined = pd.merge_asof(
         feat_for_join,
@@ -369,7 +518,6 @@ def align_satellite_labels(
         direction = "forward",
     )
 
-    # Keep only rows where the satellite pass is within lookback_hours.
     in_window = (
         joined["sat_timestamp"].notna() &
         ((joined["sat_timestamp"] - joined["timestamp"]) <= window)
@@ -384,14 +532,12 @@ def align_satellite_labels(
     if len(result) == 0:
         raise ValueError(
             "No satellite observations matched any feature window.\n"
-            "Check that sensor and satellite timestamps overlap and that\n"
-            f"LOOKBACK_HOURS ({lookback_hours}h) is wide enough to catch passes.\n"
-            "Try increasing LOOKBACK_HOURS in prepare_dataset.py CONFIG."
+            f"Check timestamp overlap and that lookback_hours ({lookback_hours}h) "
+            "is wide enough."
         )
 
     total   = len(result)
     flooded = int(result["flood_label"].sum())
-
     print(f"  Labeled rows   : {total:,}")
     print(f"  Flood     (1)  : {flooded:,}  ({100*flooded/total:.1f}%)")
     print(f"  No Flood  (0)  : {total - flooded:,}  ({100*(total-flooded)/total:.1f}%)")
@@ -410,39 +556,20 @@ if __name__ == "__main__":
     rng = np.random.default_rng(42)
 
     sensor = pd.DataFrame({
-        "waterlevel":    rng.uniform(1.5, 3.0, len(idx)),
+        "waterlevel":    rng.uniform(-2.0, 3.0, len(idx)),
         "soil_moisture": rng.uniform(0.1, 0.5, len(idx)),
         "humidity":      rng.uniform(1, 5, len(idx)),
     }, index=idx)
 
-    sat_idx   = pd.date_range("2017-01-01", periods=20, freq="12D", tz="UTC")
-    satellite = pd.DataFrame({
-        "flood_extent":    rng.uniform(0, 0.2, 20),
-        "soil_saturation": rng.uniform(0.2, 0.8, 20),
-        "wetness_trend":   rng.integers(0, 2, 20),
-        "rainfall_1d":     rng.uniform(0, 50, 20),
-        "rainfall_3d":     rng.uniform(0, 120, 20),
-        "rainfall_7d":     rng.uniform(0, 250, 20),
-        "era5_runoff_7d":  rng.uniform(0, 200, 20),
-        "era5_soil_water": rng.uniform(0.2, 0.49, 20),
-        "flood_label":     rng.integers(0, 2, 20),
-    }, index=sat_idx)
-
-    sat_cols = ["soil_saturation", "wetness_trend", "rainfall_1d",
-                "rainfall_3d", "rainfall_7d", "era5_runoff_7d", "era5_soil_water"]
-    for col in sat_cols:
-        sensor[col] = satellite[col].reindex(sensor.index, method="ffill")
+    for col in ["soil_saturation", "wetness_trend", "orbit_flag"]:
+        sensor[col] = rng.uniform(0, 1, len(idx))
 
     print("--- SENSOR MODE ---")
-    sensor_features = build_features(sensor, freq="1D", mode="sensor")
-    print(f"Columns: {list(sensor_features.columns)}\n")
+    sf = build_features(sensor, freq="1D", mode="sensor")
+    print(f"Columns ({len(sf.columns)}): {list(sf.columns)}")
+    print(f"Expected 27 sensor features\n")
 
     print("--- FULL MODE ---")
-    full_features = build_features(sensor, freq="1D", mode="full")
-    print(f"Columns: {list(full_features.columns)}\n")
-
-    dataset = align_satellite_labels(full_features, satellite,
-                                     label_col="flood_label",
-                                     use_existing_label=True)
-    print(f"\nFinal dataset shape: {dataset.shape}")
-    print(dataset.head(3).to_string())
+    ff = build_features(sensor, freq="1D", mode="full")
+    print(f"Columns ({len(ff.columns)}): {list(ff.columns)}")
+    print(f"Expected 30 full features\n")

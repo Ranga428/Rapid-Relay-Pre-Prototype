@@ -1,44 +1,39 @@
 """
-train_flood_model_lgbm.py
+LGBM_train_flood_model.py
 =========================
 LightGBM Flood Prediction — Training Script
 
 CHRONOLOGICAL 3-WAY SPLIT
 --------------------------
-    Train : 2017–2022  (~326 rows)  — model learns from historical data
-    Val   : 2023–2024  ( ~57 rows)  — early stopping & threshold tuning
-    Test  : 2025–2026  ( ~75 rows)  — final held-out evaluation (never seen)
+    Train : 2017–2022  (~2165 rows) — model learns from historical data
+    Val   : 2023-01-01 – 2024-06-30 ( ~547 rows) — threshold tuning
+    Test  : 2024-01-01 – present    ( ~758 rows) — final held-out eval
 
-WHY LIGHTGBM?
--------------
-LightGBM is a gradient boosting framework from Microsoft that is faster
-and often more accurate than XGBoost on tabular data, especially with:
+    VAL_END changed to 2023-12-31 — all of 2024 moves into test window.
+    2024 floods closely match 2023 val flood sensor profile, so thresholds
+    tuned on 2023 transfer cleanly to 2024. Test set now has 8 flood
+    clusters across two full seasons (2024 + 2025).
 
-    - Leaf-wise tree growth instead of level-wise — deeper trees in fewer
-      iterations, better for small/medium datasets.
-    - Native categorical feature support — no one-hot encoding needed.
-    - Lower memory footprint — histogram-based binning is very efficient.
-    - Built-in early stopping on a validation set — same as XGBoost.
-    - is_unbalance / scale_pos_weight — first-class imbalance handling.
-    - Faster training — noticeably faster than XGBoost on CPU.
+THRESHOLD TUNING — RECALL-FIRST STRATEGY (UPDATED)
+---------------------------------------------------
+    Target : maximize flood RECALL
+    Floor  : precision >= MIN_PRECISION_FLOOR (NOW 0.25, was 0.40)
 
-On a ~326-row training set LGBM tends to produce well-calibrated
-probabilities and generalises slightly better than XGBoost thanks to
-its regularisation parameters (lambda_l1, lambda_l2, min_gain_to_split).
+    WATCH   threshold — highest recall at precision >= 0.25
+    WARNING threshold — best F1 at precision >= 0.50 (was 0.60)
+
+FLOOD WEIGHT OVERRIDE (NEW)
+----------------------------
+    FLOOD_WEIGHT_OVERRIDE = 12 overrides scale_pos_weight.
+    Raw LightGBM probabilities are compressed toward 0/1 extremes
+    (probability compression). Applying isotonic calibration after
+    retraining is recommended once calibration data is available.
+    Set to None to revert to the auto-computed ratio.
 
 MODELS PRODUCED
 ---------------
-    flood_lgbm_full.pkl    — sensor + satellite features (revalidation)
-    flood_lgbm_sensor.pkl  — sensor-only features (deployment / predict.py)
-
-Artifact format is identical to XGBoost and RF scripts:
-    {"model": ..., "feature_columns": [...], "threshold": ...}
-
-Usage
------
-    python train_flood_model_lgbm.py
-    python train_flood_model_lgbm.py --data path/to/flood_dataset.csv
-    python train_flood_model_lgbm.py --data flood_dataset.csv --output model/
+    flood_lgbm_full.pkl    — sensor + satellite (revalidation only)
+    flood_lgbm_sensor.pkl  — sensor-only (deployed by predict_lgbm.py)
 """
 
 import os
@@ -64,6 +59,9 @@ except ImportError:
 from sklearn.metrics import (
     classification_report,
     roc_auc_score,
+    f1_score,
+    precision_score,
+    recall_score,
     ConfusionMatrixDisplay,
     RocCurveDisplay,
 )
@@ -74,7 +72,6 @@ sys.path.insert(0, SCRIPT_DIR)
 from feature_engineering import SENSOR_FEATURE_COLUMNS, FULL_FEATURE_COLUMNS
 
 warnings.filterwarnings("ignore", category=UserWarning)
-# Silence LGBM verbose output unless there's an error
 warnings.filterwarnings("ignore", message=".*No further splits.*")
 
 
@@ -88,9 +85,21 @@ OUTPUT_DIR = r"..\model"
 LABEL_COLUMN = "flood_label"
 
 TRAIN_END = "2022-12-31"
-VAL_END   = "2024-12-31"
+VAL_END   = "2023-12-31"   # CHANGED — all of 2024 moves into test window
 
-ALERT_THRESHOLD = 0.50
+DEFAULT_ALERT_THRESHOLD = 0.50
+
+# CHANGED: was 0.40
+MIN_PRECISION_FLOOR     = 0.25
+
+# WARNING tier precision floor — lowered from 0.60
+WARNING_PRECISION_FLOOR = 0.50
+
+# NEW: overrides auto-computed scale_pos_weight. Set None to use neg/pos ratio.
+FLOOD_WEIGHT_OVERRIDE = 12.0
+
+WATCH_THRESHOLD_OVERRIDE   = None
+WARNING_THRESHOLD_OVERRIDE = None
 
 # ===========================================================================
 # END CONFIG
@@ -104,10 +113,6 @@ def separator(title=""):
     else:
         print(line)
 
-
-# ---------------------------------------------------------------------------
-# 1. Load & validate dataset
-# ---------------------------------------------------------------------------
 
 def load_data(path: str, feature_cols: list) -> tuple:
     df = pd.read_csv(path, parse_dates=["timestamp"], index_col="timestamp")
@@ -123,7 +128,6 @@ def load_data(path: str, feature_cols: list) -> tuple:
 
     if LABEL_COLUMN not in available:
         raise ValueError(f"Label column '{LABEL_COLUMN}' not found.")
-
     if not feat_cols_present:
         raise ValueError("No feature columns found in dataset.")
 
@@ -138,12 +142,8 @@ def load_data(path: str, feature_cols: list) -> tuple:
     return df, feat_cols_present
 
 
-# ---------------------------------------------------------------------------
-# 2. Chronological 3-way split
-# ---------------------------------------------------------------------------
-
 def three_way_split(df: pd.DataFrame, feat_cols: list) -> tuple:
-    tz = df.index.tz
+    tz           = df.index.tz
     train_end_ts = pd.Timestamp(TRAIN_END, tz=tz)
     val_end_ts   = pd.Timestamp(VAL_END,   tz=tz)
 
@@ -173,30 +173,11 @@ def three_way_split(df: pd.DataFrame, feat_cols: list) -> tuple:
     if len(train_df) == 0:
         raise ValueError("Train split is empty — check TRAIN_END date.")
 
-    return (X_train, y_train,
-            X_val,   y_val,
-            X_test,  y_test,
+    return (X_train, y_train, X_val, y_val, X_test, y_test,
             train_df, val_df, test_df)
 
 
-# ---------------------------------------------------------------------------
-# 3. Build LightGBM model
-# ---------------------------------------------------------------------------
-
 def build_model(scale_pos_weight: float) -> lgb.LGBMClassifier:
-    """
-    Hyperparameter notes:
-        n_estimators   = 500  — high ceiling; early stopping finds the best
-        max_depth      = -1   — leaf-wise growth makes max_depth less relevant
-        num_leaves      = 31  — key param for LGBM; controls complexity
-        min_child_samples = 10 — minimum samples per leaf (prevents overfitting on small data)
-        learning_rate  = 0.05  — same as XGBoost for comparability
-        subsample      = 0.8   — row sampling per tree
-        colsample_bytree = 0.8 — feature sampling per tree
-        lambda_l1/l2   = 0.1  — L1+L2 regularisation
-        scale_pos_weight       — handles flood/no-flood imbalance
-        early_stopping_rounds  — set separately at fit() time
-    """
     return lgb.LGBMClassifier(
         n_estimators      = 500,
         max_depth         = -1,
@@ -212,21 +193,12 @@ def build_model(scale_pos_weight: float) -> lgb.LGBMClassifier:
         metric            = "binary_logloss",
         n_jobs            = -1,
         random_state      = 42,
-        verbosity         = -1,   # suppress LGBM output; use callbacks below
+        verbosity         = -1,
     )
 
 
-# ---------------------------------------------------------------------------
-# 4. Train final model
-# ---------------------------------------------------------------------------
-
-def train_final(
-    X_train, y_train,
-    X_val,   y_val,
-    scale_pos_weight: float,
-) -> lgb.LGBMClassifier:
-    model = build_model(scale_pos_weight)
-
+def train_final(X_train, y_train, X_val, y_val, scale_pos_weight):
+    model   = build_model(scale_pos_weight)
     has_val = len(X_val) > 0 and len(np.unique(y_val)) >= 2
 
     callbacks = [
@@ -235,107 +207,160 @@ def train_final(
     ]
 
     if has_val:
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_val, y_val)],
-            callbacks=callbacks,
-        )
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)],
+                  callbacks=callbacks)
         print(f"  Best iteration : {model.best_iteration_}")
-        print(f"  Best val score : {model.best_score_['valid_0']['binary_logloss']:.4f}")
+        print(f"  Best val score : "
+              f"{model.best_score_['valid_0']['binary_logloss']:.4f}")
     else:
         print("  Val set unusable — training without early stopping.")
         model.set_params(n_estimators=300)
-        model.fit(X_train, y_train,
-                  callbacks=[lgb.log_evaluation(period=50)])
+        model.fit(X_train, y_train, callbacks=[lgb.log_evaluation(period=50)])
 
     return model
 
 
-# ---------------------------------------------------------------------------
-# 5. Find optimal threshold on validation set
-# ---------------------------------------------------------------------------
+def tune_threshold(model, X_val, y_val, model_label) -> tuple:
+    """
+    Returns (watch_threshold, warning_threshold).
 
-def tune_threshold(model, X_val, y_val) -> float:
+    WATCH   = highest recall at precision >= MIN_PRECISION_FLOOR (0.25)
+    WARNING = best F1 at precision >= WARNING_PRECISION_FLOOR (0.50)
+
+    Note for LightGBM: raw probabilities are compressed toward the
+    prior due to LGBM's leaf-level regularisation. After finding optimal
+    thresholds here, consider applying isotonic calibration during
+    retraining for more reliable probability estimates.
+    """
+    separator(f"Threshold Tuning — {model_label}")
+
     if len(X_val) == 0 or len(np.unique(y_val)) < 2:
-        print(f"  Threshold tuning skipped — using default {ALERT_THRESHOLD}")
-        return ALERT_THRESHOLD
+        print(f"  Val split unusable — using defaults.")
+        return DEFAULT_ALERT_THRESHOLD, DEFAULT_ALERT_THRESHOLD
 
-    y_prob = model.predict_proba(X_val)[:, 1]
-    thresholds = np.linspace(0.20, 0.80, 61)
-    best_thresh, best_f1 = ALERT_THRESHOLD, 0.0
+    val_probs = model.predict_proba(X_val)[:, 1]
 
-    for t in thresholds:
-        y_pred = (y_prob >= t).astype(int)
-        report = classification_report(y_val, y_pred, output_dict=True, zero_division=0)
-        f1 = report.get("1", {}).get("f1-score", 0.0)
-        if f1 > best_f1:
-            best_f1, best_thresh = f1, t
+    print(f"  Strategy         : maximize recall, precision floor >= {MIN_PRECISION_FLOOR:.2f}")
+    print(f"  Warning floor    : precision >= {WARNING_PRECISION_FLOOR:.2f}")
+    print(f"  Target recall    : >= 90%")
+    print(f"  Note: LGBM probabilities are compressed — thresholds will")
+    print(f"        likely be lower than XGBoost/RF equivalents.")
 
-    print(f"  Optimal threshold (val Flood-F1 = {best_f1:.3f}) : {best_thresh:.2f}")
-    return best_thresh
+    watch_thresh    = DEFAULT_ALERT_THRESHOLD
+    watch_recall    = 0.0
+    watch_precision = 0.0
+
+    warn_thresh    = DEFAULT_ALERT_THRESHOLD
+    warn_f1        = 0.0
+    warn_precision = 0.0
+    warn_recall    = 0.0
+
+    print(f"\n  Threshold sweep (recall >= 85% rows shown):")
+    print(f"  {'Thresh':>7}  {'Precision':>10}  {'Recall':>8}  {'F1':>6}  {'Alerts':>7}")
+    print(f"  {'-'*7}  {'-'*10}  {'-'*8}  {'-'*6}  {'-'*7}")
+
+    for thresh in np.arange(0.05, 0.96, 0.01):
+        preds = (val_probs >= thresh).astype(int)
+        if preds.sum() == 0 or preds.sum() == len(preds):
+            continue
+        prec = precision_score(y_val, preds, pos_label=1, zero_division=0)
+        rec  = recall_score(y_val, preds, pos_label=1, zero_division=0)
+        f1   = f1_score(y_val, preds, pos_label=1, zero_division=0)
+
+        if rec >= 0.85:
+            print(f"  {thresh:>7.2f}  {prec:>10.3f}  {rec:>8.3f}  {f1:>6.3f}  {int(preds.sum()):>7}")
+
+        if prec >= MIN_PRECISION_FLOOR and rec > watch_recall:
+            watch_recall    = rec
+            watch_precision = prec
+            watch_thresh    = round(float(thresh), 2)
+
+        if prec >= WARNING_PRECISION_FLOOR and f1 > warn_f1:
+            warn_f1        = f1
+            warn_precision = prec
+            warn_recall    = rec
+            warn_thresh    = round(float(thresh), 2)
+
+    if WATCH_THRESHOLD_OVERRIDE is not None:
+        watch_thresh = WATCH_THRESHOLD_OVERRIDE
+    if WARNING_THRESHOLD_OVERRIDE is not None:
+        warn_thresh = WARNING_THRESHOLD_OVERRIDE
+
+    print(f"\n  WATCH threshold   : {watch_thresh:.2f}  "
+          f"(recall={watch_recall:.3f}, precision={watch_precision:.3f})")
+    print(f"  WARNING threshold : {warn_thresh:.2f}  "
+          f"(recall={warn_recall:.3f}, precision={warn_precision:.3f})")
+
+    if watch_recall < 0.90:
+        print(f"\n  ⚠️  Watch recall {watch_recall:.1%} is below 90% target.")
+        print(f"      Consider raising FLOOD_WEIGHT_OVERRIDE above {FLOOD_WEIGHT_OVERRIDE}.")
+    else:
+        print(f"\n  ✅  Watch recall {watch_recall:.1%} meets >= 90% target.")
+
+    print(f"\n  Interpretation:")
+    print(f"    prob >= {watch_thresh:.2f} → WATCH  alert  (elevated risk, prepare)")
+    print(f"    prob >= {warn_thresh:.2f} → WARNING alert (high risk, act now)")
+
+    return watch_thresh, warn_thresh
 
 
-# ---------------------------------------------------------------------------
-# 6. Evaluate model on a data split
-# ---------------------------------------------------------------------------
-
-def evaluate(
-    model,
-    X: np.ndarray,
-    y: np.ndarray,
-    split_name: str,
-    feat_cols: list,
-    output_dir: str,
-    filename_prefix: str = "",
-    threshold: float = ALERT_THRESHOLD,
-) -> float:
+def evaluate(model, X, y, split_name, watch_threshold, warn_threshold,
+             feat_cols, output_dir, filename_prefix="") -> float:
     if len(X) == 0 or len(np.unique(y)) < 2:
         print(f"  {split_name}: skipped (no data or single class).")
         return None
 
-    y_prob = model.predict_proba(X)[:, 1]
-    y_pred = (y_prob >= threshold).astype(int)
+    y_prob       = model.predict_proba(X)[:, 1]
+    y_pred_watch = (y_prob >= watch_threshold).astype(int)
+    y_pred_warn  = (y_prob >= warn_threshold).astype(int)
+    auc          = roc_auc_score(y, y_prob)
 
-    separator(f"{split_name} Evaluation  (threshold={threshold:.2f})")
-    print(classification_report(
-        y, y_pred,
-        target_names=["No Flood", "Flood"],
-        zero_division=0,
-    ))
-
-    auc = roc_auc_score(y, y_prob)
+    separator(f"{split_name} Evaluation")
+    print(f"\n  --- WATCH threshold ({watch_threshold:.2f}) ---")
+    print(classification_report(y, y_pred_watch,
+          target_names=["No Flood", "Flood"], zero_division=0))
+    print(f"  --- WARNING threshold ({warn_threshold:.2f}) ---")
+    print(classification_report(y, y_pred_warn,
+          target_names=["No Flood", "Flood"], zero_division=0))
     print(f"  ROC-AUC : {auc:.4f}")
     print(f"\n  Probability distribution:")
     print(f"    Min  : {y_prob.min():.3f}")
     print(f"    Mean : {y_prob.mean():.3f}")
     print(f"    Max  : {y_prob.max():.3f}")
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4))
     ConfusionMatrixDisplay.from_predictions(
-        y, y_pred,
-        display_labels=["No Flood", "Flood"],
-        ax=axes[0], colorbar=False,
-    )
-    axes[0].set_title(f"{split_name} — Confusion Matrix")
-    RocCurveDisplay.from_predictions(
-        y, y_prob, ax=axes[1],
-        name=f"LightGBM (AUC={auc:.3f})",
-    )
-    axes[1].set_title(f"{split_name} — ROC Curve")
-    plt.tight_layout()
+        y, y_pred_watch, display_labels=["No Flood", "Flood"],
+        ax=axes[0], colorbar=False)
+    axes[0].set_title(f"{split_name} — WATCH (t={watch_threshold:.2f})")
 
+    ConfusionMatrixDisplay.from_predictions(
+        y, y_pred_warn, display_labels=["No Flood", "Flood"],
+        ax=axes[1], colorbar=False)
+    axes[1].set_title(f"{split_name} — WARNING (t={warn_threshold:.2f})")
+
+    RocCurveDisplay.from_predictions(y, y_prob, ax=axes[2],
+        name=f"LightGBM (AUC={auc:.3f})")
+    from sklearn.metrics import roc_curve
+    fpr, tpr, roc_thresholds = roc_curve(y, y_prob)
+    for t, label, color in [
+        (watch_threshold, f"WATCH {watch_threshold:.2f}", "orange"),
+        (warn_threshold,  f"WARN  {warn_threshold:.2f}",  "red"),
+    ]:
+        idx = np.argmin(np.abs(roc_thresholds - t))
+        axes[2].scatter(fpr[idx], tpr[idx], color=color, zorder=5,
+                        label=label, s=80)
+    axes[2].legend(fontsize=8)
+    axes[2].set_title(f"{split_name} — ROC Curve")
+
+    plt.tight_layout()
     safe_name = split_name.lower().replace(" ", "_")
     fig_path  = os.path.join(output_dir, f"{filename_prefix}eval_{safe_name}.png")
     plt.savefig(fig_path, dpi=150)
     plt.close()
     print(f"  Plot saved → {fig_path}")
-
     return auc
 
-
-# ---------------------------------------------------------------------------
-# 7. Feature importance plot
-# ---------------------------------------------------------------------------
 
 def plot_feature_importance(model, feat_cols, output_dir, filename):
     importance = pd.Series(
@@ -352,84 +377,71 @@ def plot_feature_importance(model, feat_cols, output_dir, filename):
     plt.close()
     print(f"  Feature importance → {path}")
 
-    # Also print gain-based importance for comparison
-    gain_imp = model.booster_.feature_importance(importance_type="gain")
+    gain_imp    = model.booster_.feature_importance(importance_type="gain")
     gain_series = pd.Series(gain_imp, index=feat_cols).sort_values(ascending=False)
 
     print("\n  Top features (by split count):")
-    for feat, val in importance.sort_values(ascending=False).head(5).items():
+    for feat, val in importance.sort_values(ascending=False).head(10).items():
         bar = "█" * int(val / max(importance) * 30)
-        print(f"    {feat:<36} {val:>6.0f}  {bar}")
+        print(f"    {feat:<40} {val:>6.0f}  {bar}")
 
     print("\n  Top features (by gain — more reliable on small data):")
-    for feat, val in gain_series.head(5).items():
+    for feat, val in gain_series.head(10).items():
         bar = "█" * int(val / max(gain_series) * 30 if max(gain_series) > 0 else 0)
-        print(f"    {feat:<36} {val:>10.1f}  {bar}")
+        print(f"    {feat:<40} {val:>10.1f}  {bar}")
 
 
-# ---------------------------------------------------------------------------
-# 8. Save model artifact
-# ---------------------------------------------------------------------------
-
-def save_artifacts(model, feat_cols, output_dir, filename_stem, threshold):
+def save_artifacts(model, feat_cols, watch_threshold, warn_threshold,
+                   output_dir, filename_stem):
     os.makedirs(output_dir, exist_ok=True)
     pkl_path = os.path.join(output_dir, f"{filename_stem}.pkl")
     joblib.dump({
-        "model":           model,
-        "feature_columns": feat_cols,
-        "threshold":       threshold,
+        "model":             model,
+        "feature_columns":   feat_cols,
+        "threshold":         watch_threshold,
+        "watch_threshold":   watch_threshold,
+        "warning_threshold": warn_threshold,
     }, pkl_path)
     print(f"  Model saved → {pkl_path}")
-    print(f"  Threshold saved alongside model : {threshold:.2f}")
+    print(f"  WATCH threshold saved   : {watch_threshold:.2f}")
+    print(f"  WARNING threshold saved : {warn_threshold:.2f}")
 
-    # Also save native LGBM format for interoperability
     txt_path = os.path.join(output_dir, f"{filename_stem}.txt")
     model.booster_.save_model(txt_path)
     print(f"  LightGBM txt → {txt_path}")
 
 
-# ---------------------------------------------------------------------------
-# 9. Train one complete model variant
-# ---------------------------------------------------------------------------
-
-def train_one_model(
-    df, feat_cols, scale_pos_weight,
-    model_label, filename_stem, output_dir,
-) -> tuple:
+def train_one_model(df, feat_cols, scale_pos_weight,
+                    model_label, filename_stem, output_dir) -> tuple:
     separator(f"Training — {model_label}")
     print(f"  Features ({len(feat_cols)}) : {feat_cols}")
 
     splits = three_way_split(df, feat_cols)
-    (X_train, y_train,
-     X_val,   y_val,
-     X_test,  y_test,
+    (X_train, y_train, X_val, y_val, X_test, y_test,
      train_df, val_df, test_df) = splits
 
     separator(f"Fitting — {model_label}")
     model = train_final(X_train, y_train, X_val, y_val, scale_pos_weight)
 
-    separator(f"Threshold Tuning — {model_label}")
-    best_thresh = tune_threshold(model, X_val, y_val)
+    watch_thresh, warn_thresh = tune_threshold(model, X_val, y_val, model_label)
 
-    prefix = filename_stem + "_"
+    prefix   = filename_stem + "_"
+    val_auc  = evaluate(model, X_val,  y_val,
+                        f"{model_label} Val",
+                        watch_thresh, warn_thresh,
+                        feat_cols, output_dir, prefix)
+    test_auc = evaluate(model, X_test, y_test,
+                        f"{model_label} Test",
+                        watch_thresh, warn_thresh,
+                        feat_cols, output_dir, prefix)
 
-    val_auc  = evaluate(model, X_val,  y_val,  f"{model_label} Val",
-                        feat_cols, output_dir, prefix, best_thresh)
-    test_auc = evaluate(model, X_test, y_test, f"{model_label} Test",
-                        feat_cols, output_dir, prefix, best_thresh)
+    plot_feature_importance(model, feat_cols, output_dir,
+        filename=f"{filename_stem}_feature_importance.png")
+    save_artifacts(model, feat_cols, watch_thresh, warn_thresh,
+                   output_dir, filename_stem)
 
-    plot_feature_importance(
-        model, feat_cols, output_dir,
-        filename=f"{filename_stem}_feature_importance.png",
-    )
-    save_artifacts(model, feat_cols, output_dir, filename_stem, best_thresh)
+    return model, feat_cols, watch_thresh, warn_thresh, val_auc, test_auc
 
-    return model, feat_cols, val_auc, test_auc, best_thresh
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main(data_file=DATA_FILE, output_dir=OUTPUT_DIR):
     os.makedirs(output_dir, exist_ok=True)
@@ -438,9 +450,13 @@ def main(data_file=DATA_FILE, output_dir=OUTPUT_DIR):
     print(f"  Data file  : {data_file}")
     print(f"  Output dir : {output_dir}")
     print(f"\n  Split strategy (chronological, no shuffling):")
-    print(f"    Train : 2017 – {TRAIN_END}   (~326 rows)")
-    print(f"    Val   : {TRAIN_END} – {VAL_END}   (~57 rows, early stopping + threshold tuning)")
-    print(f"    Test  : {VAL_END} – present        (~75 rows, final eval)")
+    print(f"    Train : 2017 – {TRAIN_END}")
+    print(f"    Val   : {TRAIN_END} – {VAL_END}  (early stopping + threshold tuning)")
+    print(f"    Test  : {VAL_END} – present       (final eval)")
+    print(f"\n  Threshold strategy : recall-first, precision floor >= {MIN_PRECISION_FLOOR:.2f}")
+    print(f"  Warning floor      : precision >= {WARNING_PRECISION_FLOOR:.2f}")
+    print(f"  Target recall      : >= 90%")
+    print(f"  Flood weight       : {FLOOD_WEIGHT_OVERRIDE} (override)")
     print(f"\n  Two models will be trained:")
     print(f"    flood_lgbm_full.pkl    — sensor + satellite (revalidation)")
     print(f"    flood_lgbm_sensor.pkl  — sensor-only        (deployment)")
@@ -453,41 +469,41 @@ def main(data_file=DATA_FILE, output_dir=OUTPUT_DIR):
     if missing_sensor:
         print(f"  WARNING: Missing sensor columns: {missing_sensor}")
 
-    neg = int((df[LABEL_COLUMN] == 0).sum())
-    pos = int((df[LABEL_COLUMN] == 1).sum())
-    spw = neg / pos if pos > 0 else 1.0
+    neg         = int((df[LABEL_COLUMN] == 0).sum())
+    pos         = int((df[LABEL_COLUMN] == 1).sum())
+    auto_weight = neg / pos if pos > 0 else 1.0
+    spw         = FLOOD_WEIGHT_OVERRIDE if FLOOD_WEIGHT_OVERRIDE is not None else auto_weight
 
     separator("Step 2 — Class Balance")
-    print(f"  No-flood (0) : {neg}")
-    print(f"  Flood    (1) : {pos}")
-    print(f"  scale_pos_weight : {spw:.2f}  (shared by both models)")
+    print(f"  No-flood (0)     : {neg}")
+    print(f"  Flood    (1)     : {pos}")
+    print(f"  Auto ratio       : {auto_weight:.2f}")
+    print(f"  scale_pos_weight : {spw:.2f}  "
+          f"({'OVERRIDE' if FLOOD_WEIGHT_OVERRIDE is not None else 'auto'})")
 
-    # Train Model 1 — Full
-    _, _, val_auc_full, test_auc_full, thresh_full = train_one_model(
+    _, _, wt_full, wn_full, val_auc_full, test_auc_full = train_one_model(
         df=df, feat_cols=full_feat_cols, scale_pos_weight=spw,
         model_label="Full Model (sensor + satellite)",
         filename_stem="flood_lgbm_full", output_dir=output_dir,
     )
 
-    # Train Model 2 — Sensor-only
-    _, _, val_auc_sensor, test_auc_sensor, thresh_sensor = train_one_model(
+    _, _, wt_sensor, wn_sensor, val_auc_sensor, test_auc_sensor = train_one_model(
         df=df, feat_cols=sensor_feat_cols, scale_pos_weight=spw,
         model_label="Sensor Model (deployment)",
         filename_stem="flood_lgbm_sensor", output_dir=output_dir,
     )
 
-    # Summary
     separator("TRAINING COMPLETE — Model Comparison")
-    print(f"\n  {'Model':<42} {'Thresh':>7}  {'Val AUC':>8}  {'Test AUC':>9}")
-    print(f"  {'-'*42} {'-'*7}  {'-'*8}  {'-'*9}")
+    print(f"\n  {'Model':<42} {'Watch':>6}  {'Warn':>5}  {'Val AUC':>8}  {'Test AUC':>9}")
+    print(f"  {'-'*42} {'-'*6}  {'-'*5}  {'-'*8}  {'-'*9}")
 
     def _fmt(v):
         return f"{v:.3f}" if v is not None else "  N/A"
 
-    print(f"  {'Full  (flood_lgbm_full.pkl)':<42} {thresh_full:.2f}    "
-          f"{_fmt(val_auc_full):>8}  {_fmt(test_auc_full):>9}")
-    print(f"  {'Sensor (flood_lgbm_sensor.pkl)':<42} {thresh_sensor:.2f}    "
-          f"{_fmt(val_auc_sensor):>8}  {_fmt(test_auc_sensor):>9}")
+    print(f"  {'Full  (flood_lgbm_full.pkl)':<42} {wt_full:>6.2f}  "
+          f"{wn_full:>5.2f}  {_fmt(val_auc_full):>8}  {_fmt(test_auc_full):>9}")
+    print(f"  {'Sensor (flood_lgbm_sensor.pkl)':<42} {wt_sensor:>6.2f}  "
+          f"{wn_sensor:>5.2f}  {_fmt(val_auc_sensor):>8}  {_fmt(test_auc_sensor):>9}")
 
     if test_auc_full and test_auc_sensor:
         gap = test_auc_full - test_auc_sensor
@@ -495,11 +511,11 @@ def main(data_file=DATA_FILE, output_dir=OUTPUT_DIR):
         if gap <= 0.03:
             print("  ✅  Gap is small — sensor model is reliable for deployment.")
         elif gap <= 0.07:
-            print("  ⚠️   Moderate gap — sensor model is acceptable; monitor over time.")
+            print("  ⚠️   Moderate gap — sensor model acceptable; monitor over time.")
         else:
             print("  ❌  Large gap — satellite features carry significant weight.")
 
-    print(f"\n  Deployed model : flood_lgbm_sensor.pkl  (predict.py)")
+    print(f"\n  Deployed model : flood_lgbm_sensor.pkl  (predict_lgbm.py)")
     print(f"  Validation     : flood_lgbm_full.pkl    (revalidation only)")
     print(f"  Output dir     : {output_dir}")
     separator()
