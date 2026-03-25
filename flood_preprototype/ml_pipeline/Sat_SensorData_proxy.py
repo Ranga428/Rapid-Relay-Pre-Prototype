@@ -41,11 +41,25 @@ OUTPUT
     data/sensor/obando_environmental_data.csv
     Columns: timestamp, waterlevel, soil_moisture, humidity
     New rows are APPENDED. Existing rows are never modified.
+    --full overwrites the entire CSV with a fresh pull from HISTORY_START.
+
+NaN BACKFILL BEHAVIOUR
+----------------------
+On every incremental run, the script inspects the last NAN_LOOKBACK_DAYS
+rows of the existing CSV. If any soil_moisture or humidity values are NaN
+(expected for the most recent ~5 days due to ERA5/MODIS publication lag),
+it re-fetches from the earliest NaN row so those values get filled in once
+the upstream providers have published them.
 
 Requirements:
     pip install earthengine-api geemap pandas requests copernicusmarine
     earthengine authenticate
     copernicusmarine login   ← one-time CMEMS credential setup (free account)
+
+Usage
+-----
+    python Sat_SensorData_proxy.py              # incremental (auto-detects last date)
+    python Sat_SensorData_proxy.py --full       # force full history re-pull from 2017-01-01
 """
 
 import gc
@@ -53,6 +67,7 @@ import ee
 import io
 import os
 import json
+import argparse
 import requests
 import pandas as pd
 from pathlib import Path
@@ -61,7 +76,11 @@ from datetime import date, timedelta
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
 GEE_PROJECT    = "jenel-466709"
-HISTORY_START  = "2017-01-01"   # only used on first-ever run (empty CSV)
+HISTORY_START  = "2017-01-01"   # only used on first-ever run (empty CSV) or --full
+
+# How many trailing rows to inspect for NaN backfill on each incremental run.
+# ERA5 lag ~5-7 days, MODIS lag ~2-4 days. 14 days gives comfortable headroom.
+NAN_LOOKBACK_DAYS = 14
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _AOI_PATH   = _SCRIPT_DIR.parent / "config" / "aoi.geojson"
@@ -83,40 +102,75 @@ _UHSLC_ERDDAP_URL = (
 
 # ─── DYNAMIC DATE RANGE ───────────────────────────────────────────────────────
 
-def get_date_range() -> tuple[str, str]:
+def get_date_range(force_full: bool = False) -> tuple[str, str]:
     """
-    Determine the incremental date range to fetch.
+    Determine the date range to fetch.
 
-    If the output CSV exists and has data, pull from last_date + 1 day → today.
-    If the CSV is empty or missing, pull full history from HISTORY_START → today.
+    force_full=True  → always pull from HISTORY_START regardless of CSV state.
+    force_full=False → incremental: pull from the earliest date that either
+                       (a) has NaN for soil_moisture or humidity in the last
+                       NAN_LOOKBACK_DAYS rows, or (b) is the day after the
+                       last recorded row. Falls back to full history if the
+                       CSV is missing or empty.
 
     Returns (start_date_str, end_date_str) as 'YYYY-MM-DD' strings.
+    Returns (None, None) if already up to date with no NaN gaps to fill.
     End date is tomorrow (exclusive upper bound for GEE filterDate).
     """
-    today     = date.today()
-    end_date  = (today + timedelta(days=1)).strftime("%Y-%m-%d")  # exclusive
+    today    = date.today()
+    end_date = (today + timedelta(days=1)).strftime("%Y-%m-%d")  # exclusive
 
-    if OUTPUT_CSV.exists():
-        try:
-            existing = pd.read_csv(OUTPUT_CSV, usecols=["timestamp"], parse_dates=["timestamp"])
-            if len(existing) > 0:
-                last_date  = existing["timestamp"].max()
-                # Normalize to date (strip time/tz if present)
-                if hasattr(last_date, "date"):
-                    last_date = last_date.date()
-                start_date = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
+    if force_full or not OUTPUT_CSV.exists():
+        mode = "full history (forced)" if force_full else "full history (no CSV found)"
+        print(f"  Sensor CSV pull mode: {mode}")
+        print(f"  Range: {HISTORY_START} → {today}")
+        return HISTORY_START, end_date
 
-                if start_date >= end_date:
-                    print(f"  Sensor CSV already up to date (last: {last_date}). Nothing to fetch.")
-                    return None, None
+    try:
+        existing = pd.read_csv(OUTPUT_CSV, parse_dates=["timestamp"])
+        if len(existing) == 0:
+            print(f"  Sensor CSV pull mode: full history (CSV empty)")
+            return HISTORY_START, end_date
 
-                print(f"  Incremental mode: {start_date} → {today} ({(today - (last_date + timedelta(days=1))).days + 1} days)")
-                return start_date, end_date
-        except Exception as e:
-            print(f"  WARNING: Could not read existing CSV ({e}). Falling back to full history.")
+        existing["timestamp"] = pd.to_datetime(existing["timestamp"])
+        last_date = existing["timestamp"].max()
+        if hasattr(last_date, "date"):
+            last_date = last_date.date()
 
-    print(f"  Full history mode: {HISTORY_START} → {today}")
-    return HISTORY_START, end_date
+        # ── NaN backfill check ────────────────────────────────────────────
+        # Look at the last NAN_LOOKBACK_DAYS rows for any NaN in sensor cols.
+        # If found, start the pull from the earliest NaN row so those gaps
+        # get re-fetched and overwritten once upstream data is available.
+        tail = existing.tail(NAN_LOOKBACK_DAYS).copy()
+        nan_mask = tail[["soil_moisture", "humidity"]].isnull().any(axis=1)
+
+        if nan_mask.any():
+            earliest_nan_ts = tail.loc[nan_mask, "timestamp"].min()
+            earliest_nan    = earliest_nan_ts.date() if hasattr(earliest_nan_ts, "date") else pd.Timestamp(earliest_nan_ts).date()
+            start_date      = earliest_nan.strftime("%Y-%m-%d")
+            n_nan_rows      = int(nan_mask.sum())
+            print(f"  Sensor CSV pull mode: incremental (+ NaN backfill)")
+            print(f"  Last row in CSV : {last_date}")
+            print(f"  NaN rows found  : {n_nan_rows} in last {NAN_LOOKBACK_DAYS} rows")
+            print(f"  Pulling from    : {start_date} (earliest NaN) → {today}")
+        else:
+            # No NaN gaps — just pull genuinely new days
+            start_date = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
+
+            if start_date >= end_date:
+                print(f"  Sensor CSV already up to date (last: {last_date}). Nothing to fetch.")
+                return None, None
+
+            n_days = (today - (last_date + timedelta(days=1))).days + 1
+            print(f"  Sensor CSV pull mode: incremental")
+            print(f"  Last row in CSV : {last_date}")
+            print(f"  Pulling         : {start_date} → {today} ({n_days} days)")
+
+        return start_date, end_date
+
+    except Exception as e:
+        print(f"  WARNING: Could not read existing CSV ({e}). Falling back to full history.")
+        return HISTORY_START, end_date
 
 
 # ─── NORMALIZATION REFERENCE ──────────────────────────────────────────────────
@@ -507,8 +561,6 @@ def get_tidal_level(
     gc.collect()
 
     # ── Normalise ─────────────────────────────────────────────────────────
-    # If this is a full-history first run (norm_mu=0, norm_std=1 default),
-    # compute the reference from this batch's 2017-2021 window.
     REF_START = pd.Timestamp("2017-01-01")
     REF_END   = pd.Timestamp("2021-07-01")
 
@@ -526,15 +578,12 @@ def get_tidal_level(
         ).astype("float32")
 
     if not df_cmems.empty:
-        # CMEMS: use its own ref window if available, else use UHSLC constants
         ref_mask = (df_cmems["timestamp"] >= REF_START) & (df_cmems["timestamp"] < REF_END)
         if ref_mask.sum() > 10:
             cmems_mu  = float(df_cmems.loc[ref_mask, "waterlevel"].mean())
             cmems_std = float(df_cmems.loc[ref_mask, "waterlevel"].std())
             cmems_std = cmems_std if cmems_std > 0 else 1.0
         else:
-            # Incremental run — not enough CMEMS history in this batch.
-            # Use UHSLC reference constants (same scale).
             cmems_mu, cmems_std = norm_mu, norm_std
         df_cmems["waterlevel"] = (
             (df_cmems["waterlevel"] - cmems_mu) / cmems_std
@@ -551,14 +600,36 @@ def get_tidal_level(
     return df[["timestamp", "waterlevel"]]
 
 
-# ─── MERGE & APPEND ───────────────────────────────────────────────────────────
+# ─── MERGE & APPEND / OVERWRITE ───────────────────────────────────────────────
 
-def append_to_csv(new_df: pd.DataFrame) -> None:
+def save_to_csv(new_df: pd.DataFrame, force_full: bool = False) -> None:
     """
-    Append new_df rows to the existing CSV.
-    Deduplicates on timestamp so re-running never creates duplicate rows.
-    Sorts the full CSV by timestamp before saving.
+    Incremental mode (force_full=False):
+        Appends new_df to the existing CSV.
+        Deduplicates on timestamp — new row wins on conflict, so any rows
+        that were previously NaN but now have real values will be overwritten.
+        Sorts the full CSV by timestamp before saving.
+
+    Full mode (force_full=True):
+        Overwrites the CSV entirely with new_df.
+        No merge with existing data.
     """
+    if force_full:
+        # Overwrite — no merge needed
+        df_out = new_df.copy()
+        df_out["timestamp"] = pd.to_datetime(df_out["timestamp"]).dt.strftime("%Y-%m-%dT%H:%M:%S")
+        for col in ["waterlevel", "soil_moisture", "humidity"]:
+            if col in df_out.columns:
+                df_out[col] = df_out[col].astype("float32")
+        df_out = df_out[["timestamp", "waterlevel", "soil_moisture", "humidity"]]
+        df_out.to_csv(OUTPUT_CSV, index=False)
+        print(f"\n✓ Saved (full overwrite) → {OUTPUT_CSV}")
+        print(f"  Total rows written : {len(df_out)}")
+        return
+
+    # Incremental — merge with existing.
+    # keep="last" means the newly fetched row wins, so a previously-NaN
+    # row gets replaced by the freshly fetched (now populated) value.
     if OUTPUT_CSV.exists():
         existing = pd.read_csv(OUTPUT_CSV, parse_dates=["timestamp"])
         combined = pd.concat([existing, new_df], ignore_index=True)
@@ -566,50 +637,60 @@ def append_to_csv(new_df: pd.DataFrame) -> None:
     else:
         combined = new_df.copy()
 
-    # Deduplicate — keep last (new row wins if same timestamp)
     combined["timestamp"] = pd.to_datetime(combined["timestamp"])
     combined = combined.drop_duplicates(subset=["timestamp"], keep="last")
     combined.sort_values("timestamp", inplace=True)
     combined.reset_index(drop=True, inplace=True)
-
-    # Format timestamp for CSV
     combined["timestamp"] = combined["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S")
-
     for col in ["waterlevel", "soil_moisture", "humidity"]:
         if col in combined.columns:
             combined[col] = combined[col].astype("float32")
-
     combined = combined[["timestamp", "waterlevel", "soil_moisture", "humidity"]]
     combined.to_csv(OUTPUT_CSV, index=False)
-    print(f"\n✓ Saved → {OUTPUT_CSV}")
-    print(f"  Total rows now : {len(combined)}")
+
+    # Report how many previously-NaN rows were filled
+    nan_after  = combined[["soil_moisture", "humidity"]].isnull().any(axis=1).sum()
+    print(f"\n✓ Saved (incremental append) → {OUTPUT_CSV}")
+    print(f"  Total rows now     : {len(combined)}")
+    print(f"  Rows still NaN     : {nan_after} (upstream data not yet published)")
 
 
 # ─── ENTRY POINT ──────────────────────────────────────────────────────────────
 
-def run_pipeline() -> bool:
+def run_pipeline(force_full: bool = False) -> bool:
     """
     Main entry point. Called directly or imported by Start.py.
-    Returns True if new data was fetched and appended, False if already up to date.
+
+    force_full=True  — re-pull everything from HISTORY_START, overwrite CSV.
+    force_full=False — incremental append + NaN backfill (default, used by Start.py daily run).
+
+    Returns True if new data was fetched and written, False if already up to date.
     """
     print("\n" + "=" * 55)
-    print("  Sat_SensorData_proxy — Incremental Sensor Update")
+    print("  Sat_SensorData_proxy — Sensor Update")
+    print(f"  Mode: {'FULL HISTORY RE-PULL' if force_full else 'incremental append'}")
     print("=" * 55)
 
-    start_date, end_date = get_date_range()
+    start_date, end_date = get_date_range(force_full=force_full)
 
     if start_date is None:
-        # Already up to date
+        # Already up to date with no NaN gaps (incremental mode only)
         return False
 
-    # Load normalisation constants from existing CSV before touching GEE
-    norm_mu, norm_std = get_normalization_reference()
+    # On a full re-pull the existing CSV is about to be overwritten, so
+    # normalization must be re-derived from the fresh data, not the stale CSV.
+    # Pass (0.0, 1.0) so get_tidal_level() computes it from the 2017-2021 window.
+    if force_full:
+        norm_mu, norm_std = 0.0, 1.0
+        print("  Normalization will be recomputed from 2017–2021 reference window.")
+    else:
+        norm_mu, norm_std = get_normalization_reference()
 
     # Init GEE and AOI
     init_gee()
     aoi = load_aoi()
 
-    # Fetch each source for the incremental window
+    # Fetch each source for the target window
     df_sm    = get_soil_moisture(start_date, end_date)
     df_humid = get_humidity(start_date, end_date, aoi)
     df_tide  = get_tidal_level(start_date, end_date, norm_mu, norm_std)
@@ -633,13 +714,34 @@ def run_pipeline() -> bool:
 
     df = df[["timestamp", "waterlevel", "soil_moisture", "humidity"]]
 
-    print(f"  New rows to append : {len(df)}")
+    print(f"  New/updated rows   : {len(df)}")
     print(f"  Date range         : {df['timestamp'].min()} → {df['timestamp'].max()}")
     print(f"\nPreview (last 5 rows):\n{df.tail(5).to_string(index=False)}")
 
-    append_to_csv(df)
+    save_to_csv(df, force_full=force_full)
     return True
 
 
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    run_pipeline()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Sat_SensorData_proxy — GEE sensor data extractor for Obando.\n"
+            "Default: incremental append (pulls only missing days since last CSV row,\n"
+            "         plus re-fetches the last 14 days to backfill any NaN values).\n"
+            "Use --full to re-pull the entire history from 2017-01-01 and overwrite the CSV."
+        )
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help=(
+            "Force a full history re-pull from 2017-01-01 → today. "
+            "Overwrites obando_environmental_data.csv entirely. "
+            "Use when the CSV is corrupted, missing, or needs to be rebuilt from scratch. "
+            "(Mirrors the --full flag in sentinel1_GEE.py)"
+        ),
+    )
+    args = parser.parse_args()
+    run_pipeline(force_full=args.full)

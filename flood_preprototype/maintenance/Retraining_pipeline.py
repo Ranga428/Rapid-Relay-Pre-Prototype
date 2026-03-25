@@ -139,12 +139,16 @@ MODEL_DIR         = os.path.join(SCRIPT_DIR, r"..\model")
 LOG_FILE          = os.path.join(SCRIPT_DIR, r"..\logs\retraining_log.txt")
 
 # Scripts to run (in order)
-SENTINEL1_SCRIPT     = os.path.join(SCRIPT_DIR, "sentinel1_GEE.py")
-PREPARE_SCRIPT       = os.path.join(SCRIPT_DIR, "prepare_dataset.py")
-RF_TRAIN_SCRIPT      = os.path.join(SCRIPT_DIR, "RF_train_flood_model.py")
-XGB_TRAIN_SCRIPT     = os.path.join(SCRIPT_DIR, "XGB_train_flood_model.py")
-LGBM_TRAIN_SCRIPT    = os.path.join(SCRIPT_DIR, "LGBM_train_flood_model.py")
-EXTRACT_TEST_SCRIPT  = os.path.join(SCRIPT_DIR, "extract_test_set.py")
+_PROJECT_ROOT        = os.path.dirname(SCRIPT_DIR)
+_SCRIPTS_DIR         = os.path.join(_PROJECT_ROOT, "scripts")
+_ML_PIPELINE_DIR     = os.path.join(_PROJECT_ROOT, "ml_pipeline")
+
+SENTINEL1_SCRIPT     = os.path.join(_ML_PIPELINE_DIR, "sentinel1_GEE.py")
+PREPARE_SCRIPT       = os.path.join(_ML_PIPELINE_DIR, "prepare_dataset.py")
+RF_TRAIN_SCRIPT      = os.path.join(_SCRIPTS_DIR, "RF_train_flood_model.py")
+XGB_TRAIN_SCRIPT     = os.path.join(_SCRIPTS_DIR, "XGB_train_flood_model.py")
+LGBM_TRAIN_SCRIPT    = os.path.join(_SCRIPTS_DIR, "LGBM_train_flood_model.py")
+EXTRACT_TEST_SCRIPT  = os.path.join(_SCRIPTS_DIR, "extract_test_set.py")
 
 # ===========================================================================
 # END CONFIG

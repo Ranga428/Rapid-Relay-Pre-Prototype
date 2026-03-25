@@ -10,7 +10,7 @@ Calls existing pipeline scripts in order:
 
     Step 0  Sat_SensorData_proxy.py  — fetch today's sensor reading (incremental append)
     Step 1  RF_Predict.py            — predict on updated sensor CSV (Design Option 2)
-    Step 2  FB_Post.py               — Facebook alert post (if WATCH/WARNING/DANGER)
+    Step 2  Alert.py                 — dispatch alert to all configured channels (if WATCH/WARNING/DANGER)
     Step 3  Seasonal notification    — remind to retrain every ~90 days (manual trigger)
 
 COMPARISON MODELS (optional, --all-models flag)
@@ -96,16 +96,19 @@ import pandas as pd
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, SCRIPT_DIR)
+sys.path.insert(0, os.path.join(_PROJECT_ROOT, "scripts"))
+sys.path.insert(0, os.path.join(_PROJECT_ROOT, "ml_pipeline"))
+sys.path.insert(0, os.path.join(_PROJECT_ROOT, "alerts"))
+
+import Alert
 
 
 # ===========================================================================
 # CONFIG
 # ===========================================================================
-
-# Alert tiers that trigger a Facebook post
-ALERT_TIERS = {"WATCH", "WARNING", "DANGER"}
 
 # Days since last model training before a seasonal retrain notification fires.
 # 90 days ≈ one season (wet/dry transition). Change to 180 for semi-annual.
@@ -167,19 +170,6 @@ def import_comparison_modules():
         except ImportError as e:
             print(f"  WARNING: Could not import {name}.py — skipping. ({e})")
     return modules
-
-
-def import_fb_post():
-    """Import FB_Post.py softly — pipeline continues if missing."""
-    try:
-        import FB_Post
-        return FB_Post
-    except ImportError:
-        print("  NOTE: FB_Post.py not found — Facebook posting disabled.")
-        return None
-    except Exception as e:
-        print(f"  NOTE: FB_Post.py failed to import ({e}) — posting disabled.")
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -270,27 +260,6 @@ def read_latest_result(csv_path: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Facebook post dispatch
-# ---------------------------------------------------------------------------
-
-def dispatch_fb_post(FB_Post, tier: str, probability: float, timestamp: str) -> None:
-    try:
-        FB_Post.post_alert(risk_tier=tier, probability=probability, timestamp=timestamp)
-    except AttributeError:
-        try:
-            FB_Post.post(risk_tier=tier, probability=probability, timestamp=timestamp)
-        except AttributeError:
-            print(
-                "  WARNING: FB_Post.py has neither post_alert() nor post().\n"
-                "  Add a post_alert(risk_tier, probability, timestamp) function."
-            )
-        except Exception as e2:
-            print(f"  Facebook post failed: {e2}")
-    except Exception as e:
-        print(f"  Facebook post failed: {e}")
-
-
-# ---------------------------------------------------------------------------
 # Main daily orchestration
 # ---------------------------------------------------------------------------
 
@@ -355,17 +324,13 @@ def run_daily(
         emoji = {"CLEAR": "🟢", "WATCH": "🟡", "WARNING": "🟠", "DANGER": "🔴"}.get(tier, "")
         print(f"\n  Latest prediction : {ts}  {emoji} {tier}  ({prob:.1%})")
 
-        if tier in ALERT_TIERS and not no_post:
-            separator("Step 2 — FB_Post.py (alert dispatch)")
-            FB_Post = import_fb_post()
-            if FB_Post is not None:
-                dispatch_fb_post(FB_Post, tier, prob, ts)
-            else:
-                print("  Facebook post skipped — FB_Post.py not available.")
-        elif tier not in ALERT_TIERS:
-            print("  CLEAR today — no Facebook post.")
+        if tier in Alert.ALERT_TIERS and not no_post:
+            separator("Step 2 — Alert.py (alert dispatch)")
+            Alert.dispatch_alert(tier=tier, probability=prob, timestamp=ts)
+        elif tier not in Alert.ALERT_TIERS:
+            print("  CLEAR today — no alert.")
         else:
-            print("  --no-post flag set — skipping Facebook post.")
+            print("  --no-post flag set — skipping alert dispatch.")
     else:
         if rf_ok:
             print("\n  WARNING: RF ran but could not read back results.")

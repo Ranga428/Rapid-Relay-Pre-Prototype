@@ -60,8 +60,11 @@ import matplotlib.dates as mdates
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)           # flood_preprototype/
+_ML_PIPELINE  = os.path.join(_PROJECT_ROOT, "ml_pipeline")
 sys.path.insert(0, SCRIPT_DIR)
+sys.path.insert(0, _ML_PIPELINE)
 
 from prepare_dataset import load_sensor
 from feature_engineering import build_features, SENSOR_FEATURE_COLUMNS

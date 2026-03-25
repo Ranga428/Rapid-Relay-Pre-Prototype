@@ -368,6 +368,7 @@ def save_artifacts(model, feat_cols, watch_threshold, warn_threshold,
         "threshold":         watch_threshold,
         "watch_threshold":   watch_threshold,
         "warning_threshold": warn_threshold,
+        "last_training_date": pd.Timestamp.now().strftime("%Y-%m-%d"),
     }, pkl_path)
     model.save_model(json_path)
     print(f"  Model saved → {pkl_path}")

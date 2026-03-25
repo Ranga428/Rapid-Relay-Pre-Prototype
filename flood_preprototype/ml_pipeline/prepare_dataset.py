@@ -42,9 +42,11 @@ from feature_engineering import (
 # CONFIG
 # ===========================================================================
 
-SENSOR_FILE    = r"D:\Rapid Relay\Rapid-Relay-Pre-Prototype\flood_preprototype\data\sensor\obando_environmental_data.csv"
-SATELLITE_FILE = r"D:\Rapid Relay\Rapid-Relay-Pre-Prototype\flood_preprototype\data\sentinel1\GEE-Processing\sentinel1_timeseries.csv"
-OUTPUT_FILE    = r"D:\Rapid Relay\Rapid-Relay-Pre-Prototype\flood_preprototype\data\flood_dataset.csv"
+# AFTER
+_PREP_DIR      = os.path.dirname(os.path.abspath(__file__))
+SENSOR_FILE    = os.path.join(_PREP_DIR, "..", "data", "sensor", "obando_environmental_data.csv")
+SATELLITE_FILE = os.path.join(_PREP_DIR, "..", "data", "sentinel1", "GEE-Processing", "sentinel1_timeseries.csv")
+OUTPUT_FILE    = os.path.join(_PREP_DIR, "..", "data", "flood_dataset.csv")
 
 USE_EXISTING_LABEL_COL = "flood_label"
 FLOOD_THRESHOLD        = 0.60

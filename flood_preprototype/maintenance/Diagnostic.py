@@ -43,8 +43,11 @@ from scipy import stats
 
 warnings.filterwarnings("ignore")
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+_ML_PIPELINE  = os.path.join(_PROJECT_ROOT, "ml_pipeline")
 sys.path.insert(0, SCRIPT_DIR)
+sys.path.insert(0, _ML_PIPELINE)
 
 from feature_engineering import SENSOR_FEATURE_COLUMNS, FULL_FEATURE_COLUMNS
 
