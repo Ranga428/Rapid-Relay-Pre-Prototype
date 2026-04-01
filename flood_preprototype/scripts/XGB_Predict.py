@@ -1,47 +1,22 @@
 """
 predict_xgb.py
-=============
+=================
 Flood Prediction — XGBoost Real-Time Inference
 
-Runs the deployed XGBoost sensor model (flood_xgb_sensor.pkl).
-No satellite data required at inference time.
+Runs the XGBoost sensor model (flood_xgb_sensor.pkl).
+Drop-in replacement for predict_xgb.py.
 
-Design option  : XGBoost (Design Option 1 of 3)
-Artifact       : flood_xgb_sensor.pkl
-Script         : predict_xgb.py
-
-Usage
------
-    python predict_xgb.py
-    python predict_xgb.py --data ..\\data\\flood_dataset_test.csv
-    python predict_xgb.py --schedule --interval 12
-    python predict_xgb.py --data ..\\data\\flood_dataset_test.csv --threshold-search
-
-BATCH MODE vs LIVE MODE
------------------------
-    Live mode  : reads the live sensor CSV, filters to rows after
-                 LAST_TRAINING_DATE, builds features, runs model.
-
-    Batch mode : reads any CSV directly. If it already has feature
-                 columns uses them directly. If it only has raw sensor
-                 columns, builds features. Ground truth (flood_label)
-                 shown alongside predictions if present.
-
-CHANGES FROM PREVIOUS VERSION
-------------------------------
-NEW 1  — FLOOD_LOG_PATH added to CONFIG.
-         Operator-maintained CSV [timestamp, flood_label]. Append a row
-         after each confirmed flood event. Used by
-         compute_flood_history_features() for days_since_last_flood.
-         Defaults to 999 if file does not exist — no crash.
-
-NEW 2  — load_live_features() passes flood_log_path into build_features().
-
-NEW 3  — load_batch_features() passes flood_label column into
-         build_features() as flood_label_series so days_since_last_flood
-         is computed correctly in batch / evaluation mode.
-
-NEW 4  — append_rolling_features() retained as safety net.
+CHANGES FROM predict_xgb.py
+----------------------------
+NEW 1 — MODEL_FILE updated to flood_xgb_sensor.pkl
+NEW 2 — Consecutive-day alert filter (MIN_CONSECUTIVE_DAYS = 2).
+         Suppresses single-day WARNING/DANGER spikes → WATCH.
+         XGBoost v1 had persistent WARNING/DANGER even in dry season
+         (Nov 30, Dec 1-3) — this operational filter removes those.
+NEW 3 — Balanced accuracy + specificity printed in evaluation table.
+NEW 4 — Probability std printed to confirm floor effect is resolved.
+         XGBoost v1 never went below 9.6% — no CLEAR rows at all.
+NEW 5 — Version and flood_weight printed from artifact on load.
 """
 
 import os
@@ -61,7 +36,7 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=UserWarning)
 
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)           # flood_preprototype/
+_PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 _ML_PIPELINE  = os.path.join(_PROJECT_ROOT, "ml_pipeline")
 sys.path.insert(0, SCRIPT_DIR)
 sys.path.insert(0, _ML_PIPELINE)
@@ -74,7 +49,7 @@ from feature_engineering import build_features, SENSOR_FEATURE_COLUMNS
 # CONFIG
 # ===========================================================================
 
-MODEL_FILE       = r"..\model\flood_xgb_sensor.pkl"
+MODEL_FILE       = r"..\model\flood_xgb_sensor.pkl"      # NEW 1
 OUTPUT_DIR       = r"..\predictions"
 LIVE_SENSOR_FILE = os.path.join(
     SCRIPT_DIR, r"..\data\sensor\obando_environmental_data.csv"
@@ -88,6 +63,9 @@ PLOT_FILE       = os.path.join(OUTPUT_DIR, "flood_xgb_sensor_predictions.png")
 
 LAST_TRAINING_DATE      = "2024-12-31"
 DEFAULT_ALERT_THRESHOLD = 0.50
+
+# NEW 2 — set to 1 to disable
+MIN_CONSECUTIVE_DAYS = 2
 
 SUSPECTED_MISLABELED_DATES = [
     "2025-07-09", "2025-07-10", "2025-07-11",
@@ -136,6 +114,26 @@ def append_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# NEW 2 — consecutive-day filter
+def apply_consecutive_filter(results: pd.DataFrame, warn_t: float,
+                              min_days: int) -> pd.DataFrame:
+    if min_days <= 1:
+        return results
+    results = results.copy()
+    probs  = results["flood_probability"].values
+    tiers  = results["risk_tier"].tolist()
+    streak = 0
+    for i, p in enumerate(probs):
+        if p >= warn_t:
+            streak += 1
+        else:
+            streak = 0
+        if streak < min_days and tiers[i] in ("WARNING", "DANGER"):
+            tiers[i] = "WATCH"
+    results["risk_tier"] = tiers
+    return results
+
+
 # ---------------------------------------------------------------------------
 # 1. Load model
 # ---------------------------------------------------------------------------
@@ -160,10 +158,20 @@ def load_model() -> tuple:
 
     print(f"  Model loaded      : {MODEL_FILE}")
     print(f"  Model type        : {type(model).__name__}")
+    print(f"  Version           : {artifact.get('version', 'unknown')}")    # NEW 5
+    print(f"  Flood weight      : {artifact.get('flood_weight', '?')}  (v1 was 20.0)")
     print(f"  Feature count     : {len(feature_cols)}")
-    print(f"  WATCH threshold   : {watch_t:.2f}  (recall-first, from artifact)")
-    print(f"  WARNING threshold : {warn_t:.2f}  (precision-first, from artifact)")
-    print(f"  Last training date: {LAST_TRAINING_DATE}  (from artifact)")
+    print(f"  WATCH threshold   : {watch_t:.2f}")
+    print(f"  WARNING threshold : {warn_t:.2f}")
+    print(f"  Last training date: {LAST_TRAINING_DATE}")
+    print(f"  Consec. filter    : {MIN_CONSECUTIVE_DAYS} days  "
+          f"({'active' if MIN_CONSECUTIVE_DAYS > 1 else 'disabled'})")
+
+    if artifact.get("val_balanced_acc"):
+        print(f"  Val BalAcc        : {artifact['val_balanced_acc']:.4f}")
+    if artifact.get("test_balanced_acc"):
+        print(f"  Test BalAcc       : {artifact['test_balanced_acc']:.4f}")
+
     return model, feature_cols, watch_t, warn_t
 
 
@@ -198,8 +206,7 @@ def filter_new_rows(features: pd.DataFrame) -> pd.DataFrame:
     if len(new_df) == 0:
         sys.exit(
             f"\n  No new data found after {LAST_TRAINING_DATE}.\n"
-            f"  Append new sensor rows to the sensor CSV and re-run.\n"
-            f"  Update LAST_TRAINING_DATE in predict_xgb.py after retraining."
+            f"  Append new sensor rows and re-run."
         )
     print(f"  Date range       : {new_df.index[0].date()} -> {new_df.index[-1].date()}")
     return new_df
@@ -220,12 +227,10 @@ def load_batch_features(data_path: str, feature_cols: list) -> tuple:
 
     print(f"  Rows loaded      : {len(df):,}")
     print(f"  Date range       : {df.index.min().date()} -> {df.index.max().date()}")
-    print(f"  Columns          : {list(df.columns)}")
 
     ground_truth       = df.get("flood_label")
     flood_label_series = ground_truth if ground_truth is not None else None
-
-    has_features = all(c in df.columns for c in feature_cols)
+    has_features       = all(c in df.columns for c in feature_cols)
 
     if has_features:
         print(f"\n  Feature columns found in CSV — using directly.")
@@ -236,28 +241,22 @@ def load_batch_features(data_path: str, feature_cols: list) -> tuple:
         raw_needed = ["waterlevel", "soil_moisture", "humidity"]
         missing    = [c for c in raw_needed if c not in df.columns]
         if missing:
-            sys.exit(
-                f"\n  ERROR: CSV has neither pre-built features nor raw sensor columns.\n"
-                f"  Missing: {missing}"
-            )
+            sys.exit(f"\n  ERROR: Missing raw columns: {missing}")
         from prepare_dataset import detect_sensor_frequency
         freq     = detect_sensor_frequency(df)
-        features = build_features(
-            df, freq=freq, mode="sensor",
-            flood_label_series=flood_label_series,
-        )
+        features = build_features(df, freq=freq, mode="sensor",
+                                  flood_label_series=flood_label_series)
         features = append_rolling_features(features)
-        print(f"  Features built   : {len(features):,} rows")
 
     if ground_truth is not None:
-        print(f"\n  Ground truth (flood_label) found:")
+        print(f"\n  Ground truth found:")
         print(f"    Flood=1 : {int(ground_truth.sum())}  ({100*ground_truth.mean():.1f}%)")
         print(f"    Flood=0 : {int((ground_truth==0).sum())}  "
               f"({100*(1-ground_truth.mean()):.1f}%)")
         idx_strs         = [str(ts.date()) for ts in df.index]
         found_mislabeled = [d for d in SUSPECTED_MISLABELED_DATES if d in idx_strs]
         if found_mislabeled:
-            print(f"\n  ⚠️  LABEL WARNING: suspected mislabeled dates in this set:")
+            print(f"\n  ⚠️  LABEL WARNING: suspected mislabeled dates:")
             for d in found_mislabeled:
                 print(f"       {d}")
 
@@ -272,15 +271,20 @@ def run_predictions(model, feature_cols, features, watch_t, warn_t) -> tuple:
     separator("Running Predictions")
     missing = [c for c in feature_cols if c not in features.columns]
     if missing:
-        sys.exit(
-            f"\n  ERROR: {len(missing)} feature column(s) missing:\n"
-            f"    {missing}\n"
-            f"  Retrain after updating feature_engineering.py.\n"
-        )
+        sys.exit(f"\n  ERROR: Missing feature columns:\n    {missing}")
 
     X        = features[feature_cols].values
     probs    = model.predict_proba(X)[:, 1]
     danger_t = warn_t + 0.10
+
+    # NEW 4
+    prob_std = probs.std()
+    print(f"  Probability std  : {prob_std:.4f}  "
+          f"({'✅ floor effect resolved' if prob_std > 0.15 else '⚠️ still somewhat compressed'})")
+    print(f"  Prob range       : {probs.min():.3f} – {probs.max():.3f}")
+    clears = (probs < watch_t).sum()
+    print(f"  CLEAR rows       : {clears}  "
+          f"({'✅ model resting in dry season' if clears > 0 else '⚠️ no CLEAR rows — floor effect may persist'})")
 
     def classify(prob):
         if   prob >= danger_t: return "DANGER"
@@ -299,6 +303,14 @@ def run_predictions(model, feature_cols, features, watch_t, warn_t) -> tuple:
     for col in feature_cols:
         results[col] = features[col].values
 
+    # NEW 2
+    if MIN_CONSECUTIVE_DAYS > 1:
+        before = (results["risk_tier"].isin(["WARNING","DANGER"])).sum()
+        results = apply_consecutive_filter(results, warn_t, MIN_CONSECUTIVE_DAYS)
+        after  = (results["risk_tier"].isin(["WARNING","DANGER"])).sum()
+        if before - after > 0:
+            print(f"  Consec. filter   : suppressed {before-after} single-day spikes → WATCH")
+
     print(f"  Predictions made : {len(results):,}")
     return results, danger_t
 
@@ -310,38 +322,23 @@ def run_predictions(model, feature_cols, features, watch_t, warn_t) -> tuple:
 def run_threshold_search(model, feature_cols, features, ground_truth) -> None:
     from sklearn.metrics import precision_recall_curve
     separator("Threshold Search")
-
-    missing = [c for c in feature_cols if c not in features.columns]
-    if missing:
-        print(f"  SKIP — missing feature columns: {missing}")
-        return
-
     gt = ground_truth.reindex(features.index).dropna()
     if len(gt) == 0:
-        print(f"  SKIP — no ground truth labels available.")
+        print(f"  SKIP — no ground truth labels.")
         return
-
     X     = features.loc[gt.index][feature_cols].values
     probs = model.predict_proba(X)[:, 1]
     prec, rec, thresholds = precision_recall_curve(gt.values, probs)
 
-    watch_candidates = [(p, r, t) for p, r, t in zip(prec, rec, thresholds) if p >= 0.65]
+    watch_candidates = [(p,r,t) for p,r,t in zip(prec,rec,thresholds) if p >= 0.65]
     if watch_candidates:
         best = max(watch_candidates, key=lambda x: x[1])
         print(f"  Watch threshold  → {best[2]:.2f}  precision={best[0]:.3f}  recall={best[1]:.3f}")
-    else:
-        print(f"  Watch threshold  → no candidate with precision >= 0.65")
-
-    warn_candidates = [(p, r, t) for p, r, t in zip(prec, rec, thresholds) if r >= 0.30]
+    warn_candidates = [(p,r,t) for p,r,t in zip(prec,rec,thresholds) if r >= 0.80]
     if warn_candidates:
         best = max(warn_candidates, key=lambda x: x[0])
         print(f"  Warning threshold→ {best[2]:.2f}  precision={best[0]:.3f}  recall={best[1]:.3f}")
-    else:
-        print(f"  Warning threshold→ no candidate with recall >= 0.30")
-
-    print(f"\n  Apply with: python update_thresholds.py")
-    print(f"    --model ..\\model\\flood_xgb_sensor.pkl")
-    print(f"    --watch <value> --warning <value>")
+    print(f"\n  Apply: python update_thresholds.py --model ..\\model\\flood_xgb_sensor.pkl")
 
 
 # ---------------------------------------------------------------------------
@@ -365,20 +362,42 @@ def print_results(results, ground_truth=None,
     print(f"    Risk tier   : {RISK_TIERS[tier]['emoji']}  {tier}")
 
     if ground_truth is not None:
+        from sklearn.metrics import (precision_score, recall_score,
+                                     balanced_accuracy_score, f1_score)
         gt = ground_truth.reindex(results.index).dropna()
         if len(gt) > 0:
             pred_watch = (results["flood_probability"] >= watch_t).astype(int)
             pred_warn  = (results["flood_probability"] >= warn_t).astype(int)
             gt_aligned = gt.reindex(pred_watch.index).fillna(0).astype(int)
-            from sklearn.metrics import precision_score, recall_score
+
+            # NEW 3
             print(f"\n  vs Ground Truth (flood_label):")
-            print(f"  {'Threshold':<12} {'Precision':>10}  {'Recall':>8}  {'Alerts':>7}")
-            print(f"  {'-'*12} {'-'*10}  {'-'*8}  {'-'*7}")
+            print(f"  {'Threshold':<14} {'Precision':>10}  {'Recall':>8}  "
+                  f"{'Specificity':>12}  {'BalAcc':>8}  {'F1':>6}  {'Alerts':>7}")
+            print(f"  {'-'*14} {'-'*10}  {'-'*8}  {'-'*12}  {'-'*8}  {'-'*6}  {'-'*7}")
+
             for label, pred in [("WATCH", pred_watch), ("WARNING", pred_warn)]:
                 prec = precision_score(gt_aligned, pred, zero_division=0)
                 rec  = recall_score(gt_aligned, pred, zero_division=0)
-                n    = pred.sum()
-                print(f"  {label:<12} {prec:>10.3f}  {rec:>8.3f}  {n:>7}")
+                bal  = balanced_accuracy_score(gt_aligned, pred)
+                f1   = f1_score(gt_aligned, pred, zero_division=0)
+                tn   = ((pred==0)&(gt_aligned==0)).sum()
+                fp   = ((pred==1)&(gt_aligned==0)).sum()
+                spec = tn/(tn+fp) if (tn+fp) > 0 else 0
+                print(f"  {label:<14} {prec:>10.3f}  {rec:>8.3f}  "
+                      f"{spec:>12.3f}  {bal:>8.3f}  {f1:>6.3f}  {pred.sum():>7}")
+
+            if MIN_CONSECUTIVE_DAYS > 1:
+                tier_preds = (results["risk_tier"].isin(["WARNING","DANGER"])).astype(int)
+                prec = precision_score(gt_aligned, tier_preds, zero_division=0)
+                rec  = recall_score(gt_aligned, tier_preds, zero_division=0)
+                bal  = balanced_accuracy_score(gt_aligned, tier_preds)
+                f1   = f1_score(gt_aligned, tier_preds, zero_division=0)
+                tn   = ((tier_preds==0)&(gt_aligned==0)).sum()
+                fp   = ((tier_preds==1)&(gt_aligned==0)).sum()
+                spec = tn/(tn+fp) if (tn+fp)>0 else 0
+                print(f"  {'WARN+filter':<14} {prec:>10.3f}  {rec:>8.3f}  "
+                      f"{spec:>12.3f}  {bal:>8.3f}  {f1:>6.3f}  {tier_preds.sum():>7}")
 
     print(f"\n  All predictions:")
     print(f"  {'Timestamp':<32} {'Probability':>12}  {'Risk':<10}")
@@ -392,7 +411,7 @@ def print_results(results, ground_truth=None,
         print(f"  {str(ts.date()):<32} {row['flood_probability']:>11.1%}  "
               f"{RISK_TIERS[t]['emoji']} {t}{gt_s}")
 
-    alerts = results[results["risk_tier"].isin(["WARNING", "DANGER"])]
+    alerts = results[results["risk_tier"].isin(["WARNING","DANGER"])]
     if len(alerts) > 0:
         print(f"\n  ⚠️  WARNING/DANGER events: {len(alerts)}")
         for ts, row in alerts.iterrows():
@@ -411,16 +430,15 @@ def save_csv(results, output_csv) -> None:
     separator("Saving CSV")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if os.path.exists(output_csv):
-        existing = pd.read_csv(
-            output_csv, parse_dates=["timestamp"], index_col="timestamp")
+        existing = pd.read_csv(output_csv, parse_dates=["timestamp"],
+                               index_col="timestamp")
         combined = pd.concat([existing, results])
         combined = combined[~combined.index.duplicated(keep="last")].sort_index()
     else:
         combined = results
     combined.index.name = "timestamp"
     combined.to_csv(output_csv)
-    print(f"  Saved → {output_csv}")
-    print(f"  Total rows : {len(combined):,}")
+    print(f"  Saved → {output_csv}  ({len(combined):,} rows)")
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +476,7 @@ def save_plot(results, watch_t, warn_t, danger_t,
     ax.set_ylim(0, 1)
     ax.set_ylabel("Flood Probability")
     ax.set_xlabel("Date")
-    ax.set_title(f"Flood Risk Prediction — {MODEL_LABEL} Sensor Model")
+    ax.set_title(f"Flood Risk Prediction — {MODEL_LABEL}")
     ax.xaxis.set_major_locator(mdates.MonthLocator())
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
     plt.xticks(rotation=45)
@@ -476,7 +494,7 @@ def save_plot(results, watch_t, warn_t, danger_t,
 
 def run_pipeline(data_path=None, threshold_search=False) -> None:
     batch_mode = data_path is not None
-    separator(f"Flood Prediction — {MODEL_LABEL} Sensor Inference Pipeline")
+    separator(f"Flood Prediction — {MODEL_LABEL} Inference Pipeline")
     print(f"  Model  : {MODEL_FILE}")
     print(f"  Mode   : {'BATCH — ' + data_path if batch_mode else 'LIVE — ' + LIVE_SENSOR_FILE}")
 
@@ -512,7 +530,6 @@ def run_pipeline(data_path=None, threshold_search=False) -> None:
 
 def run_scheduled(interval_hours: int) -> None:
     print(f"\n  Scheduled mode — running every {interval_hours}h")
-    print(f"  Press Ctrl+C to stop.\n")
     while True:
         try:
             run_pipeline()

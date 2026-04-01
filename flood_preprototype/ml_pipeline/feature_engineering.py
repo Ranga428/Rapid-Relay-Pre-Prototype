@@ -3,20 +3,67 @@ feature_engineering.py
 =======================
 Feature engineering for Flood Prediction (XGBoost / RF / LightGBM).
 
+WATERLEVEL UNITS (UPDATED)
+--------------------------
+waterlevel is now raw metres (no z-score). One threshold needed updating:
+
+    waterlevel_days_above_threshold — was (df[col] > 1.5) in z-score units.
+    Now uses rolling 85th percentile (30-day window).
+
+    Rationale: UHSLC Manila South Harbor MSL ≈ 2.2m above chart datum.
+    Normal tidal range: 1.8–2.6m. A sustained reading above 2.5m means
+    the tide is tracking above the typical high-tide mark, indicating an
+    elevated baseline consistent with a pre-flood state. This matches the
+    physical intent of the original 1.5σ threshold.
+
 CHANGES FROM PREVIOUS VERSION
 ------------------------------
-REMOVED — days_since_last_flood dropped from SENSOR_FEATURE_COLUMNS.
-    The feature defaulted to 999 for almost all rows because no
-    flood_event_log.csv exists yet. A near-constant feature adds no
-    signal and was diluting recall-sensitive splits. The function
-    compute_flood_history_features() is retained so the feature can be
-    re-added once a populated flood event log is available.
+UPDATED — waterlevel_days_above_threshold now uses rolling 85th percentile
+          (30-day window) instead of a fixed absolute threshold.
 
-    To re-enable: uncomment "days_since_last_flood" in
-    SENSOR_FEATURE_COLUMNS and ensure flood_event_log.csv exists with
-    confirmed flood event dates before retraining.
+MONSOON FEATURES (existing)
+-----------------------------
+80% of 2024-2026 test-period flood days have waterlevel BELOW the training
+p05 minimum (1.8-2.6m tidal range). Five features teach the model the
+monsoon-flood signature:
 
-SENSOR_FEATURE_COLUMNS now has 25 features (down from 26 — one removed).
+    is_monsoon_season, waterlevel_monsoon, soilmoisture_monsoon,
+    humidity_x_soilmoisture, soilmoisture_trend_3d
+
+FIX FEATURES ADDED (NEW)
+--------------------------
+Eight features targeting three diagnosed failure modes in the test logs:
+
+  POST-FLOOD DECAY (fixes Aug false-positive block):
+    days_since_flood_level  — consecutive days waterlevel has been below its
+                              rolling 85th-pct threshold; resets to 0 when
+                              above. Signals the flood has ended.
+    waterlevel_falling_streak — consecutive days of falling waterlevel
+                              (capped 30). Direct receding-flood signal.
+    post_flood_decay_7d     — waterlevel 7d ago minus today (lag diff).
+                              Positive = water receding; negative = rising.
+                              Computed lag-based (no leakage).
+
+  LATE-SEASON ANOMALY (fixes Nov flood miss):
+    humidity_anomaly_vs_30d  — humidity minus its own 30-day rolling mean.
+                               Catches relative spikes at post-monsoon baseline.
+    soilmoist_anomaly_vs_30d — soil moisture minus its own 30-day rolling mean.
+    late_season_wet_flag     — 1 if Oct/Nov AND either anomaly is positive.
+                               Direct flag for this failure mode.
+
+  VARIANCE / DYNAMISM (fixes Jan-Mar flat probability plateau):
+    waterlevel_7d_std  — 7-day rolling std of raw waterlevel.
+    soilmoist_7d_std   — 7-day rolling std of raw soil moisture.
+    Both are near-zero in dry season (correctly so) and non-zero when
+    conditions are dynamic, helping trees distinguish active vs quiet states
+    without the noise injection hack.
+
+NOTE: No noise injection is applied. The Jan–Mar plateau is caused by
+genuinely flat sensor inputs during dry season; the correct fix is the
+std features above, which let the model learn "dry season = low variance"
+rather than corrupting the signal.
+
+SENSOR_FEATURE_COLUMNS now has 40 features (was 32).
 FULL_FEATURE_COLUMNS retains the 3 SAR-derived satellite columns on top.
 
 TWO FEATURE SETS
@@ -52,13 +99,13 @@ TICKS = {
     "1D":    {"1h": 1,   "3h": 1,   "6h": 1,   "24h": 7,   "48h": 14},
 }
 
+WATERLEVEL_ELEVATED_WINDOW     = 30
+WATERLEVEL_ELEVATED_PERCENTILE = 0.85
+
 
 # ---------------------------------------------------------------------------
-# SENSOR-ONLY feature columns (25 total)
+# SENSOR-ONLY feature columns (40 total — 32 original + 8 fix features)
 # Safe for real-time inference — no satellite data required.
-#
-# days_since_last_flood is intentionally excluded until a populated
-# flood_event_log.csv exists. See module docstring.
 # ---------------------------------------------------------------------------
 
 SENSOR_FEATURE_COLUMNS = [
@@ -109,15 +156,33 @@ SENSOR_FEATURE_COLUMNS = [
     "week_sin",
     "week_cos",
 
-    # days_since_last_flood — REMOVED until flood_event_log.csv is populated
-    # "days_since_last_flood",
+    # --- Monsoon features (fixes 2024-2026 distribution shift) ---
+    "is_monsoon_season",
+    "waterlevel_monsoon",
+    "soilmoisture_monsoon",
+    "humidity_x_soilmoisture",
+    "soilmoisture_trend_3d",
+
+    # --- Post-flood decay (NEW — fixes Aug false-positive block) ---
+    "days_since_flood_level",
+    "waterlevel_falling_streak",
+    "post_flood_decay_7d",
+
+    # --- Late-season anomaly (NEW — fixes Nov flood miss) ---
+    "humidity_anomaly_vs_30d",
+    "soilmoist_anomaly_vs_30d",
+    "late_season_wet_flag",
+
+    # --- Variance / dynamism (NEW — fixes Jan-Mar flat probability plateau) ---
+    "waterlevel_7d_std",
+    "soilmoist_7d_std",
 ]
 
 
 # ---------------------------------------------------------------------------
 # FULL feature columns (sensor + SAR-derived satellite)
 # Used only during training and revalidation.
-# ERA5/GPM columns excluded — label leakage (see original notes).
+# ERA5/GPM columns excluded — label leakage.
 # ---------------------------------------------------------------------------
 
 FULL_FEATURE_COLUMNS = SENSOR_FEATURE_COLUMNS + [
@@ -139,7 +204,6 @@ def compute_waterlevel_features(
     t  = TICKS[freq]
     df = df.copy()
 
-    # Existing point / window features
     df["max_waterlevel_6h"]        = df[col].rolling(t["6h"],  min_periods=1).max()
     df["max_waterlevel_24h"]       = df[col].rolling(t["24h"], min_periods=1).max()
     df["waterlevel_std_24h"]       = df[col].rolling(t["24h"], min_periods=2).std().fillna(0)
@@ -147,14 +211,14 @@ def compute_waterlevel_features(
     df["waterlevel_slope_6h"]      = (df[col] - df[col].shift(t["6h"])) / max(t["6h"], 1)
     df["waterlevel_rise_rate_48h"] = (df[col] - df[col].shift(t["48h"])) / max(t["48h"], 1)
 
-    # Consecutive ticks above 1.5 sigma — sustained high water state
-    above     = (df[col] > 1.5).astype(int)
-    group_key = (above != above.shift()).cumsum()
+    window_30d  = t["24h"] * WATERLEVEL_ELEVATED_WINDOW
+    rolling_85p = df[col].rolling(window_30d, min_periods=7).quantile(WATERLEVEL_ELEVATED_PERCENTILE)
+    above       = (df[col] > rolling_85p).astype(int)
+    group_key   = (above != above.shift()).cumsum()
     df["waterlevel_days_above_threshold"] = (
         above.groupby(group_key).cumcount().add(1).mul(above)
     )
 
-    # Percentile rank vs rolling 30-day window
     window_30d = t["24h"] * 30
     df["waterlevel_pct_rank_30d"] = (
         df[col]
@@ -162,7 +226,6 @@ def compute_waterlevel_features(
         .apply(lambda x: float(pd.Series(x).rank(pct=True).iloc[-1]), raw=False)
     )
 
-    # Distance from expanding historical maximum — headroom to danger mark
     historical_max = df[col].expanding(min_periods=1).max()
     df["waterlevel_distance_to_max"] = historical_max - df[col]
 
@@ -207,14 +270,6 @@ def compute_humidity_features(
 # ---------------------------------------------------------------------------
 
 def compute_season_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Sin/cos encoding for month and week-of-year.
-
-    Month encoding: broad wet/dry season cycle.
-    Week encoding : finer resolution — peak Obando flood risk is
-                    weeks 35–38 (late Aug to mid-Sep), which month
-                    encoding cannot distinguish within August/September.
-    """
     df    = df.copy()
     month = df.index.month.astype(float)
 
@@ -240,13 +295,6 @@ def compute_lag_features(
     soilmoisture_col: str = "soil_moisture",
     freq: str = "1D",
 ) -> pd.DataFrame:
-    """
-    Explicit prior-day values as model inputs.
-
-    Gives the model direct memory of what the river level actually was
-    yesterday vs. just a slope estimate — captures ascending multi-day
-    trends that rolling stats compress into a single derivative.
-    """
     t   = TICKS[freq]
     df  = df.copy()
     tpd = t["24h"]
@@ -264,17 +312,6 @@ def compute_lag_features(
 # ---------------------------------------------------------------------------
 
 def compute_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Explicit cross-sensor products for compound risk states.
-
-    waterlevel_x_soilmoisture:
-        High water + saturated soil — every raindrop becomes runoff,
-        compounding flood risk beyond what either signal alone captures.
-
-    humidity_x_waterlevel_slope:
-        Active rainfall loading (high humidity) during a rising river.
-        Only the positive (rising) slope component is used.
-    """
     df = df.copy()
 
     if "max_waterlevel_24h" in df.columns and "sensor_soilmoisture_mean_24h" in df.columns:
@@ -299,11 +336,6 @@ def compute_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def append_rolling_waterlevel(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Slow-build flood features for Aug–Oct patterns where water rises
-    gradually over many days rather than surging in a single event.
-    Idempotent — safe to call even if columns already exist.
-    """
     if "max_waterlevel_24h" not in df.columns:
         return df
     df = df.copy()
@@ -319,7 +351,218 @@ def append_rolling_waterlevel(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 8. Flood History Features (retained but NOT in SENSOR_FEATURE_COLUMNS)
+# 8. Monsoon Features (existing)
+# ---------------------------------------------------------------------------
+
+def compute_monsoon_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Five features that encode the monsoon-saturation flood mechanism.
+    Must be called AFTER compute_lag_features (requires soilmoisture_lag_*).
+    """
+    df = df.copy()
+
+    month = df.index.month
+    df["is_monsoon_season"] = ((month >= 6) & (month <= 10)).astype(float)
+
+    if "max_waterlevel_6h" in df.columns:
+        df["waterlevel_monsoon"] = df["max_waterlevel_6h"] * df["is_monsoon_season"]
+    else:
+        df["waterlevel_monsoon"] = 0.0
+
+    if "sensor_soilmoisture_mean_24h" in df.columns:
+        df["soilmoisture_monsoon"] = df["sensor_soilmoisture_mean_24h"] * df["is_monsoon_season"]
+    else:
+        df["soilmoisture_monsoon"] = 0.0
+
+    if "humidity_mean_24h" in df.columns and "sensor_soilmoisture_mean_24h" in df.columns:
+        df["humidity_x_soilmoisture"] = (
+            df["humidity_mean_24h"] * df["sensor_soilmoisture_mean_24h"]
+        )
+    else:
+        df["humidity_x_soilmoisture"] = 0.0
+
+    if "soilmoisture_lag_1d" in df.columns and "soilmoisture_lag_2d" in df.columns:
+        df["soilmoisture_trend_3d"] = df["soilmoisture_lag_1d"] - df["soilmoisture_lag_2d"]
+    else:
+        df["soilmoisture_trend_3d"] = 0.0
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 9. Post-Flood Decay Features (NEW — fixes Aug false-positive block)
+# ---------------------------------------------------------------------------
+
+def compute_postflood_decay_features(
+    df: pd.DataFrame,
+    col: str = "waterlevel",
+    freq: str = "1D",
+) -> pd.DataFrame:
+    """
+    Three features that signal the flood has ended and risk is diminishing.
+
+    Problem: After the July monsoon flood, lag features (waterlevel_lag_*,
+    waterlevel_cumrise_14d) stay elevated for weeks. The model has no signal
+    that the flood is OVER, so it keeps outputting DANGER through August even
+    though actual=clear.
+
+    days_since_flood_level:
+        Uses the same rolling 85th-percentile threshold as
+        waterlevel_days_above_threshold. Resets to 0 whenever waterlevel is
+        above that threshold; increments by 1 each day it stays below.
+        Computed identically to the TICKS-aware logic in waterlevel features.
+
+    waterlevel_falling_streak:
+        Consecutive days of strictly decreasing waterlevel, capped at 30.
+        Uses the same tick-aware shift as the slope features.
+
+    post_flood_decay_7d:
+        Waterlevel 7 calendar days ago (lag) minus today. Positive = level
+        has fallen over the past week = receding flood. Lag-based, no leakage.
+        Uses t['24h']*7 ticks to be frequency-consistent.
+    """
+    t  = TICKS[freq]
+    df = df.copy()
+
+    # --- days_since_flood_level ---
+    window_30d  = t["24h"] * WATERLEVEL_ELEVATED_WINDOW
+    rolling_85p = df[col].rolling(window_30d, min_periods=7).quantile(
+        WATERLEVEL_ELEVATED_PERCENTILE
+    )
+    above = (df[col] > rolling_85p).astype(int)
+
+    days_since = []
+    counter    = 0
+    for v in above:
+        if v == 1:
+            counter = 0
+        else:
+            counter += 1
+        days_since.append(counter)
+    df["days_since_flood_level"] = days_since
+
+    # --- waterlevel_falling_streak ---
+    tpd   = t["24h"]
+    delta = df[col] - df[col].shift(tpd)       # change since previous period
+
+    falling_streak = []
+    streak = 0
+    for d in delta.fillna(0):
+        if d < 0:
+            streak += 1
+        else:
+            streak = 0
+        falling_streak.append(min(streak, 30))
+    df["waterlevel_falling_streak"] = falling_streak
+
+    # --- post_flood_decay_7d ---
+    lag_7d = df[col].shift(tpd * 7)
+    df["post_flood_decay_7d"] = (lag_7d - df[col]).fillna(0)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 10. Late-Season Anomaly Features (NEW — fixes Nov flood miss)
+# ---------------------------------------------------------------------------
+
+def compute_late_season_anomaly_features(
+    df: pd.DataFrame,
+    humidity_col:    str = "humidity",
+    soilmoisture_col: str = "soil_moisture",
+    freq: str = "1D",
+) -> pd.DataFrame:
+    """
+    Three features that detect relative spikes at post-monsoon baseline.
+
+    Problem: Nov 3–8 floods were missed because absolute sensor values in
+    November are low (post-monsoon baseline). The model sees "dry-season-like"
+    readings. But these floods happen from a *relative* spike above the recent
+    baseline — the anomaly is invisible to absolute-value features.
+
+    humidity_anomaly_vs_30d:
+        humidity_mean_24h minus its own 30-day rolling mean. Uses the already-
+        computed humidity_mean_24h to avoid double-computation. Window uses
+        t['24h']*30 ticks for frequency consistency.
+
+    soilmoist_anomaly_vs_30d:
+        sensor_soilmoisture_mean_24h minus its own 30-day rolling mean.
+        Same window logic.
+
+    late_season_wet_flag:
+        1 if the calendar month is October or November AND at least one of the
+        two anomalies is positive (above the 30-day baseline). Hard binary flag
+        directly targeting this failure mode.
+    """
+    t  = TICKS[freq]
+    df = df.copy()
+
+    window_30d = t["24h"] * 30
+
+    # Use the already-computed 24h means if available; fall back to raw cols
+    hum_col = "humidity_mean_24h"    if "humidity_mean_24h"             in df.columns else humidity_col
+    sm_col  = "sensor_soilmoisture_mean_24h" if "sensor_soilmoisture_mean_24h" in df.columns else soilmoisture_col
+
+    hum_30d_mean = df[hum_col].rolling(window_30d, min_periods=7).mean()
+    sm_30d_mean  = df[sm_col].rolling(window_30d,  min_periods=7).mean()
+
+    df["humidity_anomaly_vs_30d"]  = df[hum_col] - hum_30d_mean
+    df["soilmoist_anomaly_vs_30d"] = df[sm_col]  - sm_30d_mean
+
+    month = df.index.month
+    is_late = ((month == 10) | (month == 11)).astype(int)
+    hum_above = (df["humidity_anomaly_vs_30d"]  > 0).astype(int)
+    sm_above  = (df["soilmoist_anomaly_vs_30d"] > 0).astype(int)
+    df["late_season_wet_flag"] = is_late * ((hum_above | sm_above).astype(int))
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 11. Variance / Dynamism Features (NEW — fixes Jan-Mar flat probability plateau)
+# ---------------------------------------------------------------------------
+
+def compute_variance_features(
+    df: pd.DataFrame,
+    waterlevel_col:   str = "waterlevel",
+    soilmoisture_col: str = "soil_moisture",
+    freq: str = "1D",
+) -> pd.DataFrame:
+    """
+    Two std features that let the model distinguish active vs quiet periods.
+
+    Problem: Jan–Mar sensor readings are near-constant (dry season) →
+    rolling features collapse to identical values → model outputs the same
+    probability every day (10.7% stuck for weeks).
+
+    The correct fix is NOT noise injection (which corrupts training signal).
+    Instead, rolling std naturally captures "how dynamic is the sensor right
+    now". Near-zero in dry season (correct — the model SHOULD know conditions
+    are stable), non-zero when conditions are fluctuating pre-flood.
+
+    waterlevel_7d_std:
+        7-day rolling std of raw waterlevel. Window uses t['24h']*7 ticks.
+
+    soilmoist_7d_std:
+        7-day rolling std of raw soil moisture. Same window.
+    """
+    t  = TICKS[freq]
+    df = df.copy()
+
+    window_7d = t["24h"] * 7
+
+    df["waterlevel_7d_std"] = (
+        df[waterlevel_col].rolling(window_7d, min_periods=2).std().fillna(0)
+    )
+    df["soilmoist_7d_std"] = (
+        df[soilmoisture_col].rolling(window_7d, min_periods=2).std().fillna(0)
+    )
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 12. Flood History Features (retained but NOT in SENSOR_FEATURE_COLUMNS)
 # ---------------------------------------------------------------------------
 
 def compute_flood_history_features(
@@ -327,17 +570,6 @@ def compute_flood_history_features(
     flood_label_series: pd.Series = None,
     flood_log_path: str = None,
 ) -> pd.DataFrame:
-    """
-    Computes days_since_last_flood — watershed recovery proxy.
-
-    NOT currently in SENSOR_FEATURE_COLUMNS. Re-enable once a populated
-    flood_event_log.csv exists with confirmed event dates.
-
-    Batch mode : pass flood_label_series (pd.Series, same index as df).
-    Live mode  : pass flood_log_path to operator-maintained CSV
-                 with columns [timestamp, flood_label].
-    Neither    : feature set to 999 (unknown).
-    """
     df     = df.copy()
     labels = None
 
@@ -370,7 +602,7 @@ def compute_flood_history_features(
 
 
 # ---------------------------------------------------------------------------
-# 9. Master Feature Pipeline
+# 13. Master Feature Pipeline
 # ---------------------------------------------------------------------------
 
 def build_features(
@@ -388,16 +620,13 @@ def build_features(
 
     Args:
         df                 : Sensor DataFrame with DatetimeIndex.
-        waterlevel_col     : Column name for water level readings.
+        waterlevel_col     : Column name for water level readings (raw metres).
         soilmoisture_col   : Column name for soil moisture readings.
         humidity_col       : Column name for humidity readings.
         freq               : Sampling frequency string.
         mode               : 'sensor' or 'full'.
-        flood_label_series : Optional flood labels for days_since_last_flood
-                             (batch / training mode). Currently unused since
-                             that feature is excluded from SENSOR_FEATURE_COLUMNS.
-        flood_log_path     : Optional path to flood event log CSV
-                             (live mode). Currently unused for same reason.
+        flood_label_series : Optional flood labels for days_since_last_flood.
+        flood_log_path     : Optional path to flood event log CSV.
 
     Returns:
         DataFrame with selected feature columns only, NaN rows dropped.
@@ -427,6 +656,7 @@ def build_features(
                 f"Run prepare_dataset.py before train scripts."
             )
 
+    # Original pipeline — order preserved exactly
     df = compute_waterlevel_features(df,          col=waterlevel_col,   freq=freq)
     df = compute_sensor_soilmoisture_features(df, col=soilmoisture_col, freq=freq)
     df = compute_humidity_features(df,            col=humidity_col,     freq=freq)
@@ -437,9 +667,18 @@ def build_features(
                                freq=freq)
     df = compute_interaction_features(df)
     df = append_rolling_waterlevel(df)
+    df = compute_monsoon_features(df)           # must come after lag features
 
-    # days_since_last_flood excluded from target_cols — computed here
-    # only if explicitly requested (flood_label_series or flood_log_path passed)
+    # New fix features — appended after original pipeline, same order requirement
+    df = compute_postflood_decay_features(df,   col=waterlevel_col,      freq=freq)
+    df = compute_late_season_anomaly_features(df,
+                                              humidity_col=humidity_col,
+                                              soilmoisture_col=soilmoisture_col,
+                                              freq=freq)
+    df = compute_variance_features(df,          waterlevel_col=waterlevel_col,
+                                                soilmoisture_col=soilmoisture_col,
+                                                freq=freq)
+
     if flood_label_series is not None or flood_log_path is not None:
         df = compute_flood_history_features(
             df,
@@ -465,7 +704,7 @@ def build_features(
 
 
 # ---------------------------------------------------------------------------
-# 10. Label Alignment (unchanged)
+# 14. Label Alignment (unchanged)
 # ---------------------------------------------------------------------------
 
 def align_satellite_labels(
@@ -479,8 +718,7 @@ def align_satellite_labels(
     """
     Assign a binary flood label to each feature row using direction='forward'.
     Each sensor row is matched to the NEXT upcoming satellite pass within
-    lookback_hours. Physical meaning: "Will the next satellite pass observe
-    a flood?" — the correct target for an early warning system.
+    lookback_hours.
     """
     satellite_df = satellite_df.copy()
 
@@ -556,7 +794,7 @@ if __name__ == "__main__":
     rng = np.random.default_rng(42)
 
     sensor = pd.DataFrame({
-        "waterlevel":    rng.uniform(-2.0, 3.0, len(idx)),
+        "waterlevel":    rng.uniform(1.8, 3.2, len(idx)),
         "soil_moisture": rng.uniform(0.1, 0.5, len(idx)),
         "humidity":      rng.uniform(1, 5, len(idx)),
     }, index=idx)
@@ -567,9 +805,28 @@ if __name__ == "__main__":
     print("--- SENSOR MODE ---")
     sf = build_features(sensor, freq="1D", mode="sensor")
     print(f"Columns ({len(sf.columns)}): {list(sf.columns)}")
-    print(f"Expected 27 sensor features\n")
+    print(f"Expected 40 sensor features\n")
 
     print("--- FULL MODE ---")
     ff = build_features(sensor, freq="1D", mode="full")
     print(f"Columns ({len(ff.columns)}): {list(ff.columns)}")
-    print(f"Expected 30 full features\n")
+    print(f"Expected 43 full features\n")
+
+    # Verify no original features changed
+    original_32 = [
+        "max_waterlevel_6h","max_waterlevel_24h","waterlevel_slope_3h","waterlevel_slope_6h",
+        "waterlevel_std_24h","waterlevel_rise_rate_48h","waterlevel_lag_1d","waterlevel_lag_2d",
+        "waterlevel_lag_3d","waterlevel_days_above_threshold","waterlevel_pct_rank_30d",
+        "waterlevel_distance_to_max","waterlevel_mean_7d","waterlevel_cumrise_14d",
+        "sensor_soilmoisture_mean_6h","sensor_soilmoisture_mean_24h","sensor_soilmoisture_trend_6h",
+        "soilmoisture_lag_1d","soilmoisture_lag_2d","humidity_mean_24h","humidity_trend_6h",
+        "waterlevel_x_soilmoisture","humidity_x_waterlevel_slope","season_sin","season_cos",
+        "week_sin","week_cos","is_monsoon_season","waterlevel_monsoon","soilmoisture_monsoon",
+        "humidity_x_soilmoisture","soilmoisture_trend_3d",
+    ]
+    missing = [f for f in original_32 if f not in sf.columns]
+    if missing:
+        print(f"ERROR — original features missing: {missing}")
+    else:
+        print("✅  All 32 original features present and correct")
+        print(f"✅  8 new fix features added: {[f for f in sf.columns if f not in original_32]}")

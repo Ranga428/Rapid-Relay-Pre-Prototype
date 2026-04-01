@@ -18,21 +18,19 @@ This script is Step 0 of Start.py's daily scheduled run:
     Step 1  RF_Predict.run_pipeline() ← predict on updated CSV
     Step 2  FB_Post (if WATCH+)
 
-NORMALIZATION NOTE
-------------------
-This script will also serve as the normalization reference baseline when
-real hardware sensors are deployed. The z-scored waterlevel values from
-UHSLC/CMEMS establish the distribution that hardware readings will be
-aligned to during the transition period (Phase 1 parallel running).
-When hardware sensors take over, their readings should be z-scored against
-the same 2017-2021 reference window (uhslc_mu / uhslc_std) to maintain
-model compatibility.
+WATERLEVEL UNITS
+----------------
+waterlevel is output in RAW METERS (m above chart datum).
+UHSLC sea_level field is in millimetres — divided by 1000 to get metres.
+CMEMS zos field is already in metres — used as-is.
+No z-score normalisation is applied. Tree-based models (RF, XGBoost,
+LightGBM) are scale-invariant and do not require normalised inputs.
 
 DATA SOURCES
 ------------
 - waterlevel : UHSLC Station 370 Manila South Harbor (primary)
                CMEMS zos SSH anomaly (gap-fill)
-               Output is z-score normalised (dimensionless)
+               Output is RAW METRES (m)
 - soil_moisture : ERA5-Land volumetric_soil_water_layer_1 (0-7cm)
 - humidity      : Aqua MODIS MCD19A2_GRANULES Column_WV
 
@@ -171,45 +169,6 @@ def get_date_range(force_full: bool = False) -> tuple[str, str]:
     except Exception as e:
         print(f"  WARNING: Could not read existing CSV ({e}). Falling back to full history.")
         return HISTORY_START, end_date
-
-
-# ─── NORMALIZATION REFERENCE ──────────────────────────────────────────────────
-
-def get_normalization_reference() -> tuple[float, float]:
-    """
-    Load the UHSLC normalization reference (mu, std) from the existing CSV.
-    Uses the 2017-01-01 → 2021-07-01 window, consistent with the original
-    full-history run.
-
-    Returns (mu, std). If CSV is missing or too small, returns (0.0, 1.0)
-    which is a safe no-op normalisation.
-
-    NOTE: These values must remain stable across runs so that new appended
-    rows are on the same z-score scale as historical rows. Hardware sensor
-    readings should also be normalised with these same constants during
-    the parallel-running transition period.
-    """
-    REF_START = pd.Timestamp("2017-01-01")
-    REF_END   = pd.Timestamp("2021-07-01")
-
-    if not OUTPUT_CSV.exists():
-        return 0.0, 1.0
-
-    try:
-        df = pd.read_csv(OUTPUT_CSV, usecols=["timestamp", "waterlevel"], parse_dates=["timestamp"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_localize(None)
-        ref = df[(df["timestamp"] >= REF_START) & (df["timestamp"] < REF_END)]
-        if len(ref) < 30:
-            print("  WARNING: Reference window too small — using full series for normalisation.")
-            ref = df
-        mu  = float(ref["waterlevel"].mean())
-        std = float(ref["waterlevel"].std())
-        std = std if std > 0 else 1.0
-        print(f"  Normalisation reference loaded — μ={mu:.4f}, σ={std:.4f} (from existing CSV)")
-        return mu, std
-    except Exception as e:
-        print(f"  WARNING: Could not load normalisation reference ({e}). Using (0, 1).")
-        return 0.0, 1.0
 
 
 # ─── INIT ─────────────────────────────────────────────────────────────────────
@@ -436,6 +395,7 @@ def _get_uhslc(start_date: str, end_date: str) -> pd.DataFrame:
         chunk["timestamp"]    = pd.to_datetime(chunk["timestamp"], utc=True).dt.tz_localize(None).dt.normalize()
         chunk["sea_level_mm"] = pd.to_numeric(chunk["sea_level_mm"], errors="coerce")
         chunk = chunk[chunk["sea_level_mm"] > -9000].dropna(subset=["sea_level_mm"])
+        # Convert mm → metres. No z-score normalisation — raw metres output.
         chunk["waterlevel"]   = (chunk["sea_level_mm"] / 1000.0).astype("float32")
         frames.append(chunk[["timestamp", "waterlevel"]])
 
@@ -495,6 +455,7 @@ def _get_cmems(missing_dates: pd.DatetimeIndex) -> pd.DataFrame:
             del ds
             df_r["timestamp"] = pd.to_datetime(df_r["timestamp"]).dt.normalize()
             df_r = df_r[df_r["timestamp"].isin(gaps_rean)]
+            # CMEMS zos is already in metres — no conversion needed.
             df_r["waterlevel"] = df_r["waterlevel"].astype("float32")
             frames.append(df_r)
             del df_r
@@ -536,19 +497,12 @@ def _get_cmems(missing_dates: pd.DatetimeIndex) -> pd.DataFrame:
     return df_cmems[["timestamp", "waterlevel"]].reset_index(drop=True)
 
 
-def get_tidal_level(
-    start_date: str,
-    end_date: str,
-    norm_mu: float,
-    norm_std: float,
-) -> pd.DataFrame:
+def get_tidal_level(start_date: str, end_date: str) -> pd.DataFrame:
     """
-    Fetch tidal water level for the given date range and normalise using
-    the provided reference mu/std (loaded from existing CSV).
-
-    On first run (full history), mu/std are computed from the 2017-2021
-    reference window of the fetched data itself. On incremental runs,
-    mu/std come from the existing CSV so new rows are on the same scale.
+    Fetch tidal water level for the given date range.
+    Returns raw metres — no z-score normalisation applied.
+    UHSLC values (mm) are converted to metres by dividing by 1000.
+    CMEMS zos values are already in metres.
     """
     print("Fetching tidal water level data (UHSLC + CMEMS)...")
 
@@ -560,35 +514,6 @@ def get_tidal_level(
     del missing, covered
     gc.collect()
 
-    # ── Normalise ─────────────────────────────────────────────────────────
-    REF_START = pd.Timestamp("2017-01-01")
-    REF_END   = pd.Timestamp("2021-07-01")
-
-    if norm_mu == 0.0 and norm_std == 1.0 and not df_uhslc.empty:
-        ref_mask  = (df_uhslc["timestamp"] >= REF_START) & (df_uhslc["timestamp"] < REF_END)
-        if ref_mask.sum() > 30:
-            norm_mu  = float(df_uhslc.loc[ref_mask, "waterlevel"].mean())
-            norm_std = float(df_uhslc.loc[ref_mask, "waterlevel"].std())
-            norm_std = norm_std if norm_std > 0 else 1.0
-            print(f"  First-run normalisation computed — μ={norm_mu:.4f}, σ={norm_std:.4f}")
-
-    if not df_uhslc.empty:
-        df_uhslc["waterlevel"] = (
-            (df_uhslc["waterlevel"] - norm_mu) / norm_std
-        ).astype("float32")
-
-    if not df_cmems.empty:
-        ref_mask = (df_cmems["timestamp"] >= REF_START) & (df_cmems["timestamp"] < REF_END)
-        if ref_mask.sum() > 10:
-            cmems_mu  = float(df_cmems.loc[ref_mask, "waterlevel"].mean())
-            cmems_std = float(df_cmems.loc[ref_mask, "waterlevel"].std())
-            cmems_std = cmems_std if cmems_std > 0 else 1.0
-        else:
-            cmems_mu, cmems_std = norm_mu, norm_std
-        df_cmems["waterlevel"] = (
-            (df_cmems["waterlevel"] - cmems_mu) / cmems_std
-        ).astype("float32")
-
     df = pd.concat([df_uhslc, df_cmems], ignore_index=True)
     del df_uhslc, df_cmems
     gc.collect()
@@ -597,6 +522,7 @@ def get_tidal_level(
     df.reset_index(drop=True, inplace=True)
     df["waterlevel"] = pd.to_numeric(df["waterlevel"], errors="coerce").astype("float32")
     print(f"  → {len(df)} tidal records total (UHSLC + CMEMS gap-fill)")
+    print(f"  Waterlevel range : {df['waterlevel'].min():.3f}m → {df['waterlevel'].max():.3f}m")
     return df[["timestamp", "waterlevel"]]
 
 
@@ -615,7 +541,6 @@ def save_to_csv(new_df: pd.DataFrame, force_full: bool = False) -> None:
         No merge with existing data.
     """
     if force_full:
-        # Overwrite — no merge needed
         df_out = new_df.copy()
         df_out["timestamp"] = pd.to_datetime(df_out["timestamp"]).dt.strftime("%Y-%m-%dT%H:%M:%S")
         for col in ["waterlevel", "soil_moisture", "humidity"]:
@@ -627,9 +552,6 @@ def save_to_csv(new_df: pd.DataFrame, force_full: bool = False) -> None:
         print(f"  Total rows written : {len(df_out)}")
         return
 
-    # Incremental — merge with existing.
-    # keep="last" means the newly fetched row wins, so a previously-NaN
-    # row gets replaced by the freshly fetched (now populated) value.
     if OUTPUT_CSV.exists():
         existing = pd.read_csv(OUTPUT_CSV, parse_dates=["timestamp"])
         combined = pd.concat([existing, new_df], ignore_index=True)
@@ -648,8 +570,7 @@ def save_to_csv(new_df: pd.DataFrame, force_full: bool = False) -> None:
     combined = combined[["timestamp", "waterlevel", "soil_moisture", "humidity"]]
     combined.to_csv(OUTPUT_CSV, index=False)
 
-    # Report how many previously-NaN rows were filled
-    nan_after  = combined[["soil_moisture", "humidity"]].isnull().any(axis=1).sum()
+    nan_after = combined[["soil_moisture", "humidity"]].isnull().any(axis=1).sum()
     print(f"\n✓ Saved (incremental append) → {OUTPUT_CSV}")
     print(f"  Total rows now     : {len(combined)}")
     print(f"  Rows still NaN     : {nan_after} (upstream data not yet published)")
@@ -674,17 +595,7 @@ def run_pipeline(force_full: bool = False) -> bool:
     start_date, end_date = get_date_range(force_full=force_full)
 
     if start_date is None:
-        # Already up to date with no NaN gaps (incremental mode only)
         return False
-
-    # On a full re-pull the existing CSV is about to be overwritten, so
-    # normalization must be re-derived from the fresh data, not the stale CSV.
-    # Pass (0.0, 1.0) so get_tidal_level() computes it from the 2017-2021 window.
-    if force_full:
-        norm_mu, norm_std = 0.0, 1.0
-        print("  Normalization will be recomputed from 2017–2021 reference window.")
-    else:
-        norm_mu, norm_std = get_normalization_reference()
 
     # Init GEE and AOI
     init_gee()
@@ -693,7 +604,7 @@ def run_pipeline(force_full: bool = False) -> bool:
     # Fetch each source for the target window
     df_sm    = get_soil_moisture(start_date, end_date)
     df_humid = get_humidity(start_date, end_date, aoi)
-    df_tide  = get_tidal_level(start_date, end_date, norm_mu, norm_std)
+    df_tide  = get_tidal_level(start_date, end_date)
 
     print("\nMerging new data...")
     df = (
@@ -739,8 +650,7 @@ if __name__ == "__main__":
         help=(
             "Force a full history re-pull from 2017-01-01 → today. "
             "Overwrites obando_environmental_data.csv entirely. "
-            "Use when the CSV is corrupted, missing, or needs to be rebuilt from scratch. "
-            "(Mirrors the --full flag in sentinel1_GEE.py)"
+            "Use when the CSV is corrupted, missing, or needs to be rebuilt from scratch."
         ),
     )
     args = parser.parse_args()

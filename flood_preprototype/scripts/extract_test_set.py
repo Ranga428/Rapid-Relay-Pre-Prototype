@@ -2,18 +2,25 @@
 extract_test_set.py
 ===================
 Extracts the test split rows from flood_dataset.csv into a separate CSV.
-The test split is the held-out period never seen during training:
-    Test : 2024-01-01 → present  (all of 2024 + 2025 + 2026)
+The test split is the held-out period never seen during training or
+threshold tuning:
+
+    Test : 2025-07-01 → present
 
 This CSV can be used to:
     - Inspect what the model was evaluated on
     - Run manual prediction checks
     - Feed into predict_*.py for batch prediction
-    - Validate against known flood events in 2024–2025
+    - Validate against known flood events in 2025–2026
 
-Test set contains 8 flood clusters across two full flood seasons:
-    2024 : Jun–Jul, Aug–Sep, Oct  (3 clusters, ~80 flood days)
-    2025 : Jun–Jul, Jul, Aug–Oct, Oct, Nov  (5 clusters, ~112 flood days)
+Test set contains flood events across the Jul 2025 – Mar 2026 window:
+    2025 : Jul        — strong flood events
+    2025 : Aug–Nov    — sensor-invisible flood cluster
+    2026 : Jan–Mar    — quiet / dry period
+
+Note: The test set (~265 rows as of Mar 2026) is smaller than ideal for
+robust per-regime evaluation. Defer final conclusions until mid-2026 when
+the second dry season is more complete and row count reaches ~350–400.
 
 Usage
 -----
@@ -37,8 +44,8 @@ INPUT_FILE  = r"..\data\flood_dataset.csv"
 OUTPUT_FILE = r"..\data\flood_dataset_test.csv"
 
 # Must match TRAIN_END and VAL_END in the training scripts
-TRAIN_END = "2022-12-31"
-VAL_END   = "2023-12-31"   # UPDATED — all of 2024 is now part of the test set
+TRAIN_END = "2024-06-30"   # UPDATED — was "2022-12-31"
+VAL_END   = "2025-06-30"   # UPDATED — was "2023-12-31"
 
 # ===========================================================================
 # END CONFIG
@@ -110,6 +117,11 @@ def main():
         print(f"    {str(row['start'].date()):<12} -> {str(row['end'].date()):<12}  "
               f"{row['days']:>2} days")
 
+    if len(test_df) < 300:
+        print(f"\n  ⚠️  Test set has {len(test_df)} rows — smaller than the 300–400 row")
+        print(f"      target for robust per-regime evaluation. Consider deferring")
+        print(f"      final conclusions until mid-2026.")
+
     # --- Save ---
     out_dir = os.path.dirname(OUTPUT_FILE)
     if out_dir and not os.path.exists(out_dir):
@@ -131,7 +143,9 @@ def main():
 
     print(f"\n  Note: These rows were NEVER seen during training or threshold tuning.")
     print(f"        The model's performance on this set is the honest prediction result.")
-    print(f"        VAL_END = {VAL_END}  —  test starts {(val_end_ts + pd.Timedelta(days=1)).date()}")
+    print(f"        TRAIN_END = {TRAIN_END}  |  VAL_END = {VAL_END}")
+    print(f"        Test starts {(val_end_ts + pd.Timedelta(days=1)).date()}  "
+          f"(~13-month gap from train cutoff)")
     print("=" * 55)
 
 

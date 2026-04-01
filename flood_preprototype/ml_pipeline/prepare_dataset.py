@@ -6,24 +6,23 @@ Merges sensor data and satellite/EO data into a single ML-ready dataset.
 This script always produces a FULL dataset (sensor + SAR satellite features
 plus flood labels). Used for training and revalidation only.
 
-predict_*.py does NOT use this script — it loads sensor data directly.
+WATERLEVEL UNITS (UPDATED)
+--------------------------
+waterlevel column is now in RAW METRES. The proxy script no longer applies
+z-score normalisation. The outlier filter (previously a z-score ceiling of
+6.0σ) is now a physical plausibility ceiling of 4.0m above chart datum —
+anything above that for Manila Bay is a sensor fault, not a real reading.
+The absolute minimum floor of -1.0m removes obvious data errors.
+Tree-based models are scale-invariant so no normalisation is needed.
 
 CHANGES FROM PREVIOUS VERSION
 ------------------------------
-NEW 1  — build_dataset() now passes flood_label_series into build_features()
-         so that days_since_last_flood is computed correctly during dataset
-         preparation. The satellite flood_label column is used as the source.
+NEW 1  — WATERLEVEL_MAX changed from z-score 6.0 to physical 4.0 metres.
+NEW 2  — WATERLEVEL_MIN changed from None to -1.0 metres.
+NEW 3  — load_sensor() print label updated to "Waterlevel stats (raw metres)".
+NEW 4  — Outlier drop logic uses raw metre bounds instead of abs(z) > threshold.
 
-NEW 2  — SAR_FEATURE_COLS and OUTPUT_FILE paths unchanged. No other
-         structural changes — all new features are computed inside
-         feature_engineering.py and picked up automatically via
-         SENSOR_FEATURE_COLUMNS.
-
-LABEL ALIGNMENT (unchanged)
-----------------------------
-Labels are assigned using direction='forward' with LOOKBACK_HOURS=288
-(12 days). Each sensor day is labeled by the NEXT upcoming satellite pass
-within the next 12 days.
+Everything else unchanged.
 """
 
 import sys
@@ -42,7 +41,6 @@ from feature_engineering import (
 # CONFIG
 # ===========================================================================
 
-# AFTER
 _PREP_DIR      = os.path.dirname(os.path.abspath(__file__))
 SENSOR_FILE    = os.path.join(_PREP_DIR, "..", "data", "sensor", "obando_environmental_data.csv")
 SATELLITE_FILE = os.path.join(_PREP_DIR, "..", "data", "sentinel1", "GEE-Processing", "sentinel1_timeseries.csv")
@@ -52,8 +50,12 @@ USE_EXISTING_LABEL_COL = "flood_label"
 FLOOD_THRESHOLD        = 0.60
 LOOKBACK_HOURS         = 288
 
-WATERLEVEL_MIN  = None
-WATERLEVEL_ZMAX = 6.0
+# Physical plausibility bounds for Manila Bay tidal water level (raw metres).
+# UHSLC station 370 (Manila South Harbor) MSL is ~2.2m above chart datum.
+# Normal tidal range: 1.8–2.6m. Storm surge peaks rarely exceed 3.5m.
+# Anything below -1.0m or above 4.0m is a sensor fault / data error.
+WATERLEVEL_MIN = -1.0   # metres — floor (negative surge / sensor fault)
+WATERLEVEL_MAX =  4.0   # metres — ceiling (beyond plausible storm surge)
 
 SENSOR_COLUMN_MAP = {
     "timestamp":     "timestamp",
@@ -209,18 +211,20 @@ def load_sensor(sensor_path: str = None) -> tuple:
     df   = df[keep]
 
     if "waterlevel" in df.columns:
-        n_before  = len(df)
-        df        = df.dropna(subset=["waterlevel"])
-        n_nan     = n_before - len(df)
+        n_before = len(df)
+        df       = df.dropna(subset=["waterlevel"])
+        n_nan    = n_before - len(df)
         if n_nan > 0:
             print(f"  Dropped {n_nan} rows with NaN waterlevel.")
 
+        # Physical plausibility filter — raw metres
         n_before2 = len(df)
-        df        = df[df["waterlevel"].abs() <= WATERLEVEL_ZMAX]
-        n_extreme = n_before2 - len(df)
+        mask_ok   = (df["waterlevel"] >= WATERLEVEL_MIN) & (df["waterlevel"] <= WATERLEVEL_MAX)
+        n_extreme = n_before2 - mask_ok.sum()
+        df        = df[mask_ok]
         if n_extreme > 0:
-            print(f"  Dropped {n_extreme} rows with |waterlevel z-score| > "
-                  f"{WATERLEVEL_ZMAX} (sensor fault artifacts).")
+            print(f"  Dropped {n_extreme} rows outside physical range "
+                  f"[{WATERLEVEL_MIN}m, {WATERLEVEL_MAX}m] (sensor fault artifacts).")
 
         print(f"  Kept {len(df):,} / {n_before:,} sensor rows "
               f"({100*len(df)/n_before:.1f}%) after dropout filter.")
@@ -239,8 +243,8 @@ def load_sensor(sensor_path: str = None) -> tuple:
     print(f"\n  Loaded rows  : {len(df):,}")
     print(f"  Date range   : {df.index[0]}  ->  {df.index[-1]}")
     print(f"  Columns kept : {list(df.columns)}")
-    print(f"\n  Waterlevel stats (z-scored):")
-    print(df["waterlevel"].describe().round(3).to_string())
+    print(f"\n  Waterlevel stats (raw metres):")
+    print(df["waterlevel"].describe().round(4).to_string())
     print(f"\n  Sample data:")
     print(df.head(3).to_string())
 
@@ -414,8 +418,6 @@ def merge_satellite_columns(
 
 # ---------------------------------------------------------------------------
 # Step 5 — Feature engineering + label alignment
-# NEW: passes satellite flood_label series into build_features() so that
-#      days_since_last_flood is computed from confirmed satellite flood events.
 # ---------------------------------------------------------------------------
 
 def build_dataset(
@@ -429,9 +431,6 @@ def build_dataset(
     print(f"  Label strategy    : forward, {LOOKBACK_HOURS}h window")
     print(f"  Building features in FULL mode (sensor + SAR satellite)...")
 
-    # --- NEW: extract satellite flood labels for days_since_last_flood ---
-    # Forward-fill the satellite flood_label onto the sensor daily index
-    # so compute_flood_history_features() has a label at each sensor row.
     sat_labels = None
     if "flood_label" in satellite_df.columns:
         sat_labels = (
@@ -448,7 +447,7 @@ def build_dataset(
         sensor_df,
         freq=freq,
         mode="full",
-        flood_label_series=sat_labels,   # NEW: passed in
+        flood_label_series=sat_labels,
     )
 
     use_existing = bool(
@@ -529,6 +528,7 @@ def main():
     print(f"  Label lookahead: {LOOKBACK_HOURS}h ({LOOKBACK_HOURS//24} days, forward)")
     print(f"  SAR features   : {SAR_FEATURE_COLS}")
     print(f"  Excluded cols  : rainfall_1d/3d/7d, era5_runoff_1d/7d, era5_soil_water")
+    print(f"  Waterlevel     : raw metres, bounds [{WATERLEVEL_MIN}m, {WATERLEVEL_MAX}m]")
     separator()
 
     sensor_df,   freq = load_sensor()
