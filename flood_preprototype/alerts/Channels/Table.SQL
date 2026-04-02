@@ -5,3 +5,11 @@ create table if not exists flood_predictions (
   risk_tier text,
   created_at timestamp default now()
 );
+
+create table public.obando_environmental_data (
+    id bigint generated always as identity primary key,
+    timestamp timestamptz not null,
+    waterlevel numeric not null,
+    soil_moisture numeric not null,
+    humidity numeric not null
+);
