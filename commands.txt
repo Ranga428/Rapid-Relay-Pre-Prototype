@@ -23,6 +23,16 @@
     # Save dependencies to txt file
         pip freeze > requirements.txt
 
+    # download GDAL
+    Invoke-WebRequest `
+        -Uri "https://github.com/cgohlke/geospatial-wheels/releases/download/v2025.10.25/gdal-3.11.4-cp313-cp313-win_amd64.whl" `
+        -OutFile ".\gdal-3.11.4-cp313-cp313-win_amd64.whl"
+
+    wget https://github.com/cgohlke/geospatial-wheels/releases/download/v2025.10.25/gdal-3.11.4-cp313-cp313-win_amd64.whl
+    
+    # download GDAL
+    pip install .\gdal-3.11.4-cp313-cp313-win_amd64.whl
+
     # Run at start of every "Git Clone"
         python -m venv floodenv
         floodenv\Scripts\activate
