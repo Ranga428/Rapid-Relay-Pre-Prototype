@@ -6,82 +6,74 @@ Flood Prediction — Daily Inference Orchestrator
 PURPOSE
 -------
 Single entry point for daily operational deployment.
-Calls existing pipeline scripts in order:
+Runs the full pipeline in order, all incremental:
 
-    Step 0  Sat_SensorData_proxy.py  — fetch today's sensor reading (incremental append)
-    Step 1  RF_Predict.py            — predict on updated sensor CSV (Design Option 2)
-    Step 2  Alert.py                 — dispatch alert to all configured channels (if WATCH/WARNING/DANGER)
-    Step 3  Seasonal notification    — remind to retrain every ~90 days (manual trigger)
+    Step 0a  sensor_ingest.py         — pull new hardware readings from Supabase
+    Step 0b  Sat_SensorData_proxy.py  — pull new proxy data from GEE
+    Step 0c  merge_sensor.py          — merge both into combined_sensor_context.csv
+    Step 1   RF_Predict.py            — live mode inference on combined CSV
+    Step 2   XGB_Predict.py           — comparison run (if --all-models)
+    Step 3   LGBM_Predict.py          — comparison run (if --all-models)
+    Step 4   Alert.py                 — dispatch alert based on flood_rf_sensor_predictions.csv
+    Step 5   Seasonal notification    — remind to retrain every ~90 days (manual trigger)
 
-COMPARISON MODELS (optional, --all-models flag)
-    XGB_Predict.py   — Design Option 1
-    LGBM_Predict.py  — Design Option 3
+ALL STEPS ARE INCREMENTAL
+--------------------------
+Every script only processes rows newer than what is already on disk:
+    sensor_ingest   — fetches Supabase rows newer than latest obando_sensor_data.csv timestamp
+    Sat_SensorData  — fetches GEE rows newer than latest obando_environmental_data.csv timestamp
+    merge_sensor    — merges only rows newer than latest combined_sensor_context.csv timestamp
+    RF_Predict      — predicts only rows after LAST_TRAINING_DATE (filter_new_rows)
+    Alert           — FB check_duplicate=True; Supabase appends only new prediction rows
 
-RETRAINING (separate script, manual trigger)
-    python Retraining_Pipeline.py --retrain
-    This is NOT run automatically by Start.py. Instead, Start.py checks
-    how many days have elapsed since the last model training and prints a
-    prominent terminal notification when retraining is due (~every season /
-    90 days). The actual retraining is always a manual decision.
+ALERT DISPATCH
+--------------
+Alert.py always runs last, after all model predictions are complete.
+It reads the latest row from flood_rf_sensor_predictions.csv — the RF
+model is the primary operational model and is always the alert source.
+XGB and LGBM are comparison-only and do not trigger alerts.
 
-HOW DEPLOYMENT WORKS
----------------------
-1. A cron job or Windows Task Scheduler runs this script once per day
-   (midnight or shortly after the sensor station uploads its daily reading).
-
-2. Step 0: Sat_SensorData_proxy.py fetches the latest missing sensor rows
-   and appends them to obando_environmental_data.csv. On a daily schedule
-   this is typically 1 new row per run (fast, incremental).
-
-3. Step 1: RF_Predict.run_pipeline() loads the updated CSV, builds features,
-   filters to rows after LAST_TRAINING_DATE, and saves predictions + plot.
-
-4. Step 2: If the latest prediction is WATCH/WARNING/DANGER, FB_Post.py
-   is called to post an alert to the configured Facebook Page.
-
-5. Step 3: Days since last model training are checked. If >= RETRAIN_NOTIFY_DAYS
-   (default 90), a prominent seasonal retrain reminder is printed to the
-   terminal and optionally written to a log file.
-
-NO LABELS NEEDED AT RUNTIME
+SCHEDULER — MIDNIGHT-PINNED
 -----------------------------
-The model was trained with satellite-derived flood labels (Sentinel-1 every
-~12 days). At inference time NO satellite data and NO labels are needed. The
-model learned "what sensor patterns precede a flood" during training.
+    python Start.py --schedule
 
-Sentinel-1 data is only needed when retraining. After new satellite passes
-accumulate (every 6-12 months), run:
+Runs once immediately on start, then sleeps until the next calendar midnight
+(local system time) before each subsequent run. This means the pipeline always
+fires at midnight regardless of when you first started the script — not every
+24 hours from launch time.
+
+If a run takes longer than expected and the next midnight has already passed,
+the script runs immediately and re-aligns to the following midnight.
+
+RETRAINING (manual, separate script)
+--------------------------------------
     python Retraining_Pipeline.py --retrain
 
-FIX vs old Start.py
--------------------
-- Added Step 0: Sat_SensorData_proxy.py runs before RF_Predict so the sensor
-  CSV is always current before predictions are made.
-- Added Step 3: Seasonal retrain notification based on last_training_date in
-  the .pkl artifact — no manual constants needed.
-- Threshold is always read from the saved .pkl artifact.
-- Sensor extractor is imported and called via run_pipeline() — same pattern
-  as RF_Predict, single code path.
+NOT run automatically. Start.py checks days since last training and prints
+a prominent terminal notice when retraining is due (~every 90 days).
 
 Usage
 -----
     # Run once manually
     python Start.py
 
-    # Run on a schedule (every 24 hours)
-    python Start.py --schedule --interval 24
+    # Run on midnight schedule (keeps running, Ctrl+C to stop)
+    python Start.py --schedule
 
-    # Also run XGB and LGBM for comparison logging
-    python Start.py --all-models
+    # Skip hardware sensor ingest (no Supabase connection / testing)
+    python Start.py --skip-sensor
+
+    # Skip GEE proxy fetch (no GEE auth / testing)
+    python Start.py --skip-proxy
 
     # Skip Facebook posting (dry run / testing)
     python Start.py --no-post
 
-    # Skip sensor update (use existing CSV as-is)
-    python Start.py --skip-sensor
-
     # Full scheduled run
-    python Start.py --schedule --interval 24 --all-models
+    python Start.py --schedule
+
+    # Also run XGB and LGBM for comparison logging
+    python Start.py --all-models
 """
 
 import os
@@ -90,7 +82,7 @@ import time
 import argparse
 import warnings
 import traceback
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 
@@ -98,10 +90,12 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+
 sys.path.insert(0, SCRIPT_DIR)
 sys.path.insert(0, os.path.join(_PROJECT_ROOT, "scripts"))
 sys.path.insert(0, os.path.join(_PROJECT_ROOT, "ml_pipeline"))
 sys.path.insert(0, os.path.join(_PROJECT_ROOT, "alerts"))
+sys.path.insert(0, os.path.join(_PROJECT_ROOT, "deployment"))
 
 import Alert
 
@@ -111,12 +105,12 @@ import Alert
 # ===========================================================================
 
 # Days since last model training before a seasonal retrain notification fires.
-# 90 days ≈ one season (wet/dry transition). Change to 180 for semi-annual.
+# 90 days ≈ one season (wet/dry transition).
 RETRAIN_NOTIFY_DAYS = 90
 
 # Path for retrain notification log (append-only)
-LOG_DIR      = os.path.join(SCRIPT_DIR, "..", "logs")
-RETRAIN_LOG  = os.path.join(LOG_DIR, "retrain_notifications.log")
+LOG_DIR     = os.path.join(SCRIPT_DIR, "..", "logs")
+RETRAIN_LOG = os.path.join(LOG_DIR, "retrain_notifications.log")
 
 # ===========================================================================
 # END CONFIG
@@ -135,18 +129,40 @@ def separator(title=""):
 # Import pipeline modules
 # ---------------------------------------------------------------------------
 
-def import_sensor_module():
-    """Import Sat_SensorData_proxy for Step 0 sensor update."""
+def import_sensor_ingest():
+    """Import sensor_ingest for Step 0a — Supabase hardware pull."""
+    try:
+        import sensor_ingest
+        return sensor_ingest
+    except ImportError as e:
+        print(f"\n  WARNING: Could not import sensor_ingest.py — {e}")
+        print("  Hardware sensor CSV will NOT be updated.")
+        return None
+
+
+def import_proxy_module():
+    """Import Sat_SensorData_proxy for Step 0b — GEE proxy pull."""
     try:
         import Sat_SensorData_proxy
         return Sat_SensorData_proxy
     except ImportError as e:
         print(f"\n  WARNING: Could not import Sat_SensorData_proxy.py — {e}")
-        print("  Sensor CSV will NOT be updated before prediction.")
+        print("  Proxy (satellite) CSV will NOT be updated.")
         return None
 
 
-def import_predict_modules():
+def import_merge_module():
+    """Import merge_sensor for Step 0c — merge proxy + hardware."""
+    try:
+        import merge_sensor
+        return merge_sensor
+    except ImportError as e:
+        print(f"\n  WARNING: Could not import merge_sensor.py — {e}")
+        print("  combined_sensor_context.csv will NOT be updated.")
+        return None
+
+
+def import_predict_module():
     """Import RF_Predict (primary model). Hard exit if missing."""
     try:
         import RF_Predict
@@ -179,16 +195,12 @@ def import_comparison_modules():
 def check_retrain_notification(RF_Predict) -> None:
     """
     Read last_training_date from the RF model artifact.
-    If >= RETRAIN_NOTIFY_DAYS have elapsed since that date, print a
-    prominent terminal notification and log it.
-
-    This is notification ONLY — retraining is always a manual step:
-        python Retraining_Pipeline.py --retrain
+    If >= RETRAIN_NOTIFY_DAYS have elapsed, print a prominent terminal
+    notification and log it. Retraining is always a manual step.
     """
     try:
         import joblib
-        model_path = RF_Predict.MODEL_PATH
-        artifact   = joblib.load(model_path)
+        artifact   = joblib.load(RF_Predict.MODEL_FILE)
         last_train = artifact.get("last_training_date")
 
         if last_train is None:
@@ -210,13 +222,8 @@ def check_retrain_notification(RF_Predict) -> None:
             print()
             print("  To retrain (manual step):")
             print("    python Retraining_Pipeline.py --retrain")
-            print()
-            print("  To also update the satellite label archive first:")
-            print("    python Retraining_Pipeline.py --retrain")
-            print("    (sentinel1_GEE.py runs automatically as Step 1)")
             separator()
 
-            # Log the notification
             os.makedirs(LOG_DIR, exist_ok=True)
             try:
                 with open(RETRAIN_LOG, "a") as f:
@@ -240,7 +247,13 @@ def check_retrain_notification(RF_Predict) -> None:
 # Read latest prediction from saved CSV
 # ---------------------------------------------------------------------------
 
-def read_latest_result(csv_path: str) -> dict | None:
+def read_latest_result(RF_Predict) -> dict | None:
+    """
+    Read the most recent row from flood_rf_sensor_predictions.csv.
+    This is always the alert source — RF is the primary operational model.
+    XGB and LGBM comparison runs do not affect alert dispatch.
+    """
+    csv_path = RF_Predict.PREDICTIONS_CSV
     if not os.path.exists(csv_path):
         print(f"  WARNING: Predictions CSV not found at {csv_path}")
         return None
@@ -260,92 +273,124 @@ def read_latest_result(csv_path: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# Midnight-pinned sleep
+# ---------------------------------------------------------------------------
+
+def seconds_until_midnight() -> float:
+    """
+    Return the number of seconds from now until the next calendar midnight
+    (local system time). Minimum 1 second to avoid tight loops.
+    """
+    now       = datetime.now()
+    tomorrow  = (now + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    delta     = (tomorrow - now).total_seconds()
+    return max(delta, 1.0)
+
+
+# ---------------------------------------------------------------------------
 # Main daily orchestration
 # ---------------------------------------------------------------------------
 
 def run_daily(
-    run_all_models: bool = False,
-    no_post:        bool = False,
     skip_sensor:    bool = False,
+    skip_proxy:     bool = False,
+    no_post:        bool = False,
+    run_all_models: bool = False,
 ) -> None:
+
     separator("Flood Early Warning System — Daily Inference")
-    print(f"  Date            : {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f"  Primary model   : RF sensor (Design Option 2 — 91.1% Watch recall)")
-    print(f"  Training cutoff : read from .pkl artifact")
-    print(f"  Inference mode  : LIVE — sensor CSV only, no satellite required")
-    print(f"  Sensor update   : {'disabled (--skip-sensor)' if skip_sensor else 'enabled (incremental append)'}")
+    print(f"  Run time        : {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"  Primary model   : RF sensor (live mode — incremental)")
+    print(f"  Hardware ingest : {'disabled (--skip-sensor)' if skip_sensor else 'enabled (Supabase incremental)'}")
+    print(f"  Proxy fetch     : {'disabled (--skip-proxy)'  if skip_proxy  else 'enabled (GEE incremental)'}")
+    print(f"  Merge           : enabled (combined_sensor_context.csv incremental)")
     print(f"  Facebook post   : {'disabled (--no-post)' if no_post else 'enabled if WATCH/WARNING/DANGER'}")
     print(f"  Comparison run  : {'RF + XGB + LGBM' if run_all_models else 'RF only'}")
+    print(f"  Alert source    : flood_rf_sensor_predictions.csv (always RF)")
 
-    # ── Step 0: Update sensor CSV ─────────────────────────────────────────
-    separator("Step 0 — Sat_SensorData_proxy.py (sensor update)")
+    # ── Step 0a: Hardware sensor ingest (Supabase → obando_sensor_data.csv) ──
+    separator("Step 0a — sensor_ingest.py (Supabase hardware pull)")
     if skip_sensor:
-        print("  Skipped — using existing sensor CSV.")
+        print("  Skipped — --skip-sensor flag set.")
     else:
-        Sensor = import_sensor_module()
-        if Sensor is not None:
+        SensorIngest = import_sensor_ingest()
+        if SensorIngest is not None:
             try:
-                updated = Sensor.run_pipeline()
+                updated = SensorIngest.ingest_latest()
                 if updated:
-                    print("  ✓ Sensor CSV updated with latest readings.")
+                    print("  ✓ Hardware sensor CSV updated with latest Supabase rows.")
                 else:
-                    print("  Sensor CSV already up to date — no new rows appended.")
+                    print("  Hardware sensor CSV already up to date — no new rows.")
             except Exception as e:
-                print(f"\n  WARNING: Sensor update failed: {e}")
-                print("  Continuing with existing sensor CSV.")
+                print(f"\n  WARNING: Hardware ingest failed: {e}")
+                print("  Continuing with existing obando_sensor_data.csv.")
                 traceback.print_exc()
         else:
-            print("  Sensor update skipped — module not available.")
+            print("  Skipped — sensor_ingest module not available.")
 
-    # ── Step 1: Import RF_Predict ─────────────────────────────────────────
-    RF_Predict = import_predict_modules()
+    # ── Step 0b: Proxy data fetch (GEE → obando_environmental_data.csv) ────
+    separator("Step 0b — Sat_SensorData_proxy.py (GEE proxy pull)")
+    if skip_proxy:
+        print("  Skipped — --skip-proxy flag set.")
+    else:
+        Proxy = import_proxy_module()
+        if Proxy is not None:
+            try:
+                updated = Proxy.run_pipeline(force_full=False)
+                if updated:
+                    print("  ✓ Proxy CSV updated with latest GEE data.")
+                else:
+                    print("  Proxy CSV already up to date — no new rows.")
+            except Exception as e:
+                print(f"\n  WARNING: Proxy fetch failed: {e}")
+                print("  Continuing with existing obando_environmental_data.csv.")
+                traceback.print_exc()
+        else:
+            print("  Skipped — Sat_SensorData_proxy module not available.")
 
-    # ── Step 2: Run RF pipeline ───────────────────────────────────────────
-    separator("Step 1 — RF_Predict.py (primary — Design Option 2)")
+    # ── Step 0c: Merge (proxy + hardware → combined_sensor_context.csv) ────
+    separator("Step 0c — merge_sensor.py (merge proxy + hardware)")
+    Merge = import_merge_module()
+    if Merge is not None:
+        try:
+            new_rows = Merge.run_pipeline()
+            if new_rows is not None and len(new_rows) > 0:
+                print(f"  ✓ Merged {len(new_rows)} new row(s) into combined_sensor_context.csv.")
+            else:
+                print("  combined_sensor_context.csv already up to date — no new rows.")
+        except Exception as e:
+            print(f"\n  WARNING: Merge failed: {e}")
+            print("  RF_Predict will use whatever combined_sensor_context.csv currently exists.")
+            traceback.print_exc()
+    else:
+        print("  Skipped — merge_sensor module not available.")
+        print("  RF_Predict will fall back to obando_environmental_data.csv (proxy only).")
+
+    # ── Step 1: Import RF_Predict ──────────────────────────────────────────
+    RF_Predict = import_predict_module()
+
+    # ── Step 2: Run RF pipeline (live mode — incremental) ──────────────────
+    separator("Step 1 — RF_Predict.py (live mode — incremental)")
     rf_ok = False
     try:
         RF_Predict.run_pipeline()
         rf_ok = True
     except SystemExit as e:
         print(f"\n  RF_Predict exited early: {e}")
-        print("  Most likely cause: no new sensor rows after the training cutoff.")
-        print("  Check that the sensor CSV has rows dated after the training cutoff.")
+        print("  Most likely: no new sensor rows after the training cutoff.")
+        print("  Check that combined_sensor_context.csv has rows after LAST_TRAINING_DATE.")
     except Exception as e:
         print(f"\n  RF_Predict.py ERROR: {e}")
         traceback.print_exc()
 
-    # ── Step 3: Read result and decide on Facebook post ───────────────────
-    latest = read_latest_result(RF_Predict.PREDICTIONS_CSV) if rf_ok else None
-
-    if latest:
-        tier  = latest["risk_tier"]
-        prob  = latest["probability"]
-        ts    = latest["timestamp"]
-        emoji = {"CLEAR": "🟢", "WATCH": "🟡", "WARNING": "🟠", "DANGER": "🔴"}.get(tier, "")
-        print(f"\n  Latest prediction : {ts}  {emoji} {tier}  ({prob:.1%})")
-
-        if tier in Alert.ALERT_TIERS and not no_post:
-            separator("Step 2 — Alert.py (alert dispatch)")
-            Alert.dispatch_alert(tier=tier, probability=prob, timestamp=ts)
-        elif tier not in Alert.ALERT_TIERS:
-            print("  CLEAR today — no alert.")
-        else:
-            print("  --no-post flag set — skipping alert dispatch.")
-    else:
-        if rf_ok:
-            print("\n  WARNING: RF ran but could not read back results.")
-        print("  Skipping Facebook post.")
-
-    # ── Step 4: Seasonal retrain notification ─────────────────────────────
-    separator("Step 3 — Seasonal Retrain Check")
-    check_retrain_notification(RF_Predict)
-
-    # ── Step 5: Optional comparison run (XGB + LGBM) ─────────────────────
+    # ── Step 3: Optional comparison run (XGB + LGBM) ──────────────────────
     if run_all_models:
         comparison_mods = import_comparison_modules()
 
         if "XGB_Predict" in comparison_mods:
-            separator("Step 4a — XGB_Predict.py (Design Option 1 — comparison)")
+            separator("Step 2a — XGB_Predict.py (comparison)")
             try:
                 comparison_mods["XGB_Predict"].run_pipeline()
             except SystemExit:
@@ -354,7 +399,7 @@ def run_daily(
                 print(f"  XGB_Predict.py ERROR: {e}")
 
         if "LGBM_Predict" in comparison_mods:
-            separator("Step 4b — LGBM_Predict.py (Design Option 3 — comparison)")
+            separator("Step 2b — LGBM_Predict.py (comparison)")
             try:
                 comparison_mods["LGBM_Predict"].run_pipeline()
             except SystemExit:
@@ -362,7 +407,38 @@ def run_daily(
             except Exception as e:
                 print(f"  LGBM_Predict.py ERROR: {e}")
 
-    # ── Summary ───────────────────────────────────────────────────────────
+    # ── Step 4: Alert dispatch — always based on RF predictions CSV ────────
+    #
+    # Reads flood_rf_sensor_predictions.csv after ALL model runs are complete.
+    # XGB and LGBM are comparison-only — they never affect alert dispatch.
+    #
+    separator("Step 3 — Alert.py (dispatch from flood_rf_sensor_predictions.csv)")
+    latest = read_latest_result(RF_Predict) if rf_ok else None
+
+    if latest:
+        tier  = latest["risk_tier"]
+        prob  = latest["probability"]
+        ts    = latest["timestamp"]
+        emoji = {"CLEAR": "🟢", "WATCH": "🟡", "WARNING": "🟠", "DANGER": "🔴"}.get(tier, "")
+        print(f"\n  Latest RF prediction : {ts}  {emoji} {tier}  ({prob:.1%})")
+
+        if no_post:
+            print("  --no-post flag set — skipping alert dispatch.")
+        elif tier in Alert.ALERT_TIERS:
+            Alert.dispatch_alert(tier=tier, probability=prob, timestamp=ts)
+        else:
+            # CLEAR — FB + Supabase still fire via ALWAYS_FIRE_CHANNELS
+            Alert.dispatch_alert(tier=tier, probability=prob, timestamp=ts)
+    else:
+        if rf_ok:
+            print("\n  WARNING: RF ran but could not read back results.")
+        print("  Skipping alert dispatch.")
+
+    # ── Step 5: Seasonal retrain notification ──────────────────────────────
+    separator("Step 4 — Seasonal Retrain Check")
+    check_retrain_notification(RF_Predict)
+
+    # ── Summary ────────────────────────────────────────────────────────────
     separator("DONE")
     if rf_ok:
         print(f"  RF CSV  : {RF_Predict.PREDICTIONS_CSV}")
@@ -371,26 +447,52 @@ def run_daily(
 
 
 # ---------------------------------------------------------------------------
-# Scheduled mode
+# Scheduled mode — midnight-pinned
 # ---------------------------------------------------------------------------
 
-def run_scheduled(interval_hours: int, run_all_models: bool, no_post: bool, skip_sensor: bool) -> None:
-    print(f"\n  Scheduled mode — running every {interval_hours}h")
+def run_scheduled(
+    skip_sensor:    bool = False,
+    skip_proxy:     bool = False,
+    no_post:        bool = False,
+    run_all_models: bool = False,
+) -> None:
+    """
+    Run once immediately, then sleep until the next calendar midnight before
+    each subsequent run. Always fires at midnight regardless of start time.
+
+    Example:
+        Started at 14:30 → runs at 14:30, then 00:00, 00:00, 00:00 ...
+        Started at 23:55 → runs at 23:55, then 00:00, 00:00, 00:00 ...
+    """
+    print(f"\n  Scheduled mode — midnight-pinned (runs daily at 00:00 local time)")
     print(f"  Press Ctrl+C to stop.\n")
+
     while True:
         try:
-            run_daily(run_all_models=run_all_models, no_post=no_post, skip_sensor=skip_sensor)
-            next_run = pd.Timestamp.now() + pd.Timedelta(hours=interval_hours)
-            print(f"\n  Next run : {next_run.strftime('%Y-%m-%d %H:%M')}")
-            time.sleep(interval_hours * 3600)
+            run_daily(
+                skip_sensor    = skip_sensor,
+                skip_proxy     = skip_proxy,
+                no_post        = no_post,
+                run_all_models = run_all_models,
+            )
+
+            secs      = seconds_until_midnight()
+            next_run  = datetime.now() + timedelta(seconds=secs)
+            h, m      = divmod(int(secs), 3600)
+            m, s      = divmod(m, 60)
+            print(f"\n  Next run : {next_run.strftime('%Y-%m-%d 00:00')}  "
+                  f"(sleeping {h}h {m}m {s}s)")
+            time.sleep(secs)
+
         except KeyboardInterrupt:
             print("\n  Stopped by user.")
             break
         except Exception as exc:
-            print(f"\n  Unexpected error: {exc}")
+            print(f"\n  Unexpected error in scheduled run: {exc}")
             traceback.print_exc()
-            print(f"  Retrying in {interval_hours}h...")
-            time.sleep(interval_hours * 3600)
+            secs = seconds_until_midnight()
+            print(f"  Retrying at next midnight (sleeping {int(secs)}s)...")
+            time.sleep(secs)
 
 
 # ---------------------------------------------------------------------------
@@ -401,42 +503,45 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
             "Flood Early Warning System — Daily Inference Orchestrator.\n"
-            "Step 0: update sensor CSV. Step 1: RF prediction. "
-            "Step 2: FB post if alert. Step 3: seasonal retrain notification."
+            "Steps: hardware ingest → proxy fetch → merge → RF predict → "
+            "XGB/LGBM (optional) → alert → retrain check.\n"
+            "All steps are incremental — only new rows processed each run.\n"
+            "Alert always dispatches from flood_rf_sensor_predictions.csv."
         )
     )
     parser.add_argument(
         "--schedule", action="store_true",
-        help="Run on a repeating schedule instead of once.",
+        help="Run on a midnight-pinned daily schedule instead of once.",
     )
     parser.add_argument(
-        "--interval", type=int, default=24,
-        help="Hours between scheduled runs (default: 24).",
+        "--skip-sensor", action="store_true",
+        help="Skip Step 0a — Supabase hardware ingest. Use existing obando_sensor_data.csv.",
+    )
+    parser.add_argument(
+        "--skip-proxy", action="store_true",
+        help="Skip Step 0b — GEE proxy fetch. Use existing obando_environmental_data.csv.",
+    )
+    parser.add_argument(
+        "--no-post", action="store_true",
+        help="Skip all alert dispatch. Useful for testing.",
     )
     parser.add_argument(
         "--all-models", action="store_true",
         help="Also run XGB_Predict.py and LGBM_Predict.py for comparison logging.",
     )
-    parser.add_argument(
-        "--no-post", action="store_true",
-        help="Skip Facebook posting. Useful for testing.",
-    )
-    parser.add_argument(
-        "--skip-sensor", action="store_true",
-        help="Skip Step 0 sensor CSV update. Use existing CSV as-is.",
-    )
     args = parser.parse_args()
 
     if args.schedule:
         run_scheduled(
-            interval_hours=args.interval,
-            run_all_models=args.all_models,
-            no_post=args.no_post,
-            skip_sensor=args.skip_sensor,
+            skip_sensor    = args.skip_sensor,
+            skip_proxy     = args.skip_proxy,
+            no_post        = args.no_post,
+            run_all_models = args.all_models,
         )
     else:
         run_daily(
-            run_all_models=args.all_models,
-            no_post=args.no_post,
-            skip_sensor=args.skip_sensor,
+            skip_sensor    = args.skip_sensor,
+            skip_proxy     = args.skip_proxy,
+            no_post        = args.no_post,
+            run_all_models = args.all_models,
         )

@@ -136,6 +136,25 @@ Examples:
     HW = 88.78% RH →  t≈1.00  →  6.87 cm  (proxy max ✓)
 
 ─────────────────────────────────────────────────────────────────────
+DUPLICATE PREVENTION
+─────────────────────────────────────────────────────────────────────
+Duplicates were previously caused by two separate bugs:
+
+BUG 1 — fetch_rows_since used date >= cutoff_date (inclusive) at the
+  Supabase query level. Since the calibrated CSV stores midnight
+  timestamps (e.g. 2026-04-03T00:00:00), the cutoff date was always
+  re-fetched in the next run.
+  FIX: query uses date > cutoff_date (strictly greater), so the day
+  that is already in the CSV is never re-fetched from Supabase.
+
+BUG 2 — append_rows_to_csv and append_raw_rows_to_csv blindly appended
+  new rows to the CSV with no existence check.
+  FIX: both functions now load the existing CSV first, drop any rows
+  whose timestamp already exists, then write only genuinely new rows.
+  This acts as a safety net even if the Supabase filter ever returns
+  an overlapping row.
+
+─────────────────────────────────────────────────────────────────────
 RAW OUTPUT CSV
 ─────────────────────────────────────────────────────────────────────
 In addition to the calibrated CSV, every ingest run also writes a
@@ -239,52 +258,24 @@ from supabase import create_client, Client
 # ===========================================================================
 
 # ── WATER LEVEL ─────────────────────────────────────────────────────────────
-# Two-step conversion: distance → actual water level → proxy-equivalent.
-#
-# Step 1 constant — physical dike height (sensor mount above river bed):
-#   DIKE_HEIGHT_M = 13 ft 3 in = 4.039 m
-#   hw_wl_m = DIKE_HEIGHT_M - distance_m
-#
-# Step 2 constants — linear stretch anchors.
-#   Maps hardware water level (m above river bed) onto the same scale as the
-#   proxy waterlevel (m above UHSLC datum) that the RF model was trained on.
-#
-#   Dry anchor (Feb 27 2026 observed paired reading):
-#     distance = 0.240 m  →  hw_wl = 4.039 - 0.240 = 3.799 m  →  proxy = 0.718 m
-#
-#   Wet anchor (monsoon peak estimate, distance ≈ 0.040 m):
-#     distance = 0.040 m  →  hw_wl = 4.039 - 0.040 = 3.999 m  →  proxy = 2.197 m
-#
-# ⚠ HW_WL_WET = 3.999 and PROXY_WL_WET = 2.197 are ESTIMATES.
-#   Replace both with actual paired readings from July–August 2026 monsoon.
-#   That paired observation is the most important calibration action remaining.
-#
 DIKE_HEIGHT_M = 4.039    # metres — 13 ft 3 in, sensor mount above river bed
 
-HW_WL_DRY    = 3.819    # hw water level (m above river bed), dry season   (Feb 27 2026 daily mean, ≈distance 0.220 m)
+HW_WL_DRY    = 3.819    # hw water level (m above river bed), dry season   (Feb 27 2026 daily mean)
 HW_WL_WET    = 3.999    # hw water level (m above river bed), monsoon peak (⚠ ESTIMATE)
-PROXY_WL_DRY = 0.718    # proxy waterlevel (m above UHSLC datum), dry season   (Feb 27 2026 observed)
+PROXY_WL_DRY = 0.718    # proxy waterlevel (m above UHSLC datum), dry season
 PROXY_WL_WET = 2.197    # proxy waterlevel (m above UHSLC datum), monsoon peak (⚠ ESTIMATE)
 
-# Ultrasonic dropout / error thresholds
 DISTANCE_MIN_VALID_M = 0.05    # below this = sensor face reflection or debris
 DISTANCE_MAX_VALID_M = 4.039   # above this = physically impossible (exceeds dike)
 
 # ── SOIL MOISTURE ────────────────────────────────────────────────────────────
-# Linear stretch: maps hardware % range onto proxy m³/m³ range.
-# Dry anchor  → observed Feb 27 2026
-# Wet ceiling → ⚠ ESTIMATED at 85.0% — REPLACE with actual Jul/Aug 2026 reading
-#
 SOIL_HW_DRY    = 71.8    # hardware % reading in dry season  (Feb observed)
 SOIL_HW_WET    = 85.0    # hardware % reading in monsoon     (⚠ ESTIMATE — update Jul/Aug 2026)
-SOIL_PROXY_DRY = 0.242   # proxy m³/m³ in dry season        (ERA5 Feb 27 2026 actual)
-SOIL_PROXY_WET = 0.463   # proxy m³/m³ in monsoon           (ERA5 Aug mean)
+SOIL_PROXY_DRY = 0.242   # proxy m³/m³ in dry season
+SOIL_PROXY_WET = 0.463   # proxy m³/m³ in monsoon
 
 # ── HUMIDITY ─────────────────────────────────────────────────────────────────
-# Linear rescale: maps observed RH% range onto observed proxy CWV range.
-# Low model importance — linear approximation is acceptable.
-#
-HUMIDITY_HW_MIN    = 78.5    # raised to compress t → lowers output toward proxy values
+HUMIDITY_HW_MIN    = 78.5    # min observed hardware %RH
 HUMIDITY_HW_MAX    = 88.78   # max observed hardware %RH
 HUMIDITY_PROXY_MIN = 0.15    # min proxy column water vapour  (cm)
 HUMIDITY_PROXY_MAX = 6.87    # max proxy column water vapour  (cm)
@@ -298,7 +289,6 @@ USE_HARDWARE = True
 TABLE_ENV_DATA    = "obando_environmental_data"
 TABLE_PREDICTIONS = "predictions"
 
-# Columns to SELECT — matches actual Postgres column names (all lowercase)
 _SELECT = "date, time, soil, humidity, distance"
 
 # ===========================================================================
@@ -337,14 +327,8 @@ def get_client() -> Client:
 
 
 # ---------------------------------------------------------------------------
-# ██████╗ █████╗ ██╗     ██╗██████╗ ██████╗  █████╗ ████████╗██╗ ██████╗ ███╗  ██╗
-# ██╔════╝██╔══██╗██║     ██║██╔══██╗██╔══██╗██╔══██╗╚══██╔══╝██║██╔═══██╗████╗ ██║
-# ██║     ███████║██║     ██║██████╔╝██████╔╝███████║   ██║   ██║██║   ██║██╔██╗██║
-# ██║     ██╔══██║██║     ██║██╔══██╗██╔══██╗██╔══██║   ██║   ██║██║   ██║██║╚████║
-# ╚██████╗██║  ██║███████╗██║██████╔╝██║  ██║██║  ██║   ██║   ██║╚██████╔╝██║ ╚███║
-#  ╚═════╝╚═╝  ╚═╝╚══════╝╚═╝╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   ╚═╝ ╚═════╝ ╚═╝  ╚═╝
+# Calibration functions
 # ---------------------------------------------------------------------------
-
 
 def _calibrate_waterlevel(distance_m: float) -> float | None:
     """
@@ -352,87 +336,35 @@ def _calibrate_waterlevel(distance_m: float) -> float | None:
 
     Step 1 — Actual water level on the dike wall (metres above river bed):
         hw_wl_m = DIKE_HEIGHT_M - distance_m
-        e.g. 4.039 - 0.240 = 3.799 m
-        (the water surface is sitting 3.799 m up the 4.039 m dike wall)
 
     Step 2 — Linear stretch onto proxy-equivalent range (m above UHSLC datum):
         t          = (hw_wl_m - HW_WL_DRY) / (HW_WL_WET - HW_WL_DRY)
         waterlevel = PROXY_WL_DRY + t × (PROXY_WL_WET - PROXY_WL_DRY)
 
-    Verification — dry anchor (Feb 27 2026):
-        hw_wl = 3.799 m  →  t = 0.0  →  proxy = 0.718 m  ✓
-    Verification — wet anchor (monsoon estimate):
-        hw_wl = 3.999 m  →  t = 1.0  →  proxy = 2.197 m  ✓
-
-    WHY LINEAR STRETCH:
-        Hardware water level has a narrow range (~0.200 m swing) because the
-        sensor sits high on the dike. The proxy has a wide range (~1.479 m
-        swing). A fixed offset cannot bridge this gap.
-
-    Returns None if the reading is a known sensor error:
-        distance <= 0.05 m  → sensor face reflection or debris
-        distance >= 4.039 m → physically impossible (exceeds dike height)
+    Returns None for known sensor errors:
+        distance <= DISTANCE_MIN_VALID_M  → sensor face reflection or debris
+        distance >= DISTANCE_MAX_VALID_M  → physically impossible
     """
     if distance_m <= DISTANCE_MIN_VALID_M or distance_m >= DISTANCE_MAX_VALID_M:
         return None
 
-    # Step 1 — actual water height on the dike wall
     hw_wl_m = DIKE_HEIGHT_M - distance_m
-
-    # Step 2 — linear stretch onto proxy range
     t = (hw_wl_m - HW_WL_DRY) / (HW_WL_WET - HW_WL_DRY)
-    t = max(0.0, min(1.0, t))   # clamp — never exceed proxy anchor range
+    t = max(0.0, min(1.0, t))
     waterlevel = PROXY_WL_DRY + t * (PROXY_WL_WET - PROXY_WL_DRY)
 
     return round(waterlevel, 6)
 
 
 def _calibrate_soil_moisture(hw_pct: float) -> float:
-    """
-    Convert capacitive sensor % reading to ERA5-equivalent volumetric
-    water content (m³/m³).
-
-    WHAT IT IS:
-        ERA5 volumetric water content is a physical quantity — litres of
-        water per litre of soil. Your sensor outputs a dielectric reading
-        as a percentage. They correlate but have no fixed formula.
-
-    HOW IT WORKS:
-        We use a linear stretch between two anchor points:
-            Dry anchor:  HW=71.8%  →  proxy=0.242 m³/m³  (Feb 27 2026 observed)
-            Wet ceiling: HW=85.0%  →  proxy=0.463 m³/m³  (⚠ estimated)
-
-        t             = (hw_pct - DRY) / (WET - DRY)   # 0.0 to 1.0
-        soil_moisture = PROXY_DRY + t × (PROXY_WET - PROXY_DRY)
-
-    ⚠ HW_WET=85.0 is an estimate. Update SOIL_HW_WET with the actual
-      sensor reading during July–August 2026 monsoon peak.
-    """
+    """Linear stretch: hardware % → ERA5-equivalent volumetric water content (m³/m³)."""
     t = (hw_pct - SOIL_HW_DRY) / (SOIL_HW_WET - SOIL_HW_DRY)
     t = max(0.0, min(1.0, t))
     return round(SOIL_PROXY_DRY + t * (SOIL_PROXY_WET - SOIL_PROXY_DRY), 6)
 
 
 def _calibrate_humidity(hw_rh: float) -> float:
-    """
-    Convert relative humidity % to proxy-equivalent column water vapour (cm).
-
-    WHAT IT IS:
-        MODIS Column Water Vapour measures the total atmospheric water
-        in a vertical column, in centimetres of precipitable water.
-        Your sensor measures how saturated the local air is, in percent.
-        These are different quantities — no exact formula exists.
-
-    HOW IT WORKS:
-        Because humidity features are low-importance in this model
-        (not in the top 8), a linear rescale is acceptable:
-
-        t        = (hw_rh - HW_MIN) / (HW_MAX - HW_MIN)
-        humidity = PROXY_MIN + t × (PROXY_MAX - PROXY_MIN)
-
-        Maps HW range [73.0, 88.78] %RH
-        onto proxy range [0.15, 6.87] cm CWV.
-    """
+    """Linear rescale: relative humidity % → proxy-equivalent column water vapour (cm)."""
     t = (hw_rh - HUMIDITY_HW_MIN) / (HUMIDITY_HW_MAX - HUMIDITY_HW_MIN)
     t = max(0.0, min(1.0, t))
     return round(HUMIDITY_PROXY_MIN + t * (HUMIDITY_PROXY_MAX - HUMIDITY_PROXY_MIN), 6)
@@ -441,34 +373,26 @@ def _calibrate_humidity(hw_rh: float) -> float:
 def calibrate_df(df: pd.DataFrame) -> pd.DataFrame:
     """
     Apply all three calibrations to a raw hardware DataFrame, then
-    aggregate to one row per day by taking the daily mean.
+    aggregate to one row per day (daily mean).
 
-    Expects columns: timestamp, waterlevel (raw distance m),
-                     soil_moisture (raw %), humidity (raw %RH)
-    Returns columns: timestamp, waterlevel (m above datum),
-                     soil_moisture (m³/m³), humidity (cm CWV)
+    Input columns : timestamp, waterlevel (raw distance m),
+                    soil_moisture (raw %), humidity (raw %RH)
+    Output columns: timestamp, waterlevel (m above datum),
+                    soil_moisture (m³/m³), humidity (cm CWV)
 
     Invalid distance readings are dropped before averaging.
-    The daily mean matches how proxy training data is aggregated
-    (ERA5, MODIS, UHSLC are all daily mean values).
     """
     out = df.copy()
 
-    # Water level — two-step calibration, drop invalid rows
     out["waterlevel"] = out["waterlevel"].apply(_calibrate_waterlevel)
     invalid = out["waterlevel"].isna().sum()
     out = out.dropna(subset=["waterlevel"])
 
-    # Soil moisture
     out["soil_moisture"] = out["soil_moisture"].apply(_calibrate_soil_moisture)
+    out["humidity"]      = out["humidity"].apply(_calibrate_humidity)
 
-    # Humidity
-    out["humidity"] = out["humidity"].apply(_calibrate_humidity)
-
-    # Extract date from timestamp for grouping
     out["date"] = out["timestamp"].str[:10]
 
-    # Aggregate to daily mean — matches proxy training data granularity
     daily = (
         out.groupby("date", sort=True)[["waterlevel", "soil_moisture", "humidity"]]
         .mean()
@@ -476,7 +400,6 @@ def calibrate_df(df: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
 
-    # Reconstruct timestamp as midnight UTC to represent the daily aggregate
     daily["timestamp"] = daily["date"] + "T00:00:00"
     daily = daily[["timestamp", "waterlevel", "soil_moisture", "humidity"]]
 
@@ -489,10 +412,7 @@ def calibrate_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def print_calibration_summary() -> None:
-    """
-    Print a human-readable table showing what the calibration does
-    at key reference points. Useful for field verification.
-    """
+    """Print a human-readable calibration verification table."""
     print()
     print("=" * 78)
     print("  SENSOR CALIBRATION SUMMARY — Obando Flood Early Warning")
@@ -501,8 +421,6 @@ def print_calibration_summary() -> None:
     print()
     print("  WATER LEVEL  (two-step: actual level + linear stretch)")
     print(f"  Dike height  : {DIKE_HEIGHT_M} m  (13 ft 3 in, sensor mount above river bed)")
-    print(f"  Step 1       : hw_wl_m    = {DIKE_HEIGHT_M} − distance_m")
-    print(f"  Step 2       : waterlevel = PROXY_WL_DRY + t × (PROXY_WL_WET − PROXY_WL_DRY)")
     print(f"  Dry anchor   : hw_wl={HW_WL_DRY} m  →  proxy={PROXY_WL_DRY} m  (Feb 27 2026 observed)")
     print(f"  Wet anchor   : hw_wl={HW_WL_WET} m  →  proxy={PROXY_WL_WET} m  (⚠ ESTIMATE — update Jul/Aug 2026)")
     print()
@@ -565,8 +483,6 @@ def print_calibration_summary() -> None:
     print("  1. Collect a paired distance + proxy waterlevel observation during")
     print("     July–August 2026 monsoon peak. Update HW_WL_WET and PROXY_WL_WET.")
     print("  2. Collect a soil sensor reading at monsoon peak. Update SOIL_HW_WET.")
-    print("     These two monsoon observations are the most important remaining")
-    print("     calibration actions for this system.")
     print("=" * 78)
     print()
 
@@ -582,25 +498,13 @@ def _empty_df() -> pd.DataFrame:
 def _rows_to_df(data: list[dict]) -> pd.DataFrame:
     """
     Convert raw Supabase rows (split date + time columns) into the internal
-    DataFrame format expected by calibrate_df():
-        timestamp     — ISO string  (date + time combined, UTC)
-        waterlevel    — raw Distance (m)
-        soil_moisture — raw Soil (%)
-        humidity      — raw Humidity (%)
-
-    Postgres returns:
-        date     → "YYYY-MM-DD"
-        time     → "HH:MM:SS"
-        soil     → float  (raw %)
-        humidity → float  (raw %RH)
-        distance → float  (raw metres)
+    DataFrame format expected by calibrate_df().
     """
     if not data:
         return _empty_df()
 
     df = pd.DataFrame(data)
 
-    # Combine date + time into a single UTC timestamp string
     df["timestamp"] = (
         pd.to_datetime(
             df["date"].astype(str) + " " + df["time"].astype(str),
@@ -609,11 +513,9 @@ def _rows_to_df(data: list[dict]) -> pd.DataFrame:
         .dt.strftime("%Y-%m-%dT%H:%M:%S")
     )
 
-    # Rename to internal names expected by calibrate_df()
     df = df.rename(columns={
-        "distance": "waterlevel",    # raw distance → converted to water level
-        "soil":     "soil_moisture", # raw soil %   → converted to m³/m³
-        # "humidity" column name is already correct
+        "distance": "waterlevel",
+        "soil":     "soil_moisture",
     })
 
     return df[["timestamp", "waterlevel", "soil_moisture", "humidity"]]
@@ -623,14 +525,21 @@ def fetch_rows_since(after_timestamp: str | None) -> pd.DataFrame:
     """
     Fetch all rows strictly newer than after_timestamp. None = full table.
 
+    DUPLICATE FIX (BUG 1):
+        Previously used date >= cutoff_date, which re-fetched the cutoff
+        day's rows on every run (since calibrated rows use midnight timestamps,
+        the fine filter timestamp > after_timestamp evaluated equal, not
+        strictly greater).
+        Now uses date > cutoff_date so the day already in the CSV is never
+        re-fetched from Supabase at all.
+
     Paginates automatically to bypass the default 1000-row Supabase limit.
-    Filters on the date column (coarse) then drops any rows whose
-    reconstructed timestamp is not strictly newer (fine).
     """
     PAGE_SIZE = 1000
     all_rows: list[dict] = []
     offset = 0
 
+    # Use the date strictly AFTER the cutoff date — not the same day
     cutoff_date = str(after_timestamp)[:10] if after_timestamp else None
 
     while True:
@@ -644,7 +553,8 @@ def fetch_rows_since(after_timestamp: str | None) -> pd.DataFrame:
                 .range(offset, offset + PAGE_SIZE - 1)
             )
             if cutoff_date:
-                query = query.gte("date", cutoff_date)
+                # gt (>) instead of gte (>=) — excludes the cutoff day entirely
+                query = query.gt("date", cutoff_date)
 
             response = query.execute()
         except Exception as exc:
@@ -656,19 +566,13 @@ def fetch_rows_since(after_timestamp: str | None) -> pd.DataFrame:
         log.debug("Fetched page at offset %d: %d row(s)", offset, len(batch))
 
         if len(batch) < PAGE_SIZE:
-            break  # last page
+            break
 
         offset += PAGE_SIZE
 
-    log.info("Total raw rows fetched: %d", len(all_rows))
+    log.info("Total raw rows fetched from Supabase: %d", len(all_rows))
 
-    df = _rows_to_df(all_rows)
-
-    # Fine filter — drop rows not strictly newer than the last CSV timestamp
-    if after_timestamp and not df.empty:
-        df = df[df["timestamp"] > str(after_timestamp)]
-
-    return df
+    return _rows_to_df(all_rows)
 
 
 def fetch_rows_for_date(target_date: str) -> pd.DataFrame:
@@ -752,6 +656,7 @@ def insert_prediction_row(record: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 def get_latest_csv_timestamp() -> str | None:
+    """Return the latest timestamp string already in SENSOR_CSV, or None."""
     if not SENSOR_CSV.exists():
         return None
     try:
@@ -773,19 +678,50 @@ def date_already_in_csv(target_date: str) -> bool:
         return False
 
 
-def append_rows_to_csv(rows: pd.DataFrame, dry_run: bool = False) -> None:
-    """Write calibrated rows to the ML pipeline CSV, creating the file if needed."""
+def _existing_timestamps(csv_path: Path) -> set[str]:
+    """Return the set of timestamp strings already present in a CSV file."""
+    if not csv_path.exists():
+        return set()
+    try:
+        df = pd.read_csv(csv_path, usecols=["timestamp"])
+        return set(df["timestamp"].astype(str).tolist())
+    except Exception:
+        return set()
+
+
+def append_rows_to_csv(rows: pd.DataFrame, dry_run: bool = False) -> int:
+    """
+    Write calibrated rows to the ML pipeline CSV.
+
+    DUPLICATE FIX (BUG 2):
+        Previously appended blindly. Now loads existing timestamps first
+        and drops any incoming row whose timestamp is already present.
+        Returns the number of rows actually written.
+    """
     if rows.empty:
         log.warning("Nothing to write — DataFrame is empty.")
-        return
+        return 0
 
     rows = rows[["timestamp", "waterlevel", "soil_moisture", "humidity"]].copy()
+
+    # Drop rows already in the CSV (safety net — primary prevention is in fetch)
+    existing = _existing_timestamps(SENSOR_CSV)
+    before   = len(rows)
+    rows     = rows[~rows["timestamp"].astype(str).isin(existing)]
+    skipped  = before - len(rows)
+    if skipped:
+        log.warning("Skipped %d row(s) already present in %s.", skipped, SENSOR_CSV)
+
+    if rows.empty:
+        log.info("No new calibrated rows to write after dedup check.")
+        return 0
+
     SENSOR_CSV.parent.mkdir(parents=True, exist_ok=True)
 
     if dry_run:
         log.info("[DRY RUN] Would append %d calibrated row(s):", len(rows))
         print(rows.to_string(index=False))
-        return
+        return len(rows)
 
     if not SENSOR_CSV.exists():
         rows.to_csv(SENSOR_CSV, index=False)
@@ -794,33 +730,28 @@ def append_rows_to_csv(rows: pd.DataFrame, dry_run: bool = False) -> None:
         rows.to_csv(SENSOR_CSV, mode="a", header=False, index=False)
         log.info("Appended %d new row(s) to %s", len(rows), SENSOR_CSV)
 
+    return len(rows)
 
-def append_raw_rows_to_csv(rows: pd.DataFrame, dry_run: bool = False) -> None:
+
+def append_raw_rows_to_csv(rows: pd.DataFrame, dry_run: bool = False) -> int:
     """
-    Write raw (pre-calibration) hardware readings to a separate CSV.
+    Write raw (pre-calibration) hardware readings to the raw CSV.
 
-    Columns written:
-        timestamp     — ISO datetime string (UTC), midnight = daily aggregate
-        waterlevel    — daily mean of DIKE_HEIGHT_M - distance_m
-                        (physical water height on dike wall, metres above river bed)
-        soil_moisture — daily mean raw capacitive soil sensor reading (%)
-        humidity      — daily mean raw relative humidity reading (%)
-
-    Aggregated to daily means (same granularity as the calibrated CSV)
-    for consistent side-by-side comparison. Each row represents the
-    mean of all readings taken on that calendar day.
+    DUPLICATE FIX (BUG 2):
+        Same dedup logic as append_rows_to_csv — drops rows whose
+        timestamp is already in obando_sensor_data_raw.csv before writing.
+        Returns the number of rows actually written.
     """
     if rows.empty:
         log.warning("Nothing to write — raw DataFrame is empty.")
-        return
+        return 0
 
     raw = rows[["timestamp", "waterlevel", "soil_moisture", "humidity"]].copy()
 
-    # Step 1 dike calculation — DIKE_HEIGHT_M - distance_m = physical water height
-    # This replaces the raw distance column entirely in the raw output
+    # Step 1 dike calculation — physical water height on dike wall
     raw["waterlevel"] = (DIKE_HEIGHT_M - raw["waterlevel"]).round(6)
 
-    # Aggregate to daily mean — matches calibrated CSV granularity
+    # Aggregate to daily mean
     raw["date"] = raw["timestamp"].str[:10]
     daily_raw = (
         raw.groupby("date", sort=True)[["waterlevel", "soil_moisture", "humidity"]]
@@ -831,14 +762,26 @@ def append_raw_rows_to_csv(rows: pd.DataFrame, dry_run: bool = False) -> None:
     daily_raw["timestamp"] = daily_raw["date"] + "T00:00:00"
     raw = daily_raw[["timestamp", "waterlevel", "soil_moisture", "humidity"]]
 
-    log.info("Aggregated raw readings -> %d daily mean row(s).", len(raw))
+    log.info("Aggregated raw readings → %d daily mean row(s).", len(raw))
+
+    # Drop rows already in the raw CSV
+    existing = _existing_timestamps(SENSOR_CSV_RAW)
+    before   = len(raw)
+    raw      = raw[~raw["timestamp"].astype(str).isin(existing)]
+    skipped  = before - len(raw)
+    if skipped:
+        log.warning("Skipped %d raw row(s) already present in %s.", skipped, SENSOR_CSV_RAW)
+
+    if raw.empty:
+        log.info("No new raw rows to write after dedup check.")
+        return 0
 
     SENSOR_CSV_RAW.parent.mkdir(parents=True, exist_ok=True)
 
     if dry_run:
         log.info("[DRY RUN] Would append %d raw row(s):", len(raw))
         print(raw.to_string(index=False))
-        return
+        return len(raw)
 
     if not SENSOR_CSV_RAW.exists():
         raw.to_csv(SENSOR_CSV_RAW, index=False)
@@ -846,6 +789,8 @@ def append_raw_rows_to_csv(rows: pd.DataFrame, dry_run: bool = False) -> None:
     else:
         raw.to_csv(SENSOR_CSV_RAW, mode="a", header=False, index=False)
         log.info("Appended %d raw row(s) to %s", len(raw), SENSOR_CSV_RAW)
+
+    return len(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -856,7 +801,7 @@ def ingest_latest(dry_run: bool = False) -> bool:
     """
     Default mode — incremental sync with calibration applied.
 
-    Fetches only rows newer than the latest CSV timestamp from Supabase,
+    Fetches only rows from dates strictly newer than the latest CSV timestamp,
     applies all three sensor calibrations, and appends to both CSVs:
         obando_sensor_data.csv      ← calibrated (used by RF model)
         obando_sensor_data_raw.csv  ← raw hardware values (no conversion)
@@ -871,30 +816,29 @@ def ingest_latest(dry_run: bool = False) -> bool:
     latest_ts = get_latest_csv_timestamp()
 
     if latest_ts:
-        log.info("CSV latest timestamp: %s — fetching newer rows only.", latest_ts)
+        log.info("CSV latest timestamp: %s — fetching rows from dates after %s.",
+                 latest_ts, latest_ts[:10])
     else:
         log.info("CSV missing or empty — bootstrapping full history from Supabase.")
 
     raw = fetch_rows_since(after_timestamp=latest_ts)
 
     if raw.empty:
-        log.info("No new rows since %s — CSV is already up to date.", latest_ts)
+        log.info("No new rows after %s — CSV is already up to date.", latest_ts)
         return False
 
     log.info("Fetched %d raw row(s) — saving raw output and applying calibration.", len(raw))
 
-    # Save raw hardware values before any conversion
     append_raw_rows_to_csv(raw, dry_run=dry_run)
 
-    # Apply calibration and save to ML pipeline CSV
     calibrated = calibrate_df(raw)
 
     if calibrated.empty:
         log.warning("All fetched rows were discarded as invalid sensor readings.")
         return False
 
-    append_rows_to_csv(calibrated, dry_run=dry_run)
-    return True
+    written = append_rows_to_csv(calibrated, dry_run=dry_run)
+    return written > 0
 
 
 def ingest_date(target_date: str, dry_run: bool = False) -> bool:
@@ -917,14 +861,12 @@ def ingest_date(target_date: str, dry_run: bool = False) -> bool:
         log.warning("No Supabase rows found for %s.", target_date)
         return False
 
-    # Save raw hardware values before any conversion
     append_raw_rows_to_csv(raw, dry_run=dry_run)
 
-    # Apply calibration and save to ML pipeline CSV
     calibrated = calibrate_df(raw)
     log.info("Ingesting %d calibrated row(s) for %s.", len(calibrated), target_date)
-    append_rows_to_csv(calibrated, dry_run=dry_run)
-    return True
+    written = append_rows_to_csv(calibrated, dry_run=dry_run)
+    return written > 0
 
 
 def log_prediction(risk_tier: str, probability: float, timestamp: str) -> None:
