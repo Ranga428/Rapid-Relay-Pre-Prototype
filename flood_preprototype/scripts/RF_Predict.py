@@ -13,6 +13,9 @@ NEW 2 — Calibration notice printed on load (model is CalibratedRF wrapper)
 NEW 3 — Consecutive-day alert filter added (operational false-alarm reduction).
 NEW 4 — Balanced accuracy printed in evaluation summary.
 NEW 5 — Probability std printed — confirms calibration is working.
+NEW 6 — LIVE_SENSOR_FILE updated to combined_sensor_context.csv (hardware +
+         proxy merged). RF_Predict reads the unified merged CSV at inference
+         time — no satellite data or re-merge needed at runtime.
 
 FIX — CalibratedRF class defined at module level so joblib.load() can
       unpickle the saved model correctly. Without this the load fails with
@@ -33,6 +36,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from sklearn.isotonic import IsotonicRegression
+from calibrated_models import CalibratedRF
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -46,22 +50,6 @@ from prepare_dataset import load_sensor
 from feature_engineering import build_features, SENSOR_FEATURE_COLUMNS
 
 
-# ===========================================================================
-# MODULE-LEVEL CALIBRATED WRAPPER  — must match RF_train_flood_model.py
-# ===========================================================================
-
-class CalibratedRF:
-    """Isotonic-calibrated wrapper. Must be at module level for joblib pickling."""
-    def __init__(self, base, calibrator):
-        self.base       = base
-        self.calibrator = calibrator
-        self.estimator  = base
-
-    def predict_proba(self, X):
-        raw = self.base.predict_proba(X)[:, 1]
-        cal = self.calibrator.predict(raw)
-        return np.column_stack([1 - cal, cal])
-
 
 # ===========================================================================
 # CONFIG
@@ -69,9 +57,16 @@ class CalibratedRF:
 
 MODEL_FILE       = r"..\model\flood_rf_sensor.pkl"
 OUTPUT_DIR       = r"..\predictions"
+
+# ── LIVE_SENSOR_FILE ────────────────────────────────────────────────────────
+# Points to the merged combined CSV (hardware Supabase + GEE proxy).
+# This is produced daily by merge_sensor.py (Step 0c in Start.py).
+# Do NOT point this at obando_environmental_data.csv (proxy-only) or
+# obando_sensor_data.csv (hardware-only) — the model expects the merged file.
 LIVE_SENSOR_FILE = os.path.join(
-    SCRIPT_DIR, r"..\data\sensor\obando_environmental_data.csv"
+    SCRIPT_DIR, r"..\data\sensor\combined_sensor_context.csv"
 )
+
 FLOOD_LOG_PATH = os.path.join(
     SCRIPT_DIR, r"..\data\flood_event_log.csv"
 )
@@ -182,6 +177,7 @@ def load_model() -> tuple:
     print(f"  WATCH threshold   : {watch_t:.2f}")
     print(f"  WARNING threshold : {warn_t:.2f}")
     print(f"  Last training date: {LAST_TRAINING_DATE}")
+    print(f"  Live sensor file  : {LIVE_SENSOR_FILE}")
     print(f"  Consec. filter    : {MIN_CONSECUTIVE_DAYS} days  "
           f"({'active' if MIN_CONSECUTIVE_DAYS > 1 else 'disabled'})")
     if artifact.get("val_balanced_acc"):
@@ -198,6 +194,13 @@ def load_model() -> tuple:
 
 def load_live_features() -> pd.DataFrame:
     separator("Loading Live Sensor Data")
+    print(f"  Source : {LIVE_SENSOR_FILE}")
+    if not os.path.exists(LIVE_SENSOR_FILE):
+        sys.exit(
+            f"\n  ERROR: Live sensor file not found.\n"
+            f"  Expected : {LIVE_SENSOR_FILE}\n"
+            f"  Fix      : Run merge_sensor.py (Step 0c) first, or check path.\n"
+        )
     sensor_df, freq = load_sensor(sensor_path=LIVE_SENSOR_FILE)
     separator("Building Sensor Features")
     features = build_features(sensor_df, freq=freq, mode="sensor",
@@ -221,7 +224,7 @@ def filter_new_rows(features: pd.DataFrame) -> pd.DataFrame:
     if len(new_df) == 0:
         sys.exit(
             f"\n  No new data found after {LAST_TRAINING_DATE}.\n"
-            f"  Append new sensor rows to the sensor CSV and re-run.\n"
+            f"  Append new sensor rows to combined_sensor_context.csv and re-run.\n"
         )
     print(f"  Date range       : {new_df.index[0].date()} -> {new_df.index[-1].date()}")
     return new_df

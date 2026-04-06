@@ -34,6 +34,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from sklearn.isotonic import IsotonicRegression
+from calibrated_models import CalibratedLGBM
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -46,22 +47,6 @@ sys.path.insert(0, _ML_PIPELINE)
 from prepare_dataset import load_sensor
 from feature_engineering import build_features, SENSOR_FEATURE_COLUMNS
 
-
-# ===========================================================================
-# MODULE-LEVEL CALIBRATED WRAPPER — must match LGBM_train_flood_model.py
-# ===========================================================================
-
-class CalibratedLGBM:
-    """Isotonic-calibrated wrapper. Must be at module level for joblib pickling."""
-    def __init__(self, base, calibrator):
-        self.base       = base
-        self.calibrator = calibrator
-        self.estimator  = base
-
-    def predict_proba(self, X):
-        raw = self.base.predict_proba(X)[:, 1]
-        cal = self.calibrator.predict(raw)
-        return np.column_stack([1 - cal, cal])
 
 
 # ===========================================================================

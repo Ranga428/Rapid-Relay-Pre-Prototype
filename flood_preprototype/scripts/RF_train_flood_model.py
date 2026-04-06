@@ -59,6 +59,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from calibrated_models import CalibratedRF
 
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.isotonic import IsotonicRegression
@@ -80,24 +81,6 @@ from prepare_dataset import load_sensor
 from feature_engineering import build_features, SENSOR_FEATURE_COLUMNS
 
 
-# ===========================================================================
-# MODULE-LEVEL CALIBRATED WRAPPER  (must be at module level for pickling)
-# ===========================================================================
-
-class CalibratedRF:
-    """
-    Isotonic-calibrated wrapper for RandomForestClassifier.
-    Defined at module level so joblib.dump() can pickle it correctly.
-    """
-    def __init__(self, base, calibrator):
-        self.base       = base
-        self.calibrator = calibrator
-        self.estimator  = base
-
-    def predict_proba(self, X):
-        raw = self.base.predict_proba(X)[:, 1]
-        cal = self.calibrator.predict(raw)
-        return np.column_stack([1 - cal, cal])
 
 
 # ===========================================================================
