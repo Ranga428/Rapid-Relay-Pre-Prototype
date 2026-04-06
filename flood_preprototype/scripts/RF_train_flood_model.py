@@ -154,11 +154,12 @@ SENSOR_FEATURES = [
     "post_flood_decay_7d", "humidity_anomaly_vs_30d",
     "soilmoist_anomaly_vs_30d", "late_season_wet_flag",
     "waterlevel_7d_std", "soilmoist_7d_std",
-    "soil_saturation",
-    "wetness_trend",
 ]
 
-FULL_FEATURES = SENSOR_FEATURES + ["orbit_flag"]
+FULL_FEATURES = SENSOR_FEATURES + [
+    "orbit_flag","soil_saturation",
+    "wetness_trend",
+]
 
 
 # ===========================================================================
