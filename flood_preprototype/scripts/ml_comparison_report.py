@@ -7,104 +7,50 @@ Loads all three sensor model pkl files, runs them against the full
 flood_dataset.csv, and produces:
 
   1. A printed comparison table (precision, recall, F1, balanced accuracy,
-     ROC-AUC, specificity) at CLEAR, WATCH, WARNING, and DANGER thresholds.
+     ROC-AUC, specificity, accuracy, TP, TN, FP, FN) at CLEAR, WATCH,
+     WARNING, and DANGER thresholds.
   2. A multi-panel PNG chart comparing probability distributions and
      ROC curves for all three models.
   3. A CSV report saved to ../ml_report/ml_comparison_report_{split}.csv
+     — now includes TP, TN, FP, FN, and accuracy columns.
+  4. A cross-reference accuracy report comparing live predictions for all
+     three models (LGBM, RF, XGBoost combined sensor+context CSVs) against
+     flood_dataset_test.csv labels on overlapping dates — saved to
+     ../ml_report/live_prediction_accuracy.csv
+
+ACCURACY FORMULA
+----------------
+  Accuracy = (TP + TN) / (TP + TN + FP + FN)
+
+  This is reported in both the terminal and CSV output at every
+  threshold level (CLEAR, WATCH, WARNING, DANGER).
+
+LIVE CROSS-REFERENCE (--live-check)
+-------------------------------------
+  After model evaluation, loads the three combined sensor+context prediction
+  CSVs and flood_dataset_test.csv (or a custom --label-file path), aligns
+  them on overlapping dates, and computes TP/TN/FP/FN + accuracy for every
+  threshold tier per model. This answers: "Of the live predictions already
+  made, how many were correct compared to the known labeled events?"
+
+  Threshold tiers used for cross-reference:
+    WATCH   — risk_tier in (WATCH, WARNING, DANGER)
+    WARNING — risk_tier in (WARNING, DANGER)
+    DANGER  — risk_tier == DANGER
 
 USAGE
 -----
     python ml_comparison_report.py
-    python ml_comparison_report.py --split test     # only test set (default)
-    python ml_comparison_report.py --split val      # only validation set
-    python ml_comparison_report.py --split full     # full dataset
+    python ml_comparison_report.py --split test        # test set only (default)
+    python ml_comparison_report.py --split val
+    python ml_comparison_report.py --split full
+    python ml_comparison_report.py --live-check        # also run live cross-reference
+    python ml_comparison_report.py --live-check \\
+        --label-file ..\\data\\flood_dataset_test.csv
 
 NOTE: This script must be in the same directory as the train_*.py scripts
       because it imports CalibratedRF and CalibratedLGBM from them at runtime
       so joblib can unpickle the saved models.
-
-CHANGE vs previous version
----------------------------
-  - CLEAR threshold section added. CLEAR is defined as prob < watch_t
-    (the model issued no alert). Metrics are evaluated on the NEGATIVE class:
-    precision = TN/(TN+FN), recall = TN/(TN+FP), F1 on class 0.
-    This makes the CLEAR section a complete, self-contained view of
-    how confidently the model declares safe conditions.
-  - danger_t is now read from artifact["danger_threshold"] (set during
-    training). Falls back to warn_t + 0.10 for backward compatibility
-    with older pkls.
-
-─────────────────────────────────────────────────────────────────────────────
-FEATURE EXPLANATION
-─────────────────────────────────────────────────────────────────────────────
-These models are trained exclusively on SENSOR-DERIVED features, meaning all
-inputs come from physical measurements collected at sensor stations (rain
-gauges, water-level loggers, flow meters, soil-moisture probes). No external
-forecast data or manually labelled weather categories are used.
-
-Feature                       | Why it matters for flood prediction
-──────────────────────────────┼──────────────────────────────────────────────
-rainfall_mm                   | Directly measures precipitation intensity.
-                              | High rainfall is the primary trigger for
-                              | surface runoff and riverine flooding.
-──────────────────────────────┼──────────────────────────────────────────────
-rainfall_1h / 3h / 6h / 24h  | Rolling accumulated rainfall over multiple
-(cumulative windows)          | windows captures antecedent moisture and
-                              | sustained storm events that cause flooding
-                              | even when instantaneous intensity is moderate.
-──────────────────────────────┼──────────────────────────────────────────────
-water_level_m                 | Real-time river/channel stage. Once water
-                              | level approaches bank-full height, the
-                              | marginal probability of inundation spikes.
-──────────────────────────────┼──────────────────────────────────────────────
-water_level_change_1h         | Rate of rise: a rapidly rising river is
-                              | far more dangerous than a high but stable
-                              | one, even at the same absolute level.
-──────────────────────────────┼──────────────────────────────────────────────
-flow_rate_m3s                 | Discharge integrates both level and velocity.
-                              | Flash floods often show a flow spike before
-                              | a visible level increase at downstream gauges.
-──────────────────────────────┼──────────────────────────────────────────────
-soil_moisture_pct             | Saturated soil cannot absorb more rainfall,
-                              | converting nearly all precipitation to runoff
-                              | and dramatically shortening flood lag times.
-──────────────────────────────┼──────────────────────────────────────────────
-hour_of_day / day_of_week /   | Cyclical time features encode diurnal and
-month / season (encoded)      | seasonal patterns — monsoon seasons, afternoon
-                              | convective storms, and weekend recreational
-                              | risk windows.
-──────────────────────────────┼──────────────────────────────────────────────
-lag features (various)        | Lagged copies of the above at 1 h, 3 h, 6 h
-                              | allow the model to reason about how conditions
-                              | evolved over the previous hours, which is
-                              | critical for early-warning lead time.
-──────────────────────────────┼──────────────────────────────────────────────
-rolling_std / rolling_max     | Statistical summaries of sensor variance
-                              | detect abrupt anomalies (e.g., a sudden
-                              | rainfall burst) that single-point readings
-                              | can miss.
-
-─────────────────────────────────────────────────────────────────────────────
-FULL-DATASET EVALUATION vs. SENSOR-ONLY MODELS
-─────────────────────────────────────────────────────────────────────────────
-  Sensor-only models (these pkl files)
-  ─────────────────────────────────────
-  • Trained and evaluated using ONLY the sensor columns listed above.
-  • Ground truth (flood_label) was derived from water-level exceedance
-    thresholds, not from manual inspection or external event catalogues.
-  • Suitable for real-time deployment at gauged river reaches where no
-    forecast or satellite data is available.
-
-  Full-dataset evaluation (--split full)
-  ──────────────────────────────────────
-  • Runs the sensor models over ALL rows in flood_dataset.csv, including
-    the TRAINING period (pre-2024-06-30).
-  • Metrics will be OPTIMISTICALLY BIASED because the models have already
-    seen those rows during fitting. Use --split full only for sanity checks
-    or distribution plots, NOT for honest performance reporting.
-  • For unbiased reporting always use --split test (post-2025-06-30).
-
-─────────────────────────────────────────────────────────────────────────────
 """
 
 import os
@@ -187,6 +133,19 @@ VAL_END   = "2025-06-30"
 
 DANGER_FALLBACK_OFFSET = 0.10
 
+# Prediction CSVs for live cross-reference (all three combined sensor+context models)
+PREDICTIONS_DIR = r"D:\Rapid-Relay\Rapid-Relay-Pre-Prototype\flood_preprototype\predictions"
+
+LIVE_PREDICTIONS = {
+    "LightGBM":      os.path.join(PREDICTIONS_DIR, "flood_lgbm_combined_sensor_context_predictions.csv"),
+    "Random Forest": os.path.join(PREDICTIONS_DIR, "flood_rf_combined_sensor_context_predictions.csv"),
+    "XGBoost":       os.path.join(PREDICTIONS_DIR, "flood_xgb_combined_sensor_context_predictions.csv"),
+}
+
+DEFAULT_LABEL_FILE = os.path.join(
+    SCRIPT_DIR, r"..\data\flood_dataset_test.csv"
+)
+
 
 # ===========================================================================
 # HELPERS
@@ -211,19 +170,37 @@ def get_split(df: pd.DataFrame, split: str) -> pd.DataFrame:
         return df
 
 
+def _confusion_counts(y_true, y_pred):
+    """Return TP, TN, FP, FN as plain ints."""
+    tp = int(((y_pred == 1) & (y_true == 1)).sum())
+    tn = int(((y_pred == 0) & (y_true == 0)).sum())
+    fp = int(((y_pred == 1) & (y_true == 0)).sum())
+    fn = int(((y_pred == 0) & (y_true == 1)).sum())
+    return tp, tn, fp, fn
+
+
+def _accuracy(tp, tn, fp, fn):
+    total = tp + tn + fp + fn
+    return (tp + tn) / total if total > 0 else 0.0
+
+
 def compute_metrics(y_true, y_prob, threshold):
-    """Metrics for an ACTIVE alert level (WATCH / WARNING / DANGER).
-    Positive class = flood (label=1). Predictions: prob >= threshold → flood."""
+    """
+    Metrics for an ACTIVE alert level (WATCH / WARNING / DANGER).
+    Positive class = flood (label=1). Predictions: prob >= threshold → flood.
+    Includes accuracy = (TP+TN) / (TP+TN+FP+FN).
+    """
     y_pred = (y_prob >= threshold).astype(int)
-    prec   = precision_score(y_true, y_pred, zero_division=0)
-    rec    = recall_score(y_true, y_pred, zero_division=0)
-    f1     = f1_score(y_true, y_pred, zero_division=0)
-    bal    = balanced_accuracy_score(y_true, y_pred)
-    auc    = roc_auc_score(y_true, y_prob)
-    tn     = ((y_pred == 0) & (y_true == 0)).sum()
-    fp     = ((y_pred == 1) & (y_true == 0)).sum()
-    spec   = tn / (tn + fp) if (tn + fp) > 0 else 0
-    alerts = int(y_pred.sum())
+    tp, tn, fp, fn = _confusion_counts(y_true, y_pred)
+
+    prec = precision_score(y_true, y_pred, zero_division=0)
+    rec  = recall_score(y_true, y_pred, zero_division=0)
+    f1   = f1_score(y_true, y_pred, zero_division=0)
+    bal  = balanced_accuracy_score(y_true, y_pred)
+    auc  = roc_auc_score(y_true, y_prob)
+    spec = tn / (tn + fp) if (tn + fp) > 0 else 0
+    acc  = _accuracy(tp, tn, fp, fn)
+
     return {
         "threshold":   threshold,
         "precision":   prec,
@@ -232,60 +209,55 @@ def compute_metrics(y_true, y_prob, threshold):
         "bal_acc":     bal,
         "roc_auc":     auc,
         "specificity": spec,
-        "alerts":      alerts,
+        "accuracy":    acc,
+        "alerts":      int(y_pred.sum()),
+        "tp":          tp,
+        "tn":          tn,
+        "fp":          fp,
+        "fn":          fn,
     }
 
 
 def compute_clear_metrics(y_true, y_prob, watch_threshold):
-    """Metrics for the CLEAR zone (prob < watch_t — no alert issued).
-
-    CLEAR is the negative-class prediction: the model says conditions are safe.
-    We evaluate it on the negative class (no-flood = label 0) so that the
-    metrics read intuitively:
-
-      precision  = of all rows called CLEAR, what fraction were truly no-flood?
-                   = TN / (TN + FN)   [how clean are the CLEAR calls?]
-      recall     = of all true no-flood rows, what fraction were called CLEAR?
-                   = TN / (TN + FP)   [how completely does CLEAR cover safe rows?]
-      f1         = harmonic mean of the above two
-      miss_rate  = of all true flood rows, what fraction were missed (called CLEAR)?
-                   = FN / (FN + TP)   [the operational false-sense-of-safety rate]
-      n_clear    = total rows called CLEAR
-      n_missed   = flood rows incorrectly called CLEAR (false negatives at WATCH level)
     """
-    y_pred_watch = (y_prob >= watch_threshold).astype(int)  # 1 = some alert issued
-    y_clear      = (y_pred_watch == 0).astype(int)          # 1 = CLEAR predicted
+    Metrics for the CLEAR zone (prob < watch_t — no alert issued).
+    Evaluated on the negative class (no-flood = label 0).
 
-    # Treat no-flood (0) as the positive class for CLEAR metrics
-    y_true_neg = (y_true == 0).astype(int)
+      precision  = TN / (TN + FN)  — purity of CLEAR calls
+      recall     = TN / (TN + FP)  — coverage of safe rows
+      miss_rate  = FN / (FN + TP)  — floods incorrectly called CLEAR
+      accuracy   = (TP + TN) / total  — overall correctness at watch_t boundary
+    """
+    y_pred_watch = (y_prob >= watch_threshold).astype(int)
+    y_clear      = (y_pred_watch == 0).astype(int)
+    y_true_neg   = (y_true == 0).astype(int)
 
     prec = precision_score(y_true_neg, y_clear, zero_division=0)
     rec  = recall_score(y_true_neg, y_clear, zero_division=0)
     f1   = f1_score(y_true_neg, y_clear, zero_division=0)
-    bal  = balanced_accuracy_score(y_true, y_pred_watch)  # same as WATCH bal_acc
-
+    bal  = balanced_accuracy_score(y_true, y_pred_watch)
     auc  = roc_auc_score(y_true, y_prob)
 
-    tn = int(((y_clear == 1) & (y_true == 0)).sum())   # correctly called CLEAR
-    fn = int(((y_clear == 1) & (y_true == 1)).sum())   # floods missed (called CLEAR)
-    tp = int(((y_clear == 0) & (y_true == 1)).sum())   # floods caught
-    fp = int(((y_clear == 0) & (y_true == 0)).sum())   # false alarms at WATCH
-
+    tp, tn, fp, fn = _confusion_counts(y_true, y_pred_watch)
+    acc       = _accuracy(tp, tn, fp, fn)
     miss_rate = fn / (fn + tp) if (fn + tp) > 0 else 0
     n_clear   = int(y_clear.sum())
 
     return {
-        "threshold":   watch_threshold,   # CLEAR boundary = watch_t
-        "precision":   prec,              # TN / (TN+FN) — purity of CLEAR calls
-        "recall":      rec,               # TN / (TN+FP) — coverage of safe rows
+        "threshold":   watch_threshold,
+        "precision":   prec,
+        "recall":      rec,
         "f1":          f1,
-        "bal_acc":     bal,               # same as WATCH balanced accuracy
+        "bal_acc":     bal,
         "roc_auc":     auc,
-        "specificity": rec,               # same as recall here (negative-class coverage)
-        "alerts":      n_clear,           # number of CLEAR predictions
-        "miss_rate":   miss_rate,         # floods incorrectly called CLEAR
-        "n_missed":    fn,                # raw count of missed floods
+        "specificity": rec,
+        "accuracy":    acc,
+        "alerts":      n_clear,
+        "miss_rate":   miss_rate,
+        "n_missed":    fn,
+        "tp":          tp,
         "tn":          tn,
+        "fp":          fp,
         "fn":          fn,
     }
 
@@ -316,27 +288,232 @@ def _print_split_context_note(split: str) -> None:
             "       rows. Use for distribution plots only, NOT performance reporting.\n\n"
             "  NOTE ON SENSOR-ONLY MODELS vs. FULL-FEATURE MODELS:\n"
             "       The pkl files loaded here (flood_*_sensor.pkl) use ONLY\n"
-            "       physical sensor readings and their derived features.\n"
-            "       A full-feature model would additionally incorporate NWP\n"
-            "       forecast fields, satellite-derived indices (NDVI, LST), and\n"
-            "       administrative/topographic covariates."
+            "       physical sensor readings and their derived features."
         ),
     }
     print(notes.get(split, f"  Split: {split.upper()}"))
 
 
 # ===========================================================================
+# LIVE CROSS-REFERENCE
+# ===========================================================================
+
+def run_live_cross_reference(
+    label_file: str,
+    output_dir: str,
+) -> None:
+    """
+    Compare live predictions for all three combined sensor+context models
+    against labeled ground truth (flood_dataset_test.csv) on overlapping dates.
+
+    Computes TP, TN, FP, FN, accuracy, precision, recall, F1, balanced
+    accuracy at three tier levels per model:
+      WATCH   — any alert (WATCH / WARNING / DANGER)
+      WARNING — WARNING or DANGER
+      DANGER  — DANGER only
+
+    Results printed to terminal and saved to two CSVs:
+      live_prediction_accuracy_summary.csv  — one row per model × tier (totals)
+      live_prediction_accuracy_allrows.csv  — one row per model × date (full detail)
+    """
+    separator("Live Prediction Cross-Reference (All 3 Models vs Labeled Ground Truth)")
+
+    # ── Load labels ─────────────────────────────────────────────────────────
+    if not os.path.exists(label_file):
+        print(f"  ⚠️  Label file not found: {label_file}")
+        print("      Provide flood_dataset_test.csv or pass --label-file <path>.")
+        return
+
+    labels = pd.read_csv(label_file, parse_dates=["timestamp"],
+                         index_col="timestamp")
+    labels.index = labels.index.tz_localize(None).normalize()
+    print(f"  Label file       : {label_file}")
+    print(f"  Label rows       : {len(labels):,}")
+    print(f"  Label date range : {labels.index.min().date()} → {labels.index.max().date()}")
+    print(f"  Flood=1 in labels: {int(labels['flood_label'].sum())}  "
+          f"({labels['flood_label'].mean()*100:.1f}%)")
+
+    # summary rows  → one row per model × tier
+    summary_rows = []
+    # detail rows   → one row per model × date
+    detail_rows  = []
+
+    for model_name, predictions_csv in LIVE_PREDICTIONS.items():
+        print(f"\n  {'─'*60}")
+        print(f"  Model : {model_name}")
+        print(f"  CSV   : {predictions_csv}")
+
+        # ── Load predictions ─────────────────────────────────────────────────
+        if not os.path.exists(predictions_csv):
+            print(f"  ⚠️  Predictions CSV not found — skipping.")
+            print(f"      Run the corresponding predict script first.")
+            continue
+
+        preds = pd.read_csv(predictions_csv, parse_dates=["timestamp"],
+                            index_col="timestamp")
+        preds.index = preds.index.tz_localize(None).normalize()
+        print(f"  Predictions rows : {len(preds):,}")
+        print(f"  Pred date range  : {preds.index.min().date()} → {preds.index.max().date()}")
+
+        # ── Align on overlapping dates ────────────────────────────────────────
+        overlap = preds.index.intersection(labels.index)
+        if len(overlap) == 0:
+            print(f"  ⚠️  No overlapping dates found between predictions and labels.")
+            print(f"      Label range : {labels.index.min().date()} → {labels.index.max().date()}")
+            print(f"      Pred  range : {preds.index.min().date()} → {preds.index.max().date()}")
+            continue
+
+        preds_aligned  = preds.loc[overlap]
+        labels_aligned = labels.loc[overlap, "flood_label"].astype(int)
+
+        print(f"  Overlapping dates: {len(overlap):,}")
+        print(f"  Overlap range    : {overlap.min().date()} → {overlap.max().date()}")
+        print(f"  Flood=1 in window: {int(labels_aligned.sum())}")
+
+        # ── Tier-based binary predictions ─────────────────────────────────────
+        tier_col = "risk_tier"
+        if tier_col not in preds_aligned.columns:
+            print(f"  ⚠️  Column '{tier_col}' not found in predictions CSV.")
+            print(f"      Available columns: {list(preds_aligned.columns)}")
+            continue
+
+        tiers = preds_aligned[tier_col]
+
+        tier_levels = {
+            "WATCH":   tiers.isin(["WATCH", "WARNING", "DANGER"]).astype(int),
+            "WARNING": tiers.isin(["WARNING", "DANGER"]).astype(int),
+            "DANGER":  (tiers == "DANGER").astype(int),
+        }
+
+        has_prob = "flood_probability" in preds_aligned.columns
+        y_prob   = preds_aligned["flood_probability"].values if has_prob else None
+        y_true   = labels_aligned.values
+
+        # ── Print confusion table (summary) ──────────────────────────────────
+        print(f"\n  Accuracy = (TP + TN) / (TP + TN + FP + FN)\n")
+        print(f"  {'Tier':<10} {'TP':>5}  {'TN':>5}  {'FP':>5}  {'FN':>5}  "
+              f"{'Accuracy':>9}  {'Precision':>10}  {'Recall':>8}  {'F1':>6}  "
+              f"{'BalAcc':>8}  {'AUC':>8}")
+        print(f"  {'-'*10} {'-'*5}  {'-'*5}  {'-'*5}  {'-'*5}  "
+              f"{'-'*9}  {'-'*10}  {'-'*8}  {'-'*6}  "
+              f"{'-'*8}  {'-'*8}")
+
+        for tier_name, y_pred in tier_levels.items():
+            tp, tn, fp, fn = _confusion_counts(y_true, y_pred.values)
+            acc  = _accuracy(tp, tn, fp, fn)
+            prec = precision_score(y_true, y_pred, zero_division=0)
+            rec  = recall_score(y_true, y_pred, zero_division=0)
+            f1   = f1_score(y_true, y_pred, zero_division=0)
+            bal  = balanced_accuracy_score(y_true, y_pred)
+            auc  = roc_auc_score(y_true, y_prob) if has_prob else float("nan")
+
+            acc_flag = "✅" if acc >= 0.80 else "⚠️ "
+            rec_flag = "✅" if rec >= 0.90 else "⚠️ "
+            bal_flag = "✅" if bal >= 0.75 else "⚠️ "
+
+            auc_str = f"{auc:>8.4f}" if has_prob else f"{'N/A':>8}"
+            print(f"  {tier_name:<10} {tp:>5}  {tn:>5}  {fp:>5}  {fn:>5}  "
+                  f"  {acc_flag}{acc:>6.3f}  {prec:>10.3f}  "
+                  f"{rec_flag}{rec:>6.3f}  {f1:>6.3f}  "
+                  f"{bal_flag}{bal:>6.3f}  {auc_str}")
+
+            # ── Summary row (totals per model × tier) ─────────────────────────
+            summary_rows.append({
+                "model":             model_name,
+                "predictions_csv":   predictions_csv,
+                "tier_level":        tier_name,
+                "overlapping_dates": len(overlap),
+                "flood_events":      int(labels_aligned.sum()),
+                "tp":                tp,
+                "tn":                tn,
+                "fp":                fp,
+                "fn":                fn,
+                "accuracy":          round(acc,  4),
+                "precision":         round(prec, 4),
+                "recall":            round(rec,  4),
+                "f1":                round(f1,   4),
+                "balanced_acc":      round(bal,  4),
+                "roc_auc":           round(auc,  4) if has_prob else None,
+                "label_file":        label_file,
+                "overlap_start":     str(overlap.min().date()),
+                "overlap_end":       str(overlap.max().date()),
+            })
+
+        print(f"\n  Targets : accuracy >= 0.80  recall >= 0.90  bal_acc >= 0.75")
+        print(f"  Note    : WATCH tier counts any non-CLEAR prediction as positive.")
+        print(f"            WARNING tier counts WARNING or DANGER as positive.")
+        print(f"            DANGER  tier counts only DANGER as positive.")
+
+        # ── Per-date detail table (printed + collected for allrows CSV) ───────
+        print(f"\n  Per-date breakdown (overlapping dates only):")
+        print(f"  {'Date':<14} {'Actual':>8}  {'Tier':<10} {'Prob':>7}  {'Match?':>8}")
+        print(f"  {'-'*14} {'-'*8}  {'-'*10} {'-'*7}  {'-'*8}")
+        for ts in overlap:
+            actual  = int(labels_aligned.loc[ts])
+            tier    = tiers.loc[ts]
+            prob_v  = (preds_aligned.loc[ts, "flood_probability"]
+                       if has_prob else None)
+            prob_s  = f"{prob_v:.3f}" if prob_v is not None else "N/A"
+            alerted = tier in ("WATCH", "WARNING", "DANGER")
+            match   = (actual == 1 and alerted) or (actual == 0 and not alerted)
+            match_s = "✅ correct" if match else "❌ wrong"
+            print(f"  {str(ts.date()):<14} {'FLOOD' if actual==1 else 'clear':>8}  "
+                  f"{tier:<10} {prob_s:>7}  {match_s:>8}")
+
+            # ── Detail row (one per model × date) ─────────────────────────────
+            detail_rows.append({
+                "model":            model_name,
+                "date":             str(ts.date()),
+                "actual_label":     actual,
+                "actual_label_str": "FLOOD" if actual == 1 else "clear",
+                "risk_tier":        tier,
+                "flood_probability": round(prob_v, 4) if prob_v is not None else None,
+                "alerted":          int(alerted),
+                # WATCH-level match (alerted when actual=1, not alerted when actual=0)
+                "match_watch":      int(match),
+                # WARNING-level match
+                "match_warning":    int(
+                    (actual == 1 and tier in ("WARNING", "DANGER")) or
+                    (actual == 0 and tier not in ("WARNING", "DANGER"))
+                ),
+                # DANGER-level match
+                "match_danger":     int(
+                    (actual == 1 and tier == "DANGER") or
+                    (actual == 0 and tier != "DANGER")
+                ),
+                "predictions_csv":  predictions_csv,
+                "label_file":       label_file,
+            })
+
+    if not summary_rows:
+        print("\n  ⚠️  No live prediction data could be loaded for any model.")
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ── Save summary CSV (totals: one row per model × tier) ──────────────────
+    summary_csv = os.path.join(output_dir, "live_prediction_accuracy_summary.csv")
+    pd.DataFrame(summary_rows).to_csv(summary_csv, index=False)
+    print(f"\n  Summary CSV (totals)   saved → {summary_csv}")
+
+    # ── Save detail CSV (all rows: one row per model × date) ─────────────────
+    detail_csv = os.path.join(output_dir, "live_prediction_accuracy_allrows.csv")
+    pd.DataFrame(detail_rows).to_csv(detail_csv, index=False)
+    print(f"  Detail  CSV (all rows) saved → {detail_csv}")
+
+
+# ===========================================================================
 # MAIN
 # ===========================================================================
 
-def main(split: str = "test"):
+def main(split: str = "test", live_check: bool = False,
+         label_file: str = DEFAULT_LABEL_FILE):
+
     separator(f"Flood Prediction — ML Comparison Report  [{split.upper()} SET]")
     print(f"  Data file  : {DATA_FILE}")
     print(f"  Models     : {list(MODELS.keys())}  ")
     print(f"  Split      : {split}")
-
-    separator("Feature Explanation")
-    print(__doc__.split("FULL-DATASET EVALUATION")[0].split("FEATURE EXPLANATION\n")[1].rstrip())
+    print(f"  Accuracy   : (TP + TN) / (TP + TN + FP + FN)")
 
     _print_split_context_note(split)
 
@@ -432,16 +609,18 @@ def main(split: str = "test"):
             "warn_danger_gap":warn_danger_gap,
         }
 
-        rec_status = "✅" if warning_metrics["recall"]  >= 0.90 else "⚠️ "
-        bal_status = "✅" if warning_metrics["bal_acc"] >= 0.85 else "⚠️ "
-        gap_status = "✅" if tier_gaps_ok else "⚠️ "
-        miss_flag  = "✅" if clear_metrics["miss_rate"] <= 0.05 else "⚠️ "
+        rec_status  = "✅" if warning_metrics["recall"]    >= 0.90  else "⚠️ "
+        bal_status  = "✅" if warning_metrics["bal_acc"]   >= 0.85  else "⚠️ "
+        acc_status  = "✅" if warning_metrics["accuracy"]  >= 0.80  else "⚠️ "
+        gap_status  = "✅" if tier_gaps_ok                           else "⚠️ "
+        miss_flag   = "✅" if clear_metrics["miss_rate"]   <= 0.05  else "⚠️ "
         print(f"  {rec_status}  {name:<18} v{version}  "
               f"weight={flood_weight}  features={len(avail)}  "
               f"watch={watch_t:.2f}  warn={warn_t:.2f}  danger={danger_t:.2f} ({danger_source})  "
               f"gaps={watch_warn_gap:.2f}/{warn_danger_gap:.2f}{gap_status}  "
               f"Recall(warn)={warning_metrics['recall']:.4f}  "
               f"BalAcc(warn)={warning_metrics['bal_acc']:.4f}  "
+              f"Acc(warn)={warning_metrics['accuracy']:.4f}{acc_status}  "
               f"MissRate(clear)={clear_metrics['miss_rate']:.4f}{miss_flag}")
 
     if not results:
@@ -449,9 +628,8 @@ def main(split: str = "test"):
 
     if missing_pkls:
         print(f"\n  ⚠️  Missing model files: {missing_pkls}")
-        print(f"       Run the corresponding train scripts to generate them.")
 
-    # --- Metric comparison tables: CLEAR first, then active tiers ---
+    # ── Metric tables ────────────────────────────────────────────────────────
     for level_name, key in [
         ("CLEAR",   "clear"),
         ("WATCH",   "watch"),
@@ -461,13 +639,17 @@ def main(split: str = "test"):
         separator(f"Metric Comparison — {split.upper()} Set — {level_name} Threshold")
         _print_metric_table(results, threshold_key=key, y_true=y_true, level=level_name)
 
-    # --- All-threshold summary ---
+    # ── All-threshold summary ────────────────────────────────────────────────
     separator(f"All-Threshold Summary — {split.upper()} Set")
     print(f"\n  {'Model':<20} {'Threshold':>10}  {'Level':<8}  "
-          f"{'Precision':>10}  {'Recall':>8}  {'F1':>6}  "
-          f"{'BalAcc':>8}  {'ROC-AUC':>8}  {'Count':>7}  {'Note':<30}")
-    print(f"  {'-'*20} {'-'*10}  {'-'*8}  {'-'*10}  {'-'*8}  "
-          f"{'-'*6}  {'-'*8}  {'-'*8}  {'-'*7}  {'-'*30}")
+          f"{'Accuracy':>9}  {'Precision':>10}  {'Recall':>8}  {'F1':>6}  "
+          f"{'BalAcc':>8}  {'ROC-AUC':>8}  "
+          f"{'TP':>5}  {'TN':>5}  {'FP':>5}  {'FN':>5}  {'Note':<30}")
+    print(f"  {'-'*20} {'-'*10}  {'-'*8}  "
+          f"{'-'*9}  {'-'*10}  {'-'*8}  {'-'*6}  "
+          f"{'-'*8}  {'-'*8}  "
+          f"{'-'*5}  {'-'*5}  {'-'*5}  {'-'*5}  {'-'*30}")
+
     for name, r in results.items():
         for level_name, key, t_key in [
             ("CLEAR",   "clear",   "watch_t"),
@@ -482,12 +664,14 @@ def main(split: str = "test"):
                 note = (f"miss_rate={m['miss_rate']:.3f}  "
                         f"missed={m['n_missed']}")
             print(f"  {name:<20} {t:>10.2f}  {level_name:<8}  "
-                  f"{m['precision']:>10.3f}  {m['recall']:>8.3f}  {m['f1']:>6.3f}  "
+                  f"{m['accuracy']:>9.3f}  {m['precision']:>10.3f}  "
+                  f"{m['recall']:>8.3f}  {m['f1']:>6.3f}  "
                   f"{m['bal_acc']:>8.3f}  {m['roc_auc']:>8.4f}  "
-                  f"{m['alerts']:>7}  {note:<30}")
+                  f"{m['tp']:>5}  {m['tn']:>5}  {m['fp']:>5}  {m['fn']:>5}  "
+                  f"{note:<30}")
         print()
 
-    # --- Tier gap summary ---
+    # ── Tier gap summary ─────────────────────────────────────────────────────
     separator("Tier Gap Summary")
     print(f"\n  {'Model':<20} {'WATCH':>7}  {'WARNING':>8}  {'DANGER':>7}  "
           f"{'W→WN gap':>9}  {'WN→D gap':>9}  {'OK?':>5}  {'Danger Source':<25}")
@@ -500,7 +684,7 @@ def main(split: str = "test"):
               f"{r['warn_danger_gap']:>9.2f}  {gap_flag:>5}  {r['danger_source']:<25}")
     print(f"\n  Minimum required gap : 0.08 (MIN_TIER_GAP)")
 
-    # --- Probability distribution summary ---
+    # ── Probability distribution summary ─────────────────────────────────────
     separator("Probability Distribution Summary")
     print(f"  {'Model':<20} {'Min':>6}  {'Mean':>6}  {'Max':>6}  {'Std':>6}  "
           f"{'CLEAR':>6}  {'WATCH':>6}  {'WARN':>6}  {'DANGER':>6}")
@@ -520,7 +704,7 @@ def main(split: str = "test"):
               f"{probs.max():>6.3f}  {probs.std():>6.3f}{std_flag}  "
               f"{n_clear:>6}  {n_watch:>6}  {n_warn:>6}  {n_danger:>6}")
 
-    # --- Stored training metrics ---
+    # ── Stored training metrics ───────────────────────────────────────────────
     separator("Stored Training Metrics (from pkl artifacts)")
     print(f"  {'Model':<20} {'Cal Fold':<20} {'Cal Method':<16} "
           f"{'Val AUC':>8}  {'Val BalAcc':>10}  {'Test AUC':>8}  {'Test BalAcc':>11}")
@@ -534,7 +718,7 @@ def main(split: str = "test"):
         cm  = r.get("calibration_method", "isotonic")
         print(f"  {name:<20} {cf:<20} {cm:<16} {va:>8}  {vb:>10}  {ta:>8}  {tb:>11}")
 
-    # --- Best model recommendation ---
+    # ── Best model recommendation ─────────────────────────────────────────────
     separator("Best Model Recommendation")
     scored = sorted(
         results.items(),
@@ -552,17 +736,21 @@ def main(split: str = "test"):
         score    = w["bal_acc"]*0.4 + w["recall"]*0.4 + w["roc_auc"]*0.2
         rec_ok   = "✅" if w["recall"]       >= 0.90 else "⚠️ "
         bal_ok   = "✅" if w["bal_acc"]      >= 0.85 else "⚠️ "
+        acc_ok   = "✅" if w["accuracy"]     >= 0.80 else "⚠️ "
         gap_ok   = "✅" if r["tier_gaps_ok"]          else "⚠️ "
         miss_ok  = "✅" if c["miss_rate"]    <= 0.05  else "⚠️ "
         status   = "  ← RECOMMENDED" if rank == 1 else ""
         print(f"  #{rank}  {name:<20}  score={score:.4f}  "
               f"Recall={w['recall']:.4f}{rec_ok}  "
               f"BalAcc={w['bal_acc']:.4f}{bal_ok}  "
+              f"Accuracy={w['accuracy']:.4f}{acc_ok}  "
               f"AUC={w['roc_auc']:.4f}  "
               f"TierGaps={gap_ok}  "
-              f"MissRate={c['miss_rate']:.4f}{miss_ok}{status}")
+              f"MissRate={c['miss_rate']:.4f}{miss_ok}  "
+              f"TP={w['tp']}  TN={w['tn']}  FP={w['fp']}  FN={w['fn']}"
+              f"{status}")
 
-    # --- Save CSV ---
+    # ── Save CSV ──────────────────────────────────────────────────────────────
     separator("Saving CSV Report")
     rows = []
     for name, r in results.items():
@@ -577,12 +765,17 @@ def main(split: str = "test"):
                 "split":              split,
                 "threshold_level":    thresh_name,
                 "threshold":          round(m["threshold"], 4),
+                "accuracy":           round(m["accuracy"],    4),
                 "precision":          round(m["precision"],   4),
                 "recall":             round(m["recall"],      4),
                 "f1":                 round(m["f1"],          4),
                 "balanced_acc":       round(m["bal_acc"],     4),
                 "roc_auc":            round(m["roc_auc"],     4),
                 "specificity":        round(m["specificity"], 4),
+                "tp":                 m["tp"],
+                "tn":                 m["tn"],
+                "fp":                 m["fp"],
+                "fn":                 m["fn"],
                 "alerts":             m["alerts"],
                 "val_auc":            r["val_auc"],
                 "val_bal_acc":        r["val_balanced_acc"],
@@ -598,7 +791,6 @@ def main(split: str = "test"):
                 "warn_danger_gap":    r["warn_danger_gap"],
                 "tier_gaps_ok":       r["tier_gaps_ok"],
             }
-            # CLEAR-only extra columns (blank for other tiers)
             if thresh_name == "CLEAR":
                 row["clear_miss_rate"] = round(m["miss_rate"], 4)
                 row["clear_n_missed"]  = m["n_missed"]
@@ -617,102 +809,106 @@ def main(split: str = "test"):
     plot_path = os.path.join(OUTPUT_DIR, f"ml_comparison_report_{split}.png")
     _save_comparison_plot(results, y_true, split, split_df.index, plot_path)
 
+    # ── Live cross-reference (optional) ──────────────────────────────────────
+    if live_check:
+        run_live_cross_reference(
+            label_file=label_file,
+            output_dir=OUTPUT_DIR,
+        )
+
     separator("DONE")
     print(f"  CSV report : {report_csv}")
     print(f"  Chart      : {plot_path}")
+    if live_check:
+        print(f"  Live summary CSV  : {os.path.join(OUTPUT_DIR, 'live_prediction_accuracy_summary.csv')}")
+        print(f"  Live detail  CSV  : {os.path.join(OUTPUT_DIR, 'live_prediction_accuracy_allrows.csv')}")
     separator()
 
 
-# ---------------------------------------------------------------------------
-# Print table helper
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# PRINT TABLE HELPER
+# ===========================================================================
 
 def _print_metric_table(results: dict, threshold_key: str, y_true, level: str = ""):
     col_w = 20
 
     if level == "CLEAR":
-        # CLEAR has a fixed boundary = watch_t (same across all models)
         threshold_vals = {r["watch_t"] for r in results.values()}
         thresh_str = ", ".join(f"{t:.2f}" for t in sorted(threshold_vals))
         print(f"\n  Threshold level : CLEAR  (prob < watch_t = {thresh_str})")
         print(f"  Metrics are on the NEGATIVE CLASS (no-flood = label 0).")
         print(f"  precision = TN/(TN+FN)  — purity of CLEAR calls")
         print(f"  recall    = TN/(TN+FP)  — coverage of true safe rows")
-        print(f"  miss_rate = FN/(FN+TP)  — floods incorrectly called CLEAR\n")
-        print(f"  {'Model':<{col_w}} {'Precision':>10}  {'Recall':>8}  {'F1':>6}  "
-              f"{'BalAcc':>8}  {'ROC-AUC':>8}  {'MissRate':>10}  {'Missed':>7}  {'N_Clear':>8}")
-        print(f"  {'-'*col_w} {'-'*10}  {'-'*8}  {'-'*6}  "
-              f"{'-'*8}  {'-'*8}  {'-'*10}  {'-'*7}  {'-'*8}")
-        target_miss = 0.05
+        print(f"  miss_rate = FN/(FN+TP)  — floods incorrectly called CLEAR")
+        print(f"  accuracy  = (TP+TN)/(TP+TN+FP+FN)\n")
+        print(f"  {'Model':<{col_w}} {'Accuracy':>9}  {'Precision':>10}  {'Recall':>8}  "
+              f"{'F1':>6}  {'BalAcc':>8}  {'ROC-AUC':>8}  "
+              f"{'MissRate':>10}  {'Missed':>7}  {'N_Clear':>8}  "
+              f"{'TP':>5}  {'TN':>5}  {'FP':>5}  {'FN':>5}")
+        print(f"  {'-'*col_w} {'-'*9}  {'-'*10}  {'-'*8}  "
+              f"{'-'*6}  {'-'*8}  {'-'*8}  "
+              f"{'-'*10}  {'-'*7}  {'-'*8}  "
+              f"{'-'*5}  {'-'*5}  {'-'*5}  {'-'*5}")
         for name, r in results.items():
-            m    = r[threshold_key]
-            prec = m["precision"]
-            rec  = m["recall"]
-            f1   = m["f1"]
-            bal  = m["bal_acc"]
-            auc  = m["roc_auc"]
-            mr   = m["miss_rate"]
-            fn   = m["n_missed"]
-            nc   = m["alerts"]
-            p_flag  = "✅" if prec >= 0.90 else "⚠️ "
-            r_flag  = "✅" if rec  >= 0.90 else "⚠️ "
-            mr_flag = "✅" if mr   <= target_miss else "⚠️ "
-            print(f"  {name:<{col_w}} {p_flag}{prec:>8.3f}  "
-                  f"{r_flag}{rec:>6.3f}  {f1:>6.3f}  "
-                  f"{bal:>8.3f}  {auc:>8.4f}  "
-                  f"{mr_flag}{mr:>8.3f}  {fn:>7}  {nc:>8}")
-        print(f"\n  Targets  : precision >= 0.90  recall >= 0.90  miss_rate <= {target_miss:.2f}")
-        print(f"  miss_rate = fraction of TRUE FLOOD rows called CLEAR (false sense of safety)")
-        flood_total = int(y_true.sum())
-        print(f"  Flood events in split : {flood_total}")
+            m       = r[threshold_key]
+            p_flag  = "✅" if m["precision"] >= 0.90        else "⚠️ "
+            r_flag  = "✅" if m["recall"]    >= 0.90        else "⚠️ "
+            mr_flag = "✅" if m["miss_rate"] <= 0.05        else "⚠️ "
+            ac_flag = "✅" if m["accuracy"]  >= 0.80        else "⚠️ "
+            print(f"  {name:<{col_w}} {ac_flag}{m['accuracy']:>7.3f}  "
+                  f"{p_flag}{m['precision']:>8.3f}  "
+                  f"{r_flag}{m['recall']:>6.3f}  {m['f1']:>6.3f}  "
+                  f"{m['bal_acc']:>8.3f}  {m['roc_auc']:>8.4f}  "
+                  f"{mr_flag}{m['miss_rate']:>8.3f}  {m['n_missed']:>7}  "
+                  f"{m['alerts']:>8}  "
+                  f"{m['tp']:>5}  {m['tn']:>5}  {m['fp']:>5}  {m['fn']:>5}")
+        print(f"\n  Targets  : accuracy >= 0.80  precision >= 0.90  "
+              f"recall >= 0.90  miss_rate <= 0.05")
+        print(f"  Flood events in split : {int(y_true.sum())}")
         return
 
     # Active tiers: WATCH / WARNING / DANGER
     threshold_vals = {r[threshold_key]["threshold"] for r in results.values()}
     thresh_str = ", ".join(f"{t:.2f}" for t in sorted(threshold_vals))
-
     print(f"\n  Threshold level : {level}  (values: {thresh_str})")
-    print(f"  {'Model':<{col_w}} {'Precision':>10}  {'Recall':>8}  {'F1':>6}  "
-          f"{'BalAcc':>8}  {'ROC-AUC':>8}  {'Specificity':>12}  {'Alerts':>7}")
-    print(f"  {'-'*col_w} {'-'*10}  {'-'*8}  {'-'*6}  "
-          f"{'-'*8}  {'-'*8}  {'-'*12}  {'-'*7}")
+    print(f"  Accuracy = (TP + TN) / (TP + TN + FP + FN)\n")
+    print(f"  {'Model':<{col_w}} {'Accuracy':>9}  {'Precision':>10}  {'Recall':>8}  "
+          f"{'F1':>6}  {'BalAcc':>8}  {'ROC-AUC':>8}  {'Spec':>8}  {'Alerts':>7}  "
+          f"{'TP':>5}  {'TN':>5}  {'FP':>5}  {'FN':>5}")
+    print(f"  {'-'*col_w} {'-'*9}  {'-'*10}  {'-'*8}  "
+          f"{'-'*6}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*7}  "
+          f"{'-'*5}  {'-'*5}  {'-'*5}  {'-'*5}")
 
     if level == "WATCH":
-        target_met = {"precision": 0.30, "recall": 0.98, "bal_acc": 0.75}
+        target_met = {"precision": 0.30, "recall": 0.98, "bal_acc": 0.75, "accuracy": 0.70}
     elif level == "WARNING":
-        target_met = {"precision": 0.55, "recall": 0.90, "bal_acc": 0.85}
+        target_met = {"precision": 0.55, "recall": 0.90, "bal_acc": 0.85, "accuracy": 0.80}
     else:
-        target_met = {"precision": 0.70, "recall": 0.75, "bal_acc": 0.80}
-
-    flood_total = int(y_true.sum())
+        target_met = {"precision": 0.70, "recall": 0.75, "bal_acc": 0.80, "accuracy": 0.80}
 
     for name, r in results.items():
-        m    = r[threshold_key]
-        prec = m["precision"]
-        rec  = m["recall"]
-        f1   = m["f1"]
-        bal  = m["bal_acc"]
-        auc  = m["roc_auc"]
-        spec = m["specificity"]
-        n    = m["alerts"]
+        m      = r[threshold_key]
+        p_flag = "✅" if m["precision"] >= target_met["precision"] else "⚠️ "
+        r_flag = "✅" if m["recall"]    >= target_met["recall"]    else "⚠️ "
+        b_flag = "✅" if m["bal_acc"]   >= target_met["bal_acc"]   else "⚠️ "
+        a_flag = "✅" if m["accuracy"]  >= target_met["accuracy"]  else "⚠️ "
+        print(f"  {name:<{col_w}} {a_flag}{m['accuracy']:>7.3f}  "
+              f"{p_flag}{m['precision']:>8.3f}  "
+              f"{r_flag}{m['recall']:>6.3f}  {m['f1']:>6.3f}  "
+              f"{b_flag}{m['bal_acc']:>6.3f}  {m['roc_auc']:>8.4f}  "
+              f"{m['specificity']:>8.3f}  {m['alerts']:>7}  "
+              f"{m['tp']:>5}  {m['tn']:>5}  {m['fp']:>5}  {m['fn']:>5}")
 
-        p_flag = "✅" if prec >= target_met["precision"] else "⚠️ "
-        r_flag = "✅" if rec  >= target_met["recall"]    else "⚠️ "
-        b_flag = "✅" if bal  >= target_met["bal_acc"]   else "⚠️ "
-
-        print(f"  {name:<{col_w}} {p_flag}{prec:>8.3f}  "
-              f"{r_flag}{rec:>6.3f}  {f1:>6.3f}  "
-              f"{b_flag}{bal:>6.3f}  {auc:>8.4f}  {spec:>12.3f}  {n:>7}")
-
-    print(f"\n  Targets  : precision >= {target_met['precision']:.2f}  "
+    print(f"\n  Targets  : accuracy >= {target_met['accuracy']:.2f}  "
+          f"precision >= {target_met['precision']:.2f}  "
           f"recall >= {target_met['recall']:.2f}  "
           f"bal_acc >= {target_met['bal_acc']:.2f}")
-    print(f"  Flood events in split : {flood_total}")
+    print(f"  Flood events in split : {int(y_true.sum())}")
 
 
-# ---------------------------------------------------------------------------
-# Plot helper
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# PLOT HELPER
+# ===========================================================================
 
 def _save_comparison_plot(results: dict, y_true, split: str,
                           index, plot_path: str) -> None:
@@ -724,8 +920,9 @@ def _save_comparison_plot(results: dict, y_true, split: str,
     for name, r in results.items():
         fpr, tpr, _ = roc_curve(y_true, r["probs"])
         auc          = r["warning"]["roc_auc"]
+        acc          = r["warning"]["accuracy"]
         ax_roc.plot(fpr, tpr, color=MODEL_COLORS[name], linewidth=2,
-                    label=f"{name}  AUC={auc:.4f}")
+                    label=f"{name}  AUC={auc:.4f}  Acc={acc:.3f}")
     ax_roc.plot([0, 1], [0, 1], "k--", linewidth=0.8, alpha=0.5)
     ax_roc.set_xlabel("False Positive Rate")
     ax_roc.set_ylabel("True Positive Rate")
@@ -733,8 +930,8 @@ def _save_comparison_plot(results: dict, y_true, split: str,
     ax_roc.legend(loc="lower right", fontsize=9)
     ax_roc.grid(alpha=0.3)
 
-    metric_labels = ["Precision", "Recall", "F1", "BalAcc", "AUC", "Specificity"]
-    metric_keys   = ["precision", "recall", "f1", "bal_acc", "roc_auc", "specificity"]
+    metric_labels = ["Precision", "Recall", "F1", "BalAcc", "AUC", "Accuracy"]
+    metric_keys   = ["precision", "recall", "f1", "bal_acc", "roc_auc", "accuracy"]
 
     for row_idx, (name, r) in enumerate(results.items(), start=1):
         probs    = r["probs"]
@@ -748,26 +945,24 @@ def _save_comparison_plot(results: dict, y_true, split: str,
                      color="steelblue", label="No Flood", density=True)
         ax_dist.hist(probs[y_true == 1], bins=30, alpha=0.6,
                      color="red", label="Flood", density=True)
-        ax_dist.axvspan(0, watch_t, alpha=0.07, color="steelblue", label="CLEAR zone")
         ax_dist.axvline(watch_t,  color="gold",    linestyle="--", linewidth=1.2,
                         label=f"WATCH ({watch_t:.2f})")
         ax_dist.axvline(warn_t,   color="orange",  linestyle="--", linewidth=1.2,
                         label=f"WARN ({warn_t:.2f})")
         ax_dist.axvline(danger_t, color="darkred", linestyle="--", linewidth=1.2,
                         label=f"DANGER ({danger_t:.2f})")
+        acc_w = r["warning"]["accuracy"]
+        ax_dist.set_title(f"{name} — Prob Distribution  (Acc@WARN={acc_w:.3f})")
         ax_dist.set_xlabel("Flood Probability")
         ax_dist.set_ylabel("Density")
-        ax_dist.set_title(f"{name} — Probability Distribution")
         ax_dist.legend(fontsize=7)
         ax_dist.grid(alpha=0.3)
 
         ax_bar = fig.add_subplot(gs[row_idx, 1])
         x     = np.arange(len(metric_labels))
         width = 0.2
-        # CLEAR uses negative-class precision/recall/f1 — recompute for plot consistency
-        c_m       = r["clear"]
-        clear_vals = [c_m["precision"], c_m["recall"], c_m["f1"],
-                      c_m["bal_acc"],   c_m["roc_auc"], c_m["specificity"]]
+        c_m        = r["clear"]
+        clear_vals = [c_m[k] for k in metric_keys]
         w_vals     = [r["watch"][k]   for k in metric_keys]
         warn_vals  = [r["warning"][k] for k in metric_keys]
         danger_vals= [r["danger"][k]  for k in metric_keys]
@@ -775,20 +970,19 @@ def _save_comparison_plot(results: dict, y_true, split: str,
         ax_bar.bar(x - 0.5*width, w_vals,      width, label="WATCH",   color=color, alpha=0.40)
         ax_bar.bar(x + 0.5*width, warn_vals,   width, label="WARNING", color=color, alpha=0.70)
         ax_bar.bar(x + 1.5*width, danger_vals, width, label="DANGER",  color=color, alpha=1.00)
-        ax_bar.axhline(0.90, color="red",   linestyle=":", linewidth=1.2,
-                       alpha=0.7, label="Recall target (0.90)")
-        ax_bar.axhline(0.85, color="black", linestyle=":", linewidth=1.2,
-                       alpha=0.7, label="BalAcc target (0.85)")
+        ax_bar.axhline(0.90, color="red",   linestyle=":", linewidth=1.2, alpha=0.7,
+                       label="Recall/Acc target (0.90)")
+        ax_bar.axhline(0.85, color="black", linestyle=":", linewidth=1.2, alpha=0.7,
+                       label="BalAcc target (0.85)")
         ax_bar.set_xticks(x)
         ax_bar.set_xticklabels(metric_labels, rotation=30, ha="right", fontsize=8)
         ax_bar.set_ylim(0, 1.05)
-        ax_bar.set_title(f"{name} — Metrics (CLEAR / WATCH / WARNING / DANGER)")
+        ax_bar.set_title(f"{name} — Metrics by Tier")
         ax_bar.legend(fontsize=7)
         ax_bar.grid(axis="y", alpha=0.3)
 
         ax_ts = fig.add_subplot(gs[row_idx, 2])
         ax_ts.plot(index, probs, color=color, linewidth=1, alpha=0.8)
-        ax_ts.axhspan(0, watch_t, alpha=0.07, color="steelblue")
         ax_ts.axhline(watch_t,  color="gold",    linestyle="--", linewidth=0.8,
                       label=f"WATCH ({watch_t:.2f})")
         ax_ts.axhline(warn_t,   color="orange",  linestyle="--", linewidth=0.8,
@@ -833,5 +1027,23 @@ if __name__ == "__main__":
         choices=["train", "val", "test", "full"],
         help="Dataset split to evaluate on (default: test)",
     )
+    parser.add_argument(
+        "--live-check",
+        action="store_true",
+        help=(
+            "Cross-reference all three combined sensor+context prediction CSVs "
+            "against labeled ground truth on overlapping dates."
+        ),
+    )
+    parser.add_argument(
+        "--label-file",
+        type=str,
+        default=DEFAULT_LABEL_FILE,
+        help="Path to labeled CSV with flood_label column (default: ../data/flood_dataset_test.csv)",
+    )
     args = parser.parse_args()
-    main(split=args.split)
+    main(
+        split=args.split,
+        live_check=args.live_check,
+        label_file=args.label_file,
+    )
