@@ -456,14 +456,6 @@ def run_scheduled(
     no_post:        bool = False,
     run_all_models: bool = False,
 ) -> None:
-    """
-    Run once immediately, then sleep until the next calendar midnight before
-    each subsequent run. Always fires at midnight regardless of start time.
-
-    Example:
-        Started at 14:30 → runs at 14:30, then 00:00, 00:00, 00:00 ...
-        Started at 23:55 → runs at 23:55, then 00:00, 00:00, 00:00 ...
-    """
     print(f"\n  Scheduled mode — midnight-pinned (runs daily at 00:00 local time)")
     print(f"  Press Ctrl+C to stop.\n")
 
@@ -476,13 +468,23 @@ def run_scheduled(
                 run_all_models = run_all_models,
             )
 
-            secs      = seconds_until_midnight()
-            next_run  = datetime.now() + timedelta(seconds=secs)
-            h, m      = divmod(int(secs), 3600)
-            m, s      = divmod(m, 60)
-            print(f"\n  Next run : {next_run.strftime('%Y-%m-%d 00:00')}  "
-                  f"(sleeping {h}h {m}m {s}s)")
-            time.sleep(secs)
+            total_secs = seconds_until_midnight()
+            next_run   = datetime.now() + timedelta(seconds=total_secs)
+            next_str   = next_run.strftime("%Y-%m-%d 00:00")
+            print(f"\n  Next run : {next_str}")
+
+            remaining = total_secs
+            try:
+                while remaining > 0:
+                    h, r = divmod(int(remaining), 3600)
+                    m, s = divmod(r, 60)
+                    print(f"  Sleeping : {h:02d}:{m:02d}:{s:02d} until midnight", end="\r", flush=True)
+                    time.sleep(1)
+                    remaining -= 1
+                print(" " * 55, end="\r")  # clear the line
+            except KeyboardInterrupt:
+                print("\n  Stopped by user.")
+                return
 
         except KeyboardInterrupt:
             print("\n  Stopped by user.")
@@ -491,7 +493,7 @@ def run_scheduled(
             print(f"\n  Unexpected error in scheduled run: {exc}")
             traceback.print_exc()
             secs = seconds_until_midnight()
-            print(f"  Retrying at next midnight (sleeping {int(secs)}s)...")
+            print(f"  Retrying at next midnight...")
             time.sleep(secs)
 
 

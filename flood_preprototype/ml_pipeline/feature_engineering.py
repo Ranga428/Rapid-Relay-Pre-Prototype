@@ -212,7 +212,7 @@ def compute_waterlevel_features(
     df["waterlevel_rise_rate_48h"] = (df[col] - df[col].shift(t["48h"])) / max(t["48h"], 1)
 
     window_30d  = t["24h"] * WATERLEVEL_ELEVATED_WINDOW
-    rolling_85p = df[col].rolling(window_30d, min_periods=7).quantile(WATERLEVEL_ELEVATED_PERCENTILE)
+    rolling_85p = df[col].rolling(window_30d, min_periods=1).quantile(WATERLEVEL_ELEVATED_PERCENTILE)
     above       = (df[col] > rolling_85p).astype(int)
     group_key   = (above != above.shift()).cumsum()
     df["waterlevel_days_above_threshold"] = (
@@ -299,11 +299,11 @@ def compute_lag_features(
     df  = df.copy()
     tpd = t["24h"]
 
-    df["waterlevel_lag_1d"]   = df[waterlevel_col].shift(tpd * 1)
-    df["waterlevel_lag_2d"]   = df[waterlevel_col].shift(tpd * 2)
-    df["waterlevel_lag_3d"]   = df[waterlevel_col].shift(tpd * 3)
-    df["soilmoisture_lag_1d"] = df[soilmoisture_col].shift(tpd * 1)
-    df["soilmoisture_lag_2d"] = df[soilmoisture_col].shift(tpd * 2)
+    df["waterlevel_lag_1d"]   = df[waterlevel_col].shift(tpd * 1).bfill()
+    df["waterlevel_lag_2d"]   = df[waterlevel_col].shift(tpd * 2).bfill()
+    df["waterlevel_lag_3d"]   = df[waterlevel_col].shift(tpd * 3).bfill()
+    df["soilmoisture_lag_1d"] = df[soilmoisture_col].shift(tpd * 1).bfill()
+    df["soilmoisture_lag_2d"] = df[soilmoisture_col].shift(tpd * 2).bfill()
     return df
 
 
@@ -426,9 +426,7 @@ def compute_postflood_decay_features(
 
     # --- days_since_flood_level ---
     window_30d  = t["24h"] * WATERLEVEL_ELEVATED_WINDOW
-    rolling_85p = df[col].rolling(window_30d, min_periods=7).quantile(
-        WATERLEVEL_ELEVATED_PERCENTILE
-    )
+    rolling_85p = df[col].rolling(window_30d, min_periods=1).quantile(WATERLEVEL_ELEVATED_PERCENTILE)
     above = (df[col] > rolling_85p).astype(int)
 
     days_since = []
@@ -503,8 +501,8 @@ def compute_late_season_anomaly_features(
     hum_col = "humidity_mean_24h"    if "humidity_mean_24h"             in df.columns else humidity_col
     sm_col  = "sensor_soilmoisture_mean_24h" if "sensor_soilmoisture_mean_24h" in df.columns else soilmoisture_col
 
-    hum_30d_mean = df[hum_col].rolling(window_30d, min_periods=7).mean()
-    sm_30d_mean  = df[sm_col].rolling(window_30d,  min_periods=7).mean()
+    hum_30d_mean = df[hum_col].rolling(window_30d, min_periods=1).mean()
+    sm_30d_mean  = df[sm_col].rolling(window_30d,  min_periods=1).mean()
 
     df["humidity_anomaly_vs_30d"]  = df[hum_col] - hum_30d_mean
     df["soilmoist_anomaly_vs_30d"] = df[sm_col]  - sm_30d_mean
@@ -694,7 +692,8 @@ def build_features(
             f"Check the input DataFrame for gaps or wrong column names."
         )
 
-    result = df[target_cols].dropna()
+    result = df[target_cols].ffill().bfill()
+    result = result.dropna(subset=["max_waterlevel_24h", "max_waterlevel_6h"])
 
     print(f"  Feature mode   : {mode.upper()}")
     print(f"  Feature count  : {len(target_cols)}")

@@ -56,7 +56,7 @@ from feature_engineering import build_features, SENSOR_FEATURE_COLUMNS
 MODEL_FILE       = r"..\model\flood_lgbm_sensor.pkl"
 OUTPUT_DIR       = r"..\predictions"
 LIVE_SENSOR_FILE = os.path.join(
-    SCRIPT_DIR, r"..\data\sensor\obando_environmental_data.csv"
+    SCRIPT_DIR, r"..\data\sensor\combined_sensor_context.csv"
 )
 FLOOD_LOG_PATH = os.path.join(
     SCRIPT_DIR, r"..\data\flood_event_log.csv"
@@ -184,11 +184,37 @@ def load_model() -> tuple:
 
 def load_live_features() -> pd.DataFrame:
     separator("Loading Live Sensor Data")
+    print(f"  Source : {LIVE_SENSOR_FILE}")
+    if not os.path.exists(LIVE_SENSOR_FILE):
+        sys.exit(
+            f"\n  ERROR: Live sensor file not found.\n"
+            f"  Expected : {LIVE_SENSOR_FILE}\n"
+            f"  Fix      : Run merge_sensor.py (Step 0c) first, or check path.\n"
+        )
     sensor_df, freq = load_sensor(sensor_path=LIVE_SENSOR_FILE)
+
+    print(f"  Raw rows loaded  : {len(sensor_df):,}")
+    print(f"  Raw date range   : {sensor_df.index.min().date()} -> "
+          f"{sensor_df.index.max().date()}")
+
     separator("Building Sensor Features")
     features = build_features(sensor_df, freq=freq, mode="sensor",
                               flood_log_path=FLOOD_LOG_PATH)
     features = append_rolling_features(features)
+
+    core_cols = ["waterlevel", "soil_moisture", "humidity"]
+    present   = [c for c in core_cols if c in features.columns]
+    before    = len(features)
+    features  = features.dropna(subset=present, how="any")
+    dropped   = before - len(features)
+
+    if dropped > 0:
+        print(f"  ⚠️  Dropped {dropped} incomplete rows after feature engineering")
+        print(f"     Remaining range : {features.index.min().date()} -> "
+              f"{features.index.max().date()}")
+    else:
+        print(f"  ✅  All {before} rows complete — no rows dropped")
+
     if os.path.exists(FLOOD_LOG_PATH):
         print(f"  Flood log        : {FLOOD_LOG_PATH}")
     else:
@@ -199,13 +225,57 @@ def load_live_features() -> pd.DataFrame:
 
 def filter_new_rows(features: pd.DataFrame) -> pd.DataFrame:
     separator("Filtering to New Data Only")
-    cutoff = pd.Timestamp(LAST_TRAINING_DATE, tz="UTC")
-    new_df = features[features.index > cutoff]
+    print(f"  DEBUG LAST_TRAINING_DATE : {LAST_TRAINING_DATE}")
+    training_cutoff = pd.Timestamp(LAST_TRAINING_DATE, tz="UTC")
+
+    already_predicted = set()
+    csv_cutoff = training_cutoff
+
+    if os.path.exists(PREDICTIONS_CSV):
+        try:
+            existing = pd.read_csv(PREDICTIONS_CSV, parse_dates=["timestamp"],
+                                   index_col="timestamp")
+            if not existing.empty:
+                if existing.index.tzinfo is None:
+                    existing.index = existing.index.tz_localize("UTC")
+
+                last_saved  = existing.index.max()
+                first_saved = existing.index.min()
+                already_predicted = set(existing.index)
+
+                print(f"  Output CSV range : {first_saved.date()} -> {last_saved.date()}")
+                print(f"  Output CSV rows  : {len(existing):,}")
+
+                expected_first = training_cutoff + pd.Timedelta(days=1)
+                if first_saved > expected_first:
+                    gap_days = (first_saved - expected_first).days
+                    print(f"  ⚠️  Gap detected  : {expected_first.date()} -> "
+                          f"{(first_saved - pd.Timedelta(days=1)).date()} "
+                          f"({gap_days} days missing — will backfill)")
+                else:
+                    print(f"  No gap detected  : CSV starts at expected date")
+
+                csv_cutoff = last_saved
+            else:
+                print(f"  Output CSV       : exists but empty — processing from training cutoff")
+        except Exception as e:
+            print(f"  Output CSV       : could not read ({e}) — processing from training cutoff")
+    else:
+        print(f"  Output CSV       : not found — processing all data from training cutoff")
+
+    candidate_df = features[features.index > training_cutoff]
+    new_df = candidate_df[~candidate_df.index.isin(already_predicted)]
+
     print(f"  Training cutoff  : {LAST_TRAINING_DATE}")
     print(f"  Full history     : {len(features):,} rows")
+    print(f"  Already saved    : {len(already_predicted):,} rows (skipped)")
     print(f"  New rows         : {len(new_df):,}")
+
     if len(new_df) == 0:
-        sys.exit(f"\n  No new data found after {LAST_TRAINING_DATE}.")
+        sys.exit(
+            f"\n  No new data found after {csv_cutoff.date()}.\n"
+            f"  Append new sensor rows to obando_environmental_data.csv and re-run.\n"
+        )
     print(f"  Date range       : {new_df.index[0].date()} -> {new_df.index[-1].date()}")
     return new_df
 
