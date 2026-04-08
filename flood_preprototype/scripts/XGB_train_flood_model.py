@@ -443,7 +443,7 @@ def train_model(df, feature_cols, model_name, pkl_name):
         "watch_threshold"   : watch_t,
         "warning_threshold" : warn_t,
         "danger_threshold"  : danger_t,          # CHANGE G — saved to artifact
-        "last_training_date": str(df.index.max().date()),
+        "last_training_date": VAL_END,
         "flood_weight"      : FLOOD_WEIGHT_OVERRIDE,
         "calibrated"        : False,
         "version"           : "v3",

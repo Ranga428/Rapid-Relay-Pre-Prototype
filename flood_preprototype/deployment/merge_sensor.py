@@ -446,6 +446,7 @@ def save_output(merged: pd.DataFrame, output_path: str,
             if len(existing) > 0:
                 existing.index = pd.to_datetime(existing.index, utc=True)
                 existing = existing[[c for c in SENSOR_COLS if c in existing.columns]]
+                existing = existing.dropna(subset=SENSOR_COLS, how="any")
                 combined = pd.concat([existing, merged[SENSOR_COLS]])
                 combined = (
                     combined[~combined.index.duplicated(keep="last")]
@@ -462,6 +463,14 @@ def save_output(merged: pd.DataFrame, output_path: str,
     else:
         combined = merged[SENSOR_COLS]
         print(f"  Output CSV did not exist — creating from scratch.")
+
+    # Write with ISO 8601 timestamps (2025-07-01T00:00:00)
+        # Drop rows where all sensor columns are NaN
+    before_drop = len(combined)
+    combined = combined.dropna(subset=SENSOR_COLS, how="any")
+    dropped = before_drop - len(combined)
+    if dropped > 0:
+        print(f"  Dropped blank rows : {dropped:,}  (all sensor columns NaN)")
 
     # Write with ISO 8601 timestamps (2025-07-01T00:00:00)
     format_index_iso(combined).to_csv(output_path)

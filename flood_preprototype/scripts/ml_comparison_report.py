@@ -133,13 +133,12 @@ VAL_END   = "2025-06-30"
 
 DANGER_FALLBACK_OFFSET = 0.10
 
-# Prediction CSVs for live cross-reference (all three combined sensor+context models)
 PREDICTIONS_DIR = r"D:\Rapid-Relay\Rapid-Relay-Pre-Prototype\flood_preprototype\predictions"
 
 LIVE_PREDICTIONS = {
-    "LightGBM":      os.path.join(PREDICTIONS_DIR, "flood_lgbm_combined_sensor_context_predictions.csv"),
-    "Random Forest": os.path.join(PREDICTIONS_DIR, "flood_rf_combined_sensor_context_predictions.csv"),
-    "XGBoost":       os.path.join(PREDICTIONS_DIR, "flood_xgb_combined_sensor_context_predictions.csv"),
+    "LightGBM":      os.path.join(PREDICTIONS_DIR, "flood_lgbm_sensor_predictions.csv"),
+    "Random Forest": os.path.join(PREDICTIONS_DIR, "flood_rf_sensor_predictions.csv"),
+    "XGBoost":       os.path.join(PREDICTIONS_DIR, "flood_xgb_sensor_predictions.csv"),
 }
 
 DEFAULT_LABEL_FILE = os.path.join(
@@ -171,7 +170,6 @@ def get_split(df: pd.DataFrame, split: str) -> pd.DataFrame:
 
 
 def _confusion_counts(y_true, y_pred):
-    """Return TP, TN, FP, FN as plain ints."""
     tp = int(((y_pred == 1) & (y_true == 1)).sum())
     tn = int(((y_pred == 0) & (y_true == 0)).sum())
     fp = int(((y_pred == 1) & (y_true == 0)).sum())
@@ -185,11 +183,6 @@ def _accuracy(tp, tn, fp, fn):
 
 
 def compute_metrics(y_true, y_prob, threshold):
-    """
-    Metrics for an ACTIVE alert level (WATCH / WARNING / DANGER).
-    Positive class = flood (label=1). Predictions: prob >= threshold → flood.
-    Includes accuracy = (TP+TN) / (TP+TN+FP+FN).
-    """
     y_pred = (y_prob >= threshold).astype(int)
     tp, tn, fp, fn = _confusion_counts(y_true, y_pred)
 
@@ -219,15 +212,6 @@ def compute_metrics(y_true, y_prob, threshold):
 
 
 def compute_clear_metrics(y_true, y_prob, watch_threshold):
-    """
-    Metrics for the CLEAR zone (prob < watch_t — no alert issued).
-    Evaluated on the negative class (no-flood = label 0).
-
-      precision  = TN / (TN + FN)  — purity of CLEAR calls
-      recall     = TN / (TN + FP)  — coverage of safe rows
-      miss_rate  = FN / (FN + TP)  — floods incorrectly called CLEAR
-      accuracy   = (TP + TN) / total  — overall correctness at watch_t boundary
-    """
     y_pred_watch = (y_prob >= watch_threshold).astype(int)
     y_clear      = (y_pred_watch == 0).astype(int)
     y_true_neg   = (y_true == 0).astype(int)
@@ -302,23 +286,8 @@ def run_live_cross_reference(
     label_file: str,
     output_dir: str,
 ) -> None:
-    """
-    Compare live predictions for all three combined sensor+context models
-    against labeled ground truth (flood_dataset_test.csv) on overlapping dates.
-
-    Computes TP, TN, FP, FN, accuracy, precision, recall, F1, balanced
-    accuracy at three tier levels per model:
-      WATCH   — any alert (WATCH / WARNING / DANGER)
-      WARNING — WARNING or DANGER
-      DANGER  — DANGER only
-
-    Results printed to terminal and saved to two CSVs:
-      live_prediction_accuracy_summary.csv  — one row per model × tier (totals)
-      live_prediction_accuracy_allrows.csv  — one row per model × date (full detail)
-    """
     separator("Live Prediction Cross-Reference (All 3 Models vs Labeled Ground Truth)")
 
-    # ── Load labels ─────────────────────────────────────────────────────────
     if not os.path.exists(label_file):
         print(f"  ⚠️  Label file not found: {label_file}")
         print("      Provide flood_dataset_test.csv or pass --label-file <path>.")
@@ -333,9 +302,7 @@ def run_live_cross_reference(
     print(f"  Flood=1 in labels: {int(labels['flood_label'].sum())}  "
           f"({labels['flood_label'].mean()*100:.1f}%)")
 
-    # summary rows  → one row per model × tier
     summary_rows = []
-    # detail rows   → one row per model × date
     detail_rows  = []
 
     for model_name, predictions_csv in LIVE_PREDICTIONS.items():
@@ -343,7 +310,6 @@ def run_live_cross_reference(
         print(f"  Model : {model_name}")
         print(f"  CSV   : {predictions_csv}")
 
-        # ── Load predictions ─────────────────────────────────────────────────
         if not os.path.exists(predictions_csv):
             print(f"  ⚠️  Predictions CSV not found — skipping.")
             print(f"      Run the corresponding predict script first.")
@@ -355,7 +321,6 @@ def run_live_cross_reference(
         print(f"  Predictions rows : {len(preds):,}")
         print(f"  Pred date range  : {preds.index.min().date()} → {preds.index.max().date()}")
 
-        # ── Align on overlapping dates ────────────────────────────────────────
         overlap = preds.index.intersection(labels.index)
         if len(overlap) == 0:
             print(f"  ⚠️  No overlapping dates found between predictions and labels.")
@@ -370,7 +335,6 @@ def run_live_cross_reference(
         print(f"  Overlap range    : {overlap.min().date()} → {overlap.max().date()}")
         print(f"  Flood=1 in window: {int(labels_aligned.sum())}")
 
-        # ── Tier-based binary predictions ─────────────────────────────────────
         tier_col = "risk_tier"
         if tier_col not in preds_aligned.columns:
             print(f"  ⚠️  Column '{tier_col}' not found in predictions CSV.")
@@ -379,7 +343,9 @@ def run_live_cross_reference(
 
         tiers = preds_aligned[tier_col]
 
+        # ── EDIT 2: Added CLEAR tier ──────────────────────────────────────────
         tier_levels = {
+            "CLEAR":   (tiers == "CLEAR").astype(int),
             "WATCH":   tiers.isin(["WATCH", "WARNING", "DANGER"]).astype(int),
             "WARNING": tiers.isin(["WARNING", "DANGER"]).astype(int),
             "DANGER":  (tiers == "DANGER").astype(int),
@@ -389,7 +355,6 @@ def run_live_cross_reference(
         y_prob   = preds_aligned["flood_probability"].values if has_prob else None
         y_true   = labels_aligned.values
 
-        # ── Print confusion table (summary) ──────────────────────────────────
         print(f"\n  Accuracy = (TP + TN) / (TP + TN + FP + FN)\n")
         print(f"  {'Tier':<10} {'TP':>5}  {'TN':>5}  {'FP':>5}  {'FN':>5}  "
               f"{'Accuracy':>9}  {'Precision':>10}  {'Recall':>8}  {'F1':>6}  "
@@ -417,7 +382,6 @@ def run_live_cross_reference(
                   f"{rec_flag}{rec:>6.3f}  {f1:>6.3f}  "
                   f"{bal_flag}{bal:>6.3f}  {auc_str}")
 
-            # ── Summary row (totals per model × tier) ─────────────────────────
             summary_rows.append({
                 "model":             model_name,
                 "predictions_csv":   predictions_csv,
@@ -440,11 +404,11 @@ def run_live_cross_reference(
             })
 
         print(f"\n  Targets : accuracy >= 0.80  recall >= 0.90  bal_acc >= 0.75")
-        print(f"  Note    : WATCH tier counts any non-CLEAR prediction as positive.")
+        print(f"  Note    : CLEAR   tier counts predicting CLEAR as positive.")
+        print(f"            WATCH   tier counts any non-CLEAR prediction as positive.")
         print(f"            WARNING tier counts WARNING or DANGER as positive.")
         print(f"            DANGER  tier counts only DANGER as positive.")
 
-        # ── Per-date detail table (printed + collected for allrows CSV) ───────
         print(f"\n  Per-date breakdown (overlapping dates only):")
         print(f"  {'Date':<14} {'Actual':>8}  {'Tier':<10} {'Prob':>7}  {'Match?':>8}")
         print(f"  {'-'*14} {'-'*8}  {'-'*10} {'-'*7}  {'-'*8}")
@@ -460,7 +424,6 @@ def run_live_cross_reference(
             print(f"  {str(ts.date()):<14} {'FLOOD' if actual==1 else 'clear':>8}  "
                   f"{tier:<10} {prob_s:>7}  {match_s:>8}")
 
-            # ── Detail row (one per model × date) ─────────────────────────────
             detail_rows.append({
                 "model":            model_name,
                 "date":             str(ts.date()),
@@ -469,14 +432,11 @@ def run_live_cross_reference(
                 "risk_tier":        tier,
                 "flood_probability": round(prob_v, 4) if prob_v is not None else None,
                 "alerted":          int(alerted),
-                # WATCH-level match (alerted when actual=1, not alerted when actual=0)
                 "match_watch":      int(match),
-                # WARNING-level match
                 "match_warning":    int(
                     (actual == 1 and tier in ("WARNING", "DANGER")) or
                     (actual == 0 and tier not in ("WARNING", "DANGER"))
                 ),
-                # DANGER-level match
                 "match_danger":     int(
                     (actual == 1 and tier == "DANGER") or
                     (actual == 0 and tier != "DANGER")
@@ -491,12 +451,28 @@ def run_live_cross_reference(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # ── Save summary CSV (totals: one row per model × tier) ──────────────────
+    # ── EDIT 2: Add average row to live summary CSV ───────────────────────────
+    summary_df = pd.DataFrame(summary_rows)
+
+    live_numeric = [
+        "overlapping_dates", "flood_events",
+        "tp", "tn", "fp", "fn",
+        "accuracy", "precision", "recall", "f1", "balanced_acc", "roc_auc",
+    ]
+    live_avg = {"model": "AVERAGE", "tier_level": "ALL"}
+    for col in live_numeric:
+        if col in summary_df.columns:
+            live_avg[col] = round(
+                pd.to_numeric(summary_df[col], errors="coerce").mean(), 4
+            )
+    summary_df = pd.concat(
+        [summary_df, pd.DataFrame([live_avg])], ignore_index=True
+    )
+
     summary_csv = os.path.join(output_dir, "live_prediction_accuracy_summary.csv")
-    pd.DataFrame(summary_rows).to_csv(summary_csv, index=False)
+    summary_df.to_csv(summary_csv, index=False)
     print(f"\n  Summary CSV (totals)   saved → {summary_csv}")
 
-    # ── Save detail CSV (all rows: one row per model × date) ─────────────────
     detail_csv = os.path.join(output_dir, "live_prediction_accuracy_allrows.csv")
     pd.DataFrame(detail_rows).to_csv(detail_csv, index=False)
     print(f"  Detail  CSV (all rows) saved → {detail_csv}")
@@ -629,7 +605,6 @@ def main(split: str = "test", live_check: bool = False,
     if missing_pkls:
         print(f"\n  ⚠️  Missing model files: {missing_pkls}")
 
-    # ── Metric tables ────────────────────────────────────────────────────────
     for level_name, key in [
         ("CLEAR",   "clear"),
         ("WATCH",   "watch"),
@@ -639,7 +614,6 @@ def main(split: str = "test", live_check: bool = False,
         separator(f"Metric Comparison — {split.upper()} Set — {level_name} Threshold")
         _print_metric_table(results, threshold_key=key, y_true=y_true, level=level_name)
 
-    # ── All-threshold summary ────────────────────────────────────────────────
     separator(f"All-Threshold Summary — {split.upper()} Set")
     print(f"\n  {'Model':<20} {'Threshold':>10}  {'Level':<8}  "
           f"{'Accuracy':>9}  {'Precision':>10}  {'Recall':>8}  {'F1':>6}  "
@@ -671,7 +645,6 @@ def main(split: str = "test", live_check: bool = False,
                   f"{note:<30}")
         print()
 
-    # ── Tier gap summary ─────────────────────────────────────────────────────
     separator("Tier Gap Summary")
     print(f"\n  {'Model':<20} {'WATCH':>7}  {'WARNING':>8}  {'DANGER':>7}  "
           f"{'W→WN gap':>9}  {'WN→D gap':>9}  {'OK?':>5}  {'Danger Source':<25}")
@@ -684,7 +657,6 @@ def main(split: str = "test", live_check: bool = False,
               f"{r['warn_danger_gap']:>9.2f}  {gap_flag:>5}  {r['danger_source']:<25}")
     print(f"\n  Minimum required gap : 0.08 (MIN_TIER_GAP)")
 
-    # ── Probability distribution summary ─────────────────────────────────────
     separator("Probability Distribution Summary")
     print(f"  {'Model':<20} {'Min':>6}  {'Mean':>6}  {'Max':>6}  {'Std':>6}  "
           f"{'CLEAR':>6}  {'WATCH':>6}  {'WARN':>6}  {'DANGER':>6}")
@@ -704,7 +676,6 @@ def main(split: str = "test", live_check: bool = False,
               f"{probs.max():>6.3f}  {probs.std():>6.3f}{std_flag}  "
               f"{n_clear:>6}  {n_watch:>6}  {n_warn:>6}  {n_danger:>6}")
 
-    # ── Stored training metrics ───────────────────────────────────────────────
     separator("Stored Training Metrics (from pkl artifacts)")
     print(f"  {'Model':<20} {'Cal Fold':<20} {'Cal Method':<16} "
           f"{'Val AUC':>8}  {'Val BalAcc':>10}  {'Test AUC':>8}  {'Test BalAcc':>11}")
@@ -718,7 +689,6 @@ def main(split: str = "test", live_check: bool = False,
         cm  = r.get("calibration_method", "isotonic")
         print(f"  {name:<20} {cf:<20} {cm:<16} {va:>8}  {vb:>10}  {ta:>8}  {tb:>11}")
 
-    # ── Best model recommendation ─────────────────────────────────────────────
     separator("Best Model Recommendation")
     scored = sorted(
         results.items(),
@@ -750,7 +720,6 @@ def main(split: str = "test", live_check: bool = False,
               f"TP={w['tp']}  TN={w['tn']}  FP={w['fp']}  FN={w['fn']}"
               f"{status}")
 
-    # ── Save CSV ──────────────────────────────────────────────────────────────
     separator("Saving CSV Report")
     rows = []
     for name, r in results.items():
@@ -799,7 +768,25 @@ def main(split: str = "test", live_check: bool = False,
                 row["clear_n_missed"]  = ""
             rows.append(row)
 
-    report_df  = pd.DataFrame(rows)
+    # ── EDIT 1: Add average row to main report CSV ────────────────────────────
+    report_df = pd.DataFrame(rows)
+
+    numeric_cols = [
+        "accuracy", "precision", "recall", "f1", "balanced_acc",
+        "roc_auc", "specificity", "tp", "tn", "fp", "fn", "alerts",
+        "val_auc", "val_bal_acc", "test_auc", "test_bal_acc",
+        "watch_warn_gap", "warn_danger_gap", "clear_miss_rate",
+    ]
+    avg_row = {"model": "AVERAGE", "split": split, "threshold_level": "ALL"}
+    for col in numeric_cols:
+        if col in report_df.columns:
+            avg_row[col] = round(
+                pd.to_numeric(report_df[col], errors="coerce").mean(), 4
+            )
+    report_df = pd.concat(
+        [report_df, pd.DataFrame([avg_row])], ignore_index=True
+    )
+
     report_csv = os.path.join(OUTPUT_DIR, f"ml_comparison_report_{split}.csv")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     report_df.to_csv(report_csv, index=False)
@@ -809,7 +796,6 @@ def main(split: str = "test", live_check: bool = False,
     plot_path = os.path.join(OUTPUT_DIR, f"ml_comparison_report_{split}.png")
     _save_comparison_plot(results, y_true, split, split_df.index, plot_path)
 
-    # ── Live cross-reference (optional) ──────────────────────────────────────
     if live_check:
         run_live_cross_reference(
             label_file=label_file,
@@ -867,7 +853,6 @@ def _print_metric_table(results: dict, threshold_key: str, y_true, level: str = 
         print(f"  Flood events in split : {int(y_true.sum())}")
         return
 
-    # Active tiers: WATCH / WARNING / DANGER
     threshold_vals = {r[threshold_key]["threshold"] for r in results.values()}
     thresh_str = ", ".join(f"{t:.2f}" for t in sorted(threshold_vals))
     print(f"\n  Threshold level : {level}  (values: {thresh_str})")
