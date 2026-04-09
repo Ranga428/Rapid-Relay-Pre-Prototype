@@ -1,88 +1,54 @@
 """
-speed_test_runner_v2.py
-=======================
-Combined Speed Test — Flood EWS Full Pipeline
-Obando, Bulacan
+speed_test_runner_v2_REALTIME_DAILY.py
+========================================
+HYBRID PIPELINE — Real-time Ingestion + Daily Prediction
+Flood EWS for Obando, Bulacan
 
-PIPELINE BEHAVIOR
------------------
-- Fetches ONLY the single latest row (by Date+Time) from Supabase.
-- If that row was already processed in a previous run → skip entirely.
-- If it is new → calibrate → predict → sync → post FB alert.
-- Writes one audit row per successful run to speedtest_audit.csv.
-- Tracks operational availability (Aₒ) per tick to speedtest_availability.csv.
+CORE LOGIC
+----------
+INGESTION (Real-time, every tick):
+  - Fetch ALL rows from Supabase
+  - For each new row (id > last_processed_id):
+    → Calibrate → Append to sensor CSV → Track in ingestion audit
+  - No prediction yet, just accumulate sensor data
 
-SPEEDTEST PREDICTIONS CSV COLUMNS
-----------------------------------
-    timestamp               str    — sensor date (midnight UTC, model granularity)
-    flood_probability       float  — XGBoost predicted probability (0–1)
-    risk_tier               str    — CLEAR / WATCH / WARNING / DANGER
-    watch_threshold         float  — model watch threshold
-    warning_threshold       float  — model warning threshold
-    danger_threshold        float  — model danger threshold
-    transmission_speed_s    float  — latency from sensor timestamp → prediction_created_at (seconds)
-    sensor_timestamp        str    — raw sensor Date+Time from Supabase (ISO)
-    prediction_created_at   str    — when the prediction was produced (local ISO)
-    row_created_at          str    — when this CSV row was written (local ISO)
+PREDICTION (Once daily at midnight):
+  - Check if it's past midnight (00:00–00:30 UTC or configurable window)
+  - If yes: Run single prediction on FULL accumulated sensor history
+  - Post alert for daily prediction result
+  - Log to prediction audit
 
-AUDIT CSV COLUMNS
------------------
-    run_number              int    — pipeline run counter
-    run_timestamp           str    — when this tick started (local ISO)
-    supabase_row_id         int    — id of the source row in Supabase
-    supabase_saved_at       str    — Date + Time from Supabase (sensor timestamp)
-    cal_waterlevel          float  — calibrated water level (m above datum)
-    cal_soil_moisture       float  — calibrated soil moisture (m³/m³)
-    cal_humidity            float  — calibrated humidity (cm CWV)
-    flood_probability       float  — XGBoost predicted probability (0–1)
-    risk_tier               str    — CLEAR / WATCH / WARNING / DANGER
-    prediction_created_at   str    — when the prediction row was written (local ISO)
-    fb_posted               bool   — whether FB alert was sent this tick
+BENEFITS
+--------
+✅ Real-time sensor data accumulation (no lag)
+✅ Handles all incoming rows efficiently
+✅ Daily prediction on complete historical context
+✅ Separates ingestion concerns from model concerns
+✅ Predictable alert schedule (once per day max)
+✅ Lower compute cost (predict 1x/day, not N times/day)
 
-AVAILABILITY CSV COLUMNS
-------------------------
-    session_id              str    — UUID generated once per script launch
-    tick_number             int    — increments every loop regardless of outcome
-    tick_timestamp          str    — when the tick ran (local ISO)
-    status                  str    — ACTIVE | SKIPPED | FAILED
-    supabase_row_id         int    — id of latest row seen (even if skipped)
-    uptime_ticks            int    — running count of ACTIVE ticks
-    total_ticks             int    — running count of all ticks
-    availability_pct        float  — uptime_ticks / total_ticks * 100 (running)
+CSV SCHEMAS
+-----------
+INGESTION AUDIT (speedtest_ingestion_audit.csv):
+  run_number, run_timestamp, rows_fetched, new_rows_found, new_rows_ingested,
+  last_ingested_id, last_ingested_timestamp, ingestion_errors
 
-AVAILABILITY STATUS DEFINITIONS
---------------------------------
-    ACTIVE   — new row detected, calibrated, and prediction produced end-to-end (true uptime)
-    SKIPPED  — latest Supabase row already processed in a prior tick (sensor gap, not system failure)
-    FAILED   — fetch error, NULL data, calibration out of range, or model failure (true downtime)
+SENSOR DATA (speedtest_sensor_data.csv):
+  timestamp, waterlevel, soil_moisture, humidity, row_created_at
+  (accumulates across all runs)
 
-    Strict Aₒ     = ACTIVE / total_ticks
-    Soft health   = (ACTIVE + SKIPPED) / total_ticks  (separates sensor gaps from system failures)
-
-SUPABASE SOURCE TABLE SCHEMA (obando_environmental_data)
----------------------------------------------------------
-    id               BIGINT GENERATED ALWAYS AS IDENTITY
-    "Soil Moisture"  REAL NOT NULL
-    "Temperature"    REAL NOT NULL
-    "Humidity"       REAL NOT NULL
-    "Pressure"       REAL NOT NULL
-    "Final Distance" REAL NULL
-    "Date"           DATE NULL
-    "Time"           TIME NULL
-    "Device"         TEXT NULL
+PREDICTION AUDIT (speedtest_prediction_audit.csv):
+  prediction_number, prediction_timestamp, rows_in_history, flood_probability,
+  risk_tier, watch_threshold, warning_threshold, danger_threshold,
+  fb_posted, prediction_created_at
 
 USAGE
 -----
-    python speed_test_runner_v2.py                  # run every 30 seconds (default)
-    python speed_test_runner_v2.py --interval 10    # run every 10 seconds
-    python speed_test_runner_v2.py --once           # run exactly once and exit
-    python speed_test_runner_v2.py --dry-run        # preview, no writes
-
-ENVIRONMENT VARIABLES (.env two levels above this file)
-    SUPABASE_URL          = https://<project-ref>.supabase.co
-    SUPABASE_SERVICE_KEY  = <service_role key>
-    FB_PAGE_ID            = <numeric page id>
-    FB_PAGE_TOKEN         = <long-lived page access token>
+  python speed_test_runner_v2_REALTIME_DAILY.py                   # 30s interval
+  python speed_test_runner_v2_REALTIME_DAILY.py --interval 10     # 10s interval
+  python speed_test_runner_v2_REALTIME_DAILY.py --once            # Single ingest + check predict
+  python speed_test_runner_v2_REALTIME_DAILY.py --force-predict   # Force prediction now
+  python speed_test_runner_v2_REALTIME_DAILY.py --dry-run         # Preview only
 """
 
 # ===========================================================================
@@ -97,13 +63,14 @@ import uuid
 import logging
 import argparse
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
 import numpy as np
 import requests
 import joblib
+import pytz
 import matplotlib
 matplotlib.use("Agg")
 
@@ -123,8 +90,9 @@ load_dotenv(dotenv_path=_ENV_PATH)
 
 MODEL_FILE           = os.path.join(_PROJECT_ROOT, "model", "flood_xgb_sensor.pkl")
 SPEEDTEST_OUTPUT_DIR = os.path.join(_PROJECT_ROOT, "predictions")
-SPEEDTEST_CSV        = os.path.join(SPEEDTEST_OUTPUT_DIR, "speedtest_predictions.csv")
-AUDIT_CSV            = os.path.join(SPEEDTEST_OUTPUT_DIR, "speedtest_audit.csv")
+INGESTION_AUDIT_CSV  = os.path.join(SPEEDTEST_OUTPUT_DIR, "speedtest_ingestion_audit.csv")
+PREDICTION_AUDIT_CSV = os.path.join(SPEEDTEST_OUTPUT_DIR, "speedtest_prediction_audit.csv")
+SPEEDTEST_PRED_CSV   = os.path.join(SPEEDTEST_OUTPUT_DIR, "speedtest_predictions.csv")
 AVAILABILITY_CSV     = os.path.join(SPEEDTEST_OUTPUT_DIR, "speedtest_availability.csv")
 
 SENSOR_CSV = Path(os.path.normpath(
@@ -132,6 +100,9 @@ SENSOR_CSV = Path(os.path.normpath(
 ))
 
 FLOOD_LOG_PATH = os.path.join(_PROJECT_ROOT, "data", "flood_event_log.csv")
+
+# State tracking
+STATE_FILE = os.path.join(SPEEDTEST_OUTPUT_DIR, "speedtest_state.json")
 
 _ML_PIPELINE = os.path.join(_PROJECT_ROOT, "ml_pipeline")
 sys.path.insert(0, _ML_PIPELINE)
@@ -145,10 +116,10 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("speed_test_runner_v2")
+log = logging.getLogger("speed_test_runner_realtime_daily")
 
 # ===========================================================================
-# SUPABASE CONFIG
+# CONFIG
 # ===========================================================================
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -169,71 +140,7 @@ _SELECT = '"id", "Date", "Time", "Soil Moisture", "Humidity", "Final Distance"'
 
 _supabase_client = None
 
-
-def get_supabase():
-    global _supabase_client
-    if _supabase_client is not None:
-        return _supabase_client
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        raise RuntimeError(
-            f"Supabase credentials missing.\n"
-            f"  .env checked         : {_ENV_PATH}\n"
-            f"  SUPABASE_URL         : {'SET' if SUPABASE_URL else 'MISSING'}\n"
-            f"  SUPABASE_SERVICE_KEY : {'SET' if SUPABASE_KEY else 'MISSING'}\n"
-        )
-    from supabase import create_client
-    _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    return _supabase_client
-
-
-# ===========================================================================
-# FACEBOOK CONFIG
-# ===========================================================================
-
-FB_PAGE_ID     = os.getenv("FB_PAGE_ID")
-FB_PAGE_TOKEN  = os.getenv("FB_PAGE_TOKEN")
-FB_API_VERSION = "v23.0"
-FB_STATE_PATH  = os.path.join(SCRIPT_DIR, "speedtest_last_posted.json")
-
-FB_TIER_MESSAGE = {
-    "CLEAR": (
-        "🟢 ALL CLEAR — Obando, Bulacan\n\n"
-        "No flood risk detected by the Rapid Relay Early Warning System.\n"
-        "Conditions are normal. No action required.\n\n"
-        "Flood Probability : {prob_pct}\n"
-        "Date              : {timestamp}\n\n"
-        "Stay informed. Follow official advisories from local DRRMO."
-    ),
-    "WATCH": (
-        "🟡 FLOOD WATCH — Obando, Bulacan\n\n"
-        "Elevated flood risk detected by the Rapid Relay Early Warning System.\n"
-        "Monitor water levels closely. Be prepared to act.\n\n"
-        "Flood Probability : {prob_pct}\n"
-        "Date              : {timestamp}\n\n"
-        "Stay safe. Follow official advisories from local DRRMO."
-    ),
-    "WARNING": (
-        "🟠 FLOOD WARNING — Obando, Bulacan\n\n"
-        "High flood risk detected by the Rapid Relay Early Warning System.\n"
-        "Prepare for possible flooding. Move valuables to higher ground.\n\n"
-        "Flood Probability : {prob_pct}\n"
-        "Date              : {timestamp}\n\n"
-        "Stay safe. Follow official advisories from local DRRMO."
-    ),
-    "DANGER": (
-        "🔴 FLOOD DANGER — Obando, Bulacan\n\n"
-        "IMMINENT or ONGOING flood detected by the Rapid Relay Early Warning System.\n"
-        "Take immediate action. Evacuate if in flood-prone areas.\n\n"
-        "Flood Probability : {prob_pct}\n"
-        "Date              : {timestamp}\n\n"
-        "🚨 Follow evacuation orders from local DRRMO immediately."
-    ),
-}
-
-# ===========================================================================
-# CALIBRATION CONSTANTS
-# ===========================================================================
-
+# Calibration constants
 DIKE_HEIGHT_M        = 4.039
 HW_WL_DRY            = 3.819
 HW_WL_WET            = 3.999
@@ -252,15 +159,62 @@ HUMIDITY_HW_MAX    = 88.78
 HUMIDITY_PROXY_MIN = 0.15
 HUMIDITY_PROXY_MAX = 6.87
 
-# ===========================================================================
-# PREDICTION CONFIG
-# ===========================================================================
-
+# Prediction config
 DEFAULT_ALERT_THRESHOLD = 0.50
 MIN_CONSECUTIVE_DAYS    = 2
 ROLLING_MEAN_WINDOW     = 7
 ROLLING_SUM_WINDOW      = 14
 LAST_TRAINING_DATE      = "2024-12-31"
+
+# Daily prediction timing
+PREDICTION_HOUR_UTC = 0  # Predict at 00:00 UTC (midnight)
+PREDICTION_WINDOW_MINUTES = 30  # Allow prediction window: 00:00–00:30 UTC
+SENSOR_TIMEZONE = os.getenv("SENSOR_TIMEZONE", "UTC")
+
+# Facebook
+FB_PAGE_ID     = os.getenv("FB_PAGE_ID")
+FB_PAGE_TOKEN  = os.getenv("FB_PAGE_TOKEN")
+FB_API_VERSION = "v23.0"
+FB_STATE_PATH  = os.path.join(SCRIPT_DIR, "speedtest_last_fb_prediction_ts.json")
+
+# Allow forcing FB posts via environment (useful for CI/testing or always-on posting)
+# Default to true so the runner posts predictions by default (set ALWAYS_POST_FB=false to disable)
+ALWAYS_POST_FB = os.getenv("ALWAYS_POST_FB", "true").lower() in ("1", "true", "yes")
+
+FB_TIER_MESSAGE = {
+    "CLEAR": (
+        "🟢 DAILY CLEAR — Obando, Bulacan\n\n"
+        "No flood risk detected in today's data by Rapid Relay EWS.\n"
+        "Conditions normal. No action required.\n\n"
+        "Flood Probability : {prob_pct}\n"
+        "Prediction Time   : {timestamp}\n\n"
+        "Stay informed. Follow official DRRMO advisories."
+    ),
+    "WATCH": (
+        "🟡 DAILY WATCH — Obando, Bulacan\n\n"
+        "Elevated flood risk detected in today's data by Rapid Relay EWS.\n"
+        "Monitor water levels. Be prepared to act.\n\n"
+        "Flood Probability : {prob_pct}\n"
+        "Prediction Time   : {timestamp}\n\n"
+        "Stay safe. Follow official DRRMO advisories."
+    ),
+    "WARNING": (
+        "🟠 DAILY WARNING — Obando, Bulacan\n\n"
+        "High flood risk detected in today's data by Rapid Relay EWS.\n"
+        "Prepare for possible flooding. Move valuables to higher ground.\n\n"
+        "Flood Probability : {prob_pct}\n"
+        "Prediction Time   : {timestamp}\n\n"
+        "Stay safe. Follow official DRRMO advisories."
+    ),
+    "DANGER": (
+        "🔴 DAILY DANGER — Obando, Bulacan\n\n"
+        "IMMINENT/ONGOING flood detected in today's data by Rapid Relay EWS.\n"
+        "Take immediate action. Evacuate if in flood-prone areas.\n\n"
+        "Flood Probability : {prob_pct}\n"
+        "Prediction Time   : {timestamp}\n\n"
+        "🚨 Follow DRRMO evacuation orders immediately."
+    ),
+}
 
 RISK_TIERS = {
     "CLEAR":   {"emoji": "🟢", "color": "green"},
@@ -269,32 +223,7 @@ RISK_TIERS = {
     "DANGER":  {"emoji": "🔴", "color": "red"},
 }
 
-AUDIT_COLUMNS = [
-    "run_number",
-    "run_timestamp",
-    "supabase_row_id",
-    "supabase_saved_at",
-    "cal_waterlevel",
-    "cal_soil_moisture",
-    "cal_humidity",
-    "flood_probability",
-    "risk_tier",
-    "prediction_created_at",
-    "fb_posted",
-]
-
-AVAIL_COLUMNS = [
-    "session_id",
-    "tick_number",
-    "tick_timestamp",
-    "status",
-    "supabase_row_id",
-    "uptime_ticks",
-    "total_ticks",
-    "availability_pct",
-]
-
-# Generated once per script launch — groups all ticks in this session
+# Session
 _SESSION_ID = str(uuid.uuid4())[:8]
 
 # ===========================================================================
@@ -302,7 +231,7 @@ _SESSION_ID = str(uuid.uuid4())[:8]
 # ===========================================================================
 
 def sep(title=""):
-    line = "=" * 60
+    line = "=" * 70
     if title:
         print(f"\n{line}\n  {title}\n{line}")
     else:
@@ -328,112 +257,125 @@ def countdown(seconds: int, label: str = "Next run in") -> None:
         raise
 
 
-def get_run_number() -> int:
-    """Return next run number based on existing audit CSV row count."""
-    if not os.path.exists(AUDIT_CSV):
-        return 1
-    try:
-        df = pd.read_csv(AUDIT_CSV, usecols=["run_number"])
-        return int(df["run_number"].max()) + 1 if not df.empty else 1
-    except Exception:
-        return 1
+def is_prediction_time() -> bool:
+    """Check if current time is within the daily prediction window (UTC)."""
+    now_utc = datetime.now(pytz.UTC)
+    hour = now_utc.hour
+    minute = now_utc.minute
+    
+    # Prediction window: PREDICTION_HOUR_UTC to PREDICTION_HOUR_UTC + PREDICTION_WINDOW_MINUTES
+    if hour == PREDICTION_HOUR_UTC and minute < PREDICTION_WINDOW_MINUTES:
+        return True
+    return False
 
 
-def get_last_processed_id() -> int | None:
-    """Return the Supabase row id processed in the most recent audit entry."""
-    if not os.path.exists(AUDIT_CSV):
+def get_last_prediction_timestamp() -> str | None:
+    """Return timestamp of last successful prediction."""
+    if not os.path.exists(STATE_FILE):
         return None
     try:
-        df = pd.read_csv(AUDIT_CSV, usecols=["run_number", "supabase_row_id"])
-        if df.empty:
-            return None
-        return int(df.loc[df["run_number"].idxmax(), "supabase_row_id"])
+        with open(STATE_FILE, "r") as f:
+            state = json.load(f)
+            return state.get("last_prediction_timestamp")
     except Exception:
         return None
 
 
-def write_audit_row(row: dict, dry_run: bool = False) -> None:
-    """Append one row to the audit CSV, creating it with headers if needed."""
+def save_state(last_ingest_id: int | None = None, last_predict_ts: str | None = None) -> None:
+    """Persist ingestion and prediction state."""
     os.makedirs(SPEEDTEST_OUTPUT_DIR, exist_ok=True)
-    df = pd.DataFrame([{col: row.get(col, None) for col in AUDIT_COLUMNS}])
-
-    if dry_run:
-        log.info("[DRY RUN] Audit row:\n%s", df.to_string(index=False))
-        return
-
-    if not os.path.exists(AUDIT_CSV):
-        df.to_csv(AUDIT_CSV, index=False)
-        log.info("Created audit CSV: %s", AUDIT_CSV)
-    else:
-        df.to_csv(AUDIT_CSV, mode="a", header=False, index=False)
-        log.info("Appended audit row → run #%s  id=%s  tier=%s",
-                 row.get("run_number"), row.get("supabase_row_id"), row.get("risk_tier"))
-
-
-# ===========================================================================
-# AVAILABILITY TRACKING
-# ===========================================================================
-
-def get_availability_state() -> tuple[int, int]:
-    """
-    Read existing availability CSV and return
-    (cumulative uptime_ticks, cumulative total_ticks) across all sessions.
-    Returns (0, 0) if no CSV exists yet.
-    """
-    if not os.path.exists(AVAILABILITY_CSV):
-        return 0, 0
+    
+    # Read existing state
+    state = {}
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                state = json.load(f)
+        except Exception:
+            pass
+    
+    # Update
+    if last_ingest_id is not None:
+        state["last_ingested_id"] = last_ingest_id
+    if last_predict_ts is not None:
+        state["last_prediction_timestamp"] = last_predict_ts
+    
     try:
-        df = pd.read_csv(AVAILABILITY_CSV, usecols=["uptime_ticks", "total_ticks"])
-        if df.empty:
-            return 0, 0
-        last = df.iloc[-1]
-        return int(last["uptime_ticks"]), int(last["total_ticks"])
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        log.warning("Could not save state: %s", e)
+
+
+def get_last_ingested_id() -> int | None:
+    """Return highest row id ingested so far."""
+    if not os.path.exists(STATE_FILE):
+        return None
+    try:
+        with open(STATE_FILE, "r") as f:
+            state = json.load(f)
+            return state.get("last_ingested_id")
     except Exception:
-        return 0, 0
+        return None
 
 
-def write_availability_row(
-    tick_number: int,
-    status: str,          # "ACTIVE" | "SKIPPED" | "FAILED"
-    supabase_row_id,
-    uptime_ticks: int,
-    total_ticks: int,
-    dry_run: bool = False,
-) -> None:
-    """Append one availability row to the CSV."""
-    avail_pct = round((uptime_ticks / total_ticks) * 100, 4) if total_ticks > 0 else 0.0
-
-    row = {
-        "session_id":       _SESSION_ID,
-        "tick_number":      tick_number,
-        "tick_timestamp":   now_iso(),
-        "status":           status,
-        "supabase_row_id":  supabase_row_id,
-        "uptime_ticks":     uptime_ticks,
-        "total_ticks":      total_ticks,
-        "availability_pct": avail_pct,
-    }
-
-    df = pd.DataFrame([{col: row.get(col) for col in AVAIL_COLUMNS}])
-
-    if dry_run:
-        log.info(
-            "[DRY RUN] Availability → tick=%d  status=%s  Aₒ=%.2f%%",
-            tick_number, status, avail_pct
+def get_supabase():
+    global _supabase_client
+    if _supabase_client is not None:
+        return _supabase_client
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError(
+            f"Supabase credentials missing.\n"
+            f"  .env checked         : {_ENV_PATH}\n"
+            f"  SUPABASE_URL         : {'SET' if SUPABASE_URL else 'MISSING'}\n"
+            f"  SUPABASE_SERVICE_KEY : {'SET' if SUPABASE_KEY else 'MISSING'}\n"
         )
-        return
+    from supabase import create_client
+    _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _supabase_client
 
-    os.makedirs(SPEEDTEST_OUTPUT_DIR, exist_ok=True)
-    if not os.path.exists(AVAILABILITY_CSV):
-        df.to_csv(AVAILABILITY_CSV, index=False)
-        log.info("Created availability CSV: %s", AVAILABILITY_CSV)
-    else:
-        df.to_csv(AVAILABILITY_CSV, mode="a", header=False, index=False)
 
-    log.info(
-        "Availability → tick=%d  status=%-7s  Aₒ=%.2f%%  (%d/%d ticks)",
-        tick_number, status, avail_pct, uptime_ticks, total_ticks
-    )
+# ===========================================================================
+# SUPABASE FETCH
+# ===========================================================================
+
+def fetch_all_rows() -> list | None:
+    """Fetch ALL rows from Supabase ordered by id DESC."""
+    try:
+        supabase = get_supabase()
+        response = (
+            supabase.table(TABLE_ENV_DATA)
+            .select(_SELECT)
+            .order("id", desc=True)
+            .execute()
+        )
+    except Exception as exc:
+        log.error("Supabase fetch failed: %s", exc)
+        return None
+
+    rows = response.data or []
+    log.info("Fetched %d total row(s) from Supabase.", len(rows))
+    return rows
+
+
+def fetch_latest_row() -> list | None:
+    """Fetch only the latest row from Supabase (ordered by id DESC, limit=1)."""
+    try:
+        supabase = get_supabase()
+        response = (
+            supabase.table(TABLE_ENV_DATA)
+            .select(_SELECT)
+            .order("id", desc=True)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        log.error("Supabase fetch latest failed: %s", exc)
+        return None
+
+    rows = response.data or []
+    log.info("Fetched %d latest row(s) from Supabase.", len(rows))
+    return rows
 
 
 # ===========================================================================
@@ -462,59 +404,11 @@ def _calibrate_humidity(hw_rh) -> float:
     return round(HUMIDITY_PROXY_MIN + t * (HUMIDITY_PROXY_MAX - HUMIDITY_PROXY_MIN), 6)
 
 
-# ===========================================================================
-# STEP 1 — FETCH LATEST ROW ONLY
-# ===========================================================================
-
-def fetch_latest_row() -> dict | None:
-    """
-    Fetch the single most recent row from Supabase ordered by Date DESC,
-    Time DESC. Scans up to 50 rows to find the first one where Date,
-    Time, and Final Distance are all non-NULL.
-    Returns a raw dict or None.
-    """
-    try:
-        response = (
-            get_supabase()
-            .table(TABLE_ENV_DATA)
-            .select(_SELECT)
-            .order(COL_DATE, desc=True)
-            .order(COL_TIME, desc=True)
-            .limit(50)
-            .execute()
-        )
-    except Exception as exc:
-        log.error("Supabase fetch failed: %s", exc)
-        return None
-
-    rows = response.data or []
-    log.info("Fetched %d candidate row(s) from Supabase.", len(rows))
-
-    for row in rows:
-        if (
-            row.get(COL_DATE)     is not None
-            and row.get(COL_TIME)     is not None
-            and row.get(COL_DISTANCE) is not None
-        ):
-            log.info(
-                "Latest valid row → id=%s  Date=%s  Time=%s  Distance=%s",
-                row.get(COL_ID), row.get(COL_DATE),
-                row.get(COL_TIME), row.get(COL_DISTANCE),
-            )
-            return row
-
-    log.warning("No valid row found (all candidates have NULL Date/Time/Distance).")
-    return None
-
-
 def calibrate_row(row: dict) -> dict | None:
-    """
-    Calibrate a single raw Supabase row.
-    Returns dict with cal_ fields, or None if waterlevel is invalid.
-    """
+    """Calibrate a single row. Returns dict or None if invalid."""
     cal_wl = _calibrate_waterlevel(row.get(COL_DISTANCE))
     if cal_wl is None:
-        log.warning(
+        log.debug(
             "Row id=%s has invalid Final Distance (%s) — skipping.",
             row.get(COL_ID), row.get(COL_DISTANCE)
         )
@@ -527,16 +421,198 @@ def calibrate_row(row: dict) -> dict | None:
     }
 
 
-def append_to_sensor_csv(row: dict, cal: dict, dry_run: bool = False) -> None:
+def _row_timestamp_to_utc_iso(row: dict) -> str | None:
+    """Combine Date+Time from a Supabase row and return an ISO UTC timestamp.
+
+    Returns string like '2026-04-09T08:04:07Z' or None if parsing fails.
     """
-    Append the calibrated row to the running sensor CSV so that
-    feature engineering always has the full history available.
-    Uses midnight timestamp (daily granularity) to match model expectations.
+    date = row.get(COL_DATE)
+    time = row.get(COL_TIME)
+    if not date or not time:
+        return None
+    raw = f"{date}T{time}"
+    try:
+        ts = pd.to_datetime(raw, utc=False, errors="coerce")
+        if pd.isna(ts):
+            ts = pd.to_datetime(raw, utc=True, errors="coerce")
+        if pd.isna(ts):
+            return None
+
+        # If naive, localize to configured sensor timezone then convert to UTC
+        if ts.tzinfo is None:
+            try:
+                tz = pytz.timezone(SENSOR_TIMEZONE)
+                ts = tz.localize(ts)
+            except Exception:
+                # Fallback: assume UTC
+                ts = ts.replace(tzinfo=pytz.UTC)
+
+        ts_utc = ts.astimezone(pytz.UTC)
+        # Use Z format for readability and robust parsing later
+        return ts_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return None
+
+
+def get_availability_state() -> tuple[int, int]:
+    """Return cumulative (uptime_ticks, total_ticks) from availability CSV."""
+    if not os.path.exists(AVAILABILITY_CSV):
+        return 0, 0
+    try:
+        df = pd.read_csv(AVAILABILITY_CSV)
+        if df.empty:
+            return 0, 0
+        last = df.iloc[-1]
+        return int(last.get("uptime_ticks", 0)), int(last.get("total_ticks", 0))
+    except Exception:
+        return 0, 0
+
+
+def write_availability_row(status: str, supabase_row_id: int | None = None, dry_run: bool = False) -> None:
+    """Append one availability row to the availability CSV."""
+    uptime_prev, total_prev = get_availability_state()
+    total_ticks = total_prev + 1
+    uptime_ticks = uptime_prev + (1 if status == "ACTIVE" else 0)
+    avail_pct = round((uptime_ticks / total_ticks) * 100, 4) if total_ticks > 0 else 0.0
+
+    # session-local tick number
+    tick_number = 1
+    if os.path.exists(AVAILABILITY_CSV):
+        try:
+            df = pd.read_csv(AVAILABILITY_CSV)
+            tick_number = int(df[df["session_id"] == _SESSION_ID].shape[0]) + 1
+        except Exception:
+            tick_number = 1
+
+    row = {
+        "session_id":      _SESSION_ID,
+        "tick_number":     tick_number,
+        "tick_timestamp":  now_iso(),
+        "status":          status,
+        "supabase_row_id": supabase_row_id,
+        "uptime_ticks":    uptime_ticks,
+        "total_ticks":     total_ticks,
+        "availability_pct": avail_pct,
+    }
+
+    df_row = pd.DataFrame([row])
+    os.makedirs(SPEEDTEST_OUTPUT_DIR, exist_ok=True)
+    if not os.path.exists(AVAILABILITY_CSV):
+        df_row.to_csv(AVAILABILITY_CSV, index=False)
+    else:
+        df_row.to_csv(AVAILABILITY_CSV, mode="a", header=False, index=False)
+
+    log.info(
+        "Availability → tick=%d  status=%-7s  Aₒ=%.2f%%  (%d/%d ticks)",
+        tick_number, status, avail_pct, uptime_ticks, total_ticks
+    )
+
+
+def save_speedtest_prediction_row(pred: dict, sensor_timestamp: str | None = None, transmission_speed_s: float | None = None, dry_run: bool = False) -> None:
+    """Append a single prediction summary row to SPEEDTEST_PRED_CSV."""
+    row = {
+        "timestamp":            pred.get("timestamp"),
+        "flood_probability":    pred.get("probability"),
+        "risk_tier":            pred.get("tier"),
+        "watch_threshold":      pred.get("watch_threshold"),
+        "warning_threshold":    pred.get("warning_threshold"),
+        "danger_threshold":     pred.get("danger_threshold"),
+        "transmission_speed_s": transmission_speed_s,
+        "sensor_timestamp":     sensor_timestamp,
+        "prediction_created_at": pred.get("prediction_created_at"),
+        "row_created_at":       now_iso(),
+    }
+
+    df_row = pd.DataFrame([row])
+    os.makedirs(SPEEDTEST_OUTPUT_DIR, exist_ok=True)
+    if dry_run:
+        log.info("[DRY RUN] Would append to %s:\n%s", SPEEDTEST_PRED_CSV, df_row.to_string(index=False))
+        return
+
+    if not os.path.exists(SPEEDTEST_PRED_CSV):
+        df_row.to_csv(SPEEDTEST_PRED_CSV, index=False)
+    else:
+        df_row.to_csv(SPEEDTEST_PRED_CSV, mode="a", header=False, index=False)
+
+
+def sync_prediction_to_supabase(pred: dict, dry_run: bool = False) -> bool:
+    """Sync a single prediction to Supabase table `flood_predictions_speedtest`.
+
+    Returns True on success (or dry-run), False on failure.
     """
-    ts_str = f"{row[COL_DATE]}T00:00:00"
+    supabase = None
+    try:
+        supabase = get_supabase()
+    except Exception as e:
+        log.error("Supabase client unavailable: %s", e)
+        return False
+
+    # Use prediction_created_at (UTC ISO) if available
+    ts = pred.get("prediction_created_at") or pred.get("timestamp")
+    if not ts:
+        # fallback to now UTC
+        ts = datetime.now(pytz.UTC).isoformat()
+
+    record = {
+        "timestamp": ts,
+        "flood_probability": float(pred.get("probability", 0.0)),
+        "risk_tier": str(pred.get("tier", "")),
+    }
+
+    if dry_run:
+        log.info("[DRY RUN] Would upsert prediction to Supabase: %s", record)
+        return True
+
+    try:
+        # Use upsert on conflict timestamp to avoid unique constraint errors
+        res = supabase.table(SUPABASE_PRED_TABLE).upsert([record], on_conflict="timestamp").execute()
+        # supabase client returns .data on success
+        if getattr(res, "error", None):
+            log.error("Supabase upsert error: %s", res.error)
+            return False
+        log.info("Synced prediction to Supabase (timestamp=%s)", ts)
+        return True
+    except Exception as e:
+        log.error("Supabase upsert failed: %s", e)
+        return False
+
+
+def _append_ingestion_audit_single(run_number: int, rows_fetched: int, new_rows_found: int, new_rows_ingested: int, last_ingested_id: int | None, last_ingested_timestamp: str | None, dry_run: bool = False) -> None:
+    """Append a single ingestion audit row (used by realtime handler)."""
+    audit = {
+        "run_number": run_number,
+        "run_timestamp": now_iso(),
+        "rows_fetched": rows_fetched,
+        "new_rows_found": new_rows_found,
+        "new_rows_ingested": new_rows_ingested,
+        "last_ingested_id": last_ingested_id,
+        "last_ingested_timestamp": last_ingested_timestamp,
+        "ingestion_errors": new_rows_found - new_rows_ingested,
+    }
+    df = pd.DataFrame([audit])
+    os.makedirs(SPEEDTEST_OUTPUT_DIR, exist_ok=True)
+    if dry_run:
+        log.info("[DRY RUN] Would append ingestion audit:\n%s", df.to_string(index=False))
+        return
+    if not os.path.exists(INGESTION_AUDIT_CSV):
+        df.to_csv(INGESTION_AUDIT_CSV, index=False)
+    else:
+        df.to_csv(INGESTION_AUDIT_CSV, mode="a", header=False, index=False)
+
+
+def append_to_sensor_csv(row: dict, cal: dict, dry_run: bool = False) -> bool:
+    """
+    Append calibrated row to sensor CSV.
+    Returns True if appended, False if skipped.
+    """
+    # Normalize Date+Time to UTC ISO (Z) for robust parsing later
+    ts_iso = _row_timestamp_to_utc_iso(row)
+    if ts_iso is None:
+        log.debug("Could not parse timestamp for row id=%s — skipping.", row.get(COL_ID))
+        return False
 
     new_row = pd.DataFrame([{
-        "timestamp":      ts_str,
+        "timestamp":      ts_iso,
         "waterlevel":     cal["cal_waterlevel"],
         "soil_moisture":  cal["cal_soil_moisture"],
         "humidity":       cal["cal_humidity"],
@@ -544,27 +620,33 @@ def append_to_sensor_csv(row: dict, cal: dict, dry_run: bool = False) -> None:
     }])
 
     if dry_run:
-        log.info("[DRY RUN] Would append sensor row:\n%s", new_row.to_string(index=False))
-        return
+        log.info("[DRY RUN] Would append to sensor CSV:\n%s", new_row.to_string(index=False))
+        return True
 
     SENSOR_CSV.parent.mkdir(parents=True, exist_ok=True)
 
     if not SENSOR_CSV.exists():
         new_row.to_csv(SENSOR_CSV, index=False)
-        log.info("Created sensor CSV: %s", SENSOR_CSV)
-        return
+        log.debug("Created sensor CSV: %s", SENSOR_CSV)
+        return True
 
-    existing = pd.read_csv(SENSOR_CSV, usecols=["timestamp"])
-    if ts_str in existing["timestamp"].astype(str).values:
-        log.info("Sensor CSV already has row for %s — skipping append.", ts_str)
-        return
+    # Read existing timestamps and normalize them to UTC ISO for accurate dedupe
+    try:
+        existing = pd.read_csv(SENSOR_CSV, usecols=["timestamp"])['timestamp'].astype(str)
+        existing_norm = pd.to_datetime(existing, utc=True, errors='coerce').dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+        if ts_iso in existing_norm.values:
+            log.debug("Timestamp %s already in sensor CSV — skipping.", ts_iso)
+            return False
+    except Exception as e:
+        log.debug("Could not read existing sensor CSV timestamps (%s) — proceeding to append.", e)
 
     new_row.to_csv(SENSOR_CSV, mode="a", header=False, index=False)
-    log.info("Sensor CSV updated → %s", SENSOR_CSV)
+    log.debug("Appended to sensor CSV: %s", ts_iso)
+    return True
 
 
 # ===========================================================================
-# STEP 2 — PREDICTION
+# PREDICTION
 # ===========================================================================
 
 _model_cache = None
@@ -586,10 +668,8 @@ def load_model():
     warn_t       = artifact.get("warning_threshold", threshold + 0.10)
     LAST_TRAINING_DATE = artifact.get("last_training_date", LAST_TRAINING_DATE)
 
-    log.info("Model loaded  : %s", os.path.basename(MODEL_FILE))
-    log.info("  Version     : %s", artifact.get("version", "unknown"))
-    log.info("  Features    : %d", len(feature_cols))
-    log.info("  WATCH thr   : %.2f   WARNING thr : %.2f", watch_t, warn_t)
+    log.info("Model loaded: %s", os.path.basename(MODEL_FILE))
+    log.info("  Features: %d  WATCH: %.2f  WARNING: %.2f", len(feature_cols), watch_t, warn_t)
 
     _model_cache = (model, feature_cols, watch_t, warn_t)
     return _model_cache
@@ -633,10 +713,7 @@ def apply_consecutive_filter(results: pd.DataFrame, warn_t: float) -> pd.DataFra
 
 
 def run_prediction() -> dict | None:
-    """
-    Run XGBoost inference using the full sensor CSV history.
-    Returns prediction dict or None on failure.
-    """
+    """Run prediction on full sensor history. Returns dict or None."""
     from prepare_dataset import load_sensor
     from feature_engineering import build_features
 
@@ -694,137 +771,29 @@ def run_prediction() -> dict | None:
     latest      = results.iloc[-1]
     latest_tier = latest["risk_tier"]
     latest_prob = float(latest["flood_probability"])
-    pred_ts     = now_iso()
-    pred_epoch  = time.time()   # wall-clock at prediction completion
+    pred_ts     = datetime.now(pytz.UTC).isoformat()
+    pred_epoch  = time.time()
 
     log.info(
-        "Prediction → %s %s  (%.1f%%)",
-        RISK_TIERS[latest_tier]["emoji"], latest_tier, latest_prob * 100
+        "Prediction → %s %s  (%.1f%%)  on %d rows",
+        RISK_TIERS[latest_tier]["emoji"], latest_tier, latest_prob * 100, len(features)
     )
 
     return {
         "tier":                  latest_tier,
         "probability":           latest_prob,
-        "timestamp":             results.index[-1].strftime("%Y-%m-%d"),
+        "timestamp":             pred_ts,
         "prediction_created_at": pred_ts,
         "pred_epoch":            pred_epoch,
-        "results_df":            results,
+        "watch_threshold":       watch_t,
+        "warning_threshold":     warn_t,
+        "danger_threshold":      danger_t,
+        "rows_in_history":       len(features),
     }
 
 
-def save_predictions_csv(
-    results_df: pd.DataFrame,
-    transmission_speed_s: float | None = None,
-    sensor_timestamp: str | None = None,
-    prediction_created_at: str | None = None,
-    dry_run: bool = False,
-) -> None:
-    """
-    Persist prediction results to speedtest_predictions.csv.
-
-    The latest row gets transmission_speed_s, sensor_timestamp, and
-    prediction_created_at stamped in; historical rows keep whatever
-    values they already have (NaN if written by an older version).
-    """
-    if dry_run:
-        log.info(
-            "[DRY RUN] Would save predictions CSV  "
-            "(transmission_speed_s=%.3fs  sensor_ts=%s)",
-            transmission_speed_s or 0.0, sensor_timestamp
-        )
-        return
-
-    os.makedirs(SPEEDTEST_OUTPUT_DIR, exist_ok=True)
-    out = results_df.copy()
-    now = now_iso()
-    out["row_created_at"] = now
-
-    # Stamp speed columns only on the latest row (last index position)
-    out["transmission_speed_s"]  = None
-    out["sensor_timestamp"]       = None
-    out["prediction_created_at"]  = None
-    if len(out) > 0:
-        out.iloc[-1, out.columns.get_loc("transmission_speed_s")]  = (
-            round(transmission_speed_s, 4) if transmission_speed_s is not None else None
-        )
-        out.iloc[-1, out.columns.get_loc("sensor_timestamp")]       = sensor_timestamp
-        out.iloc[-1, out.columns.get_loc("prediction_created_at")]  = prediction_created_at
-
-    if os.path.exists(SPEEDTEST_CSV):
-        existing = pd.read_csv(
-            SPEEDTEST_CSV, parse_dates=["timestamp"], index_col="timestamp"
-        )
-        if existing.index.tzinfo is None:
-            existing.index = existing.index.tz_localize("UTC")
-        combined = pd.concat([existing, out])
-        combined = combined[~combined.index.duplicated(keep="last")].sort_index()
-    else:
-        combined = out
-
-    combined.index.name = "timestamp"
-    combined.to_csv(SPEEDTEST_CSV)
-    log.info(
-        "Predictions CSV saved → %s  (%d total rows)  speed=%.3fs",
-        SPEEDTEST_CSV, len(combined), transmission_speed_s or 0.0
-    )
-
-
 # ===========================================================================
-# STEP 3 — SUPABASE SYNC
-# ===========================================================================
-
-def sync_to_supabase(dry_run: bool = False) -> None:
-    sep(f"STEP 3 — Supabase Sync → {SUPABASE_PRED_TABLE}")
-
-    if not os.path.exists(SPEEDTEST_CSV):
-        log.warning("No predictions CSV — skipping Supabase sync.")
-        return
-
-    try:
-        df = pd.read_csv(SPEEDTEST_CSV)
-    except Exception as e:
-        log.error("Could not read predictions CSV: %s", e)
-        return
-
-    if df.empty:
-        log.warning("Predictions CSV is empty — nothing to sync.")
-        return
-
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-
-    records = [
-        {
-            "timestamp":         row["timestamp"].isoformat(),
-            "flood_probability": float(row["flood_probability"]),
-            "risk_tier":         str(row["risk_tier"]),
-            "row_created_at":    str(row.get("row_created_at", now_iso())),
-        }
-        for _, row in df.iterrows()
-    ]
-
-    log.info("Syncing %d record(s) to %s ...", len(records), SUPABASE_PRED_TABLE)
-
-    if dry_run:
-        log.info("[DRY RUN] Would upsert %d record(s).", len(records))
-        return
-
-    try:
-        sb    = get_supabase()
-        total = 0
-        for i in range(0, len(records), SUPABASE_BATCH_SIZE):
-            batch = records[i:i + SUPABASE_BATCH_SIZE]
-            sb.table(SUPABASE_PRED_TABLE).upsert(
-                batch, on_conflict="timestamp"
-            ).execute()
-            total += len(batch)
-            log.info("  Upserted batch %d / %d", total, len(records))
-        log.info("Supabase sync complete: %d row(s).", total)
-    except Exception as e:
-        log.error("Supabase sync failed: %s", e)
-
-
-# ===========================================================================
-# STEP 4 — FACEBOOK ALERT
+# FACEBOOK ALERT
 # ===========================================================================
 
 def _load_fb_last_posted():
@@ -832,7 +801,7 @@ def _load_fb_last_posted():
         if not os.path.exists(FB_STATE_PATH):
             return None
         with open(FB_STATE_PATH, "r") as f:
-            return json.load(f).get("last_posted_timestamp")
+            return json.load(f).get("last_posted_ts")
     except Exception:
         return None
 
@@ -840,10 +809,60 @@ def _load_fb_last_posted():
 def _save_fb_last_posted(timestamp: str) -> None:
     try:
         with open(FB_STATE_PATH, "w") as f:
-            json.dump({"last_posted_timestamp": timestamp}, f, indent=2)
-        log.info("FB state saved — last posted: %s", timestamp)
+            json.dump({"last_posted_ts": timestamp}, f)
     except Exception as e:
         log.warning("Could not save FB state: %s", e)
+
+
+def _mask_token(tok: str | None) -> str:
+    """Return a masked version of a token for safe logging."""
+    if not tok:
+        return "<missing>"
+    s = str(tok)
+    if len(s) <= 10:
+        return s[:4] + "..." + s[-2:]
+    return s[:6] + "..." + s[-4:]
+
+
+def fb_token_info(dry_run: bool = False) -> dict | None:
+    """Perform a lightweight token/info check against Graph API `/me`.
+
+    Returns parsed JSON on success, or a dict with `_raw` on non-JSON response.
+    Returns None if token missing or request fails.
+    """
+    if not FB_PAGE_TOKEN:
+        log.error("FB token missing — cannot run token diagnostics.")
+        return None
+
+    url = f"https://graph.facebook.com/{FB_API_VERSION}/me"
+    params = {"access_token": FB_PAGE_TOKEN, "fields": "id,name"}
+    if dry_run:
+        log.info("[DRY RUN] FB token diagnostics: GET %s params=%s", url, {"access_token": _mask_token(FB_PAGE_TOKEN), "fields": "id,name"})
+        return None
+
+    try:
+        res = requests.get(url, params=params, timeout=10)
+        try:
+            data = res.json()
+        except ValueError:
+            data = {"_raw": res.text, "status_code": res.status_code}
+
+        # Log token info at info/debug level for diagnostics
+        try:
+            if isinstance(data, dict) and data.get("error"):
+                log.error("FB token diagnostics failed: status=%s body=%s", res.status_code, data)
+            else:
+                log.info("FB token valid: status=%s body=%s", res.status_code, data)
+        except Exception:
+            log.debug("FB token diagnostics raw: %s", data)
+
+        return data
+    except requests.Timeout:
+        log.error("FB token diagnostics timed out")
+        return None
+    except Exception as e:
+        log.exception("FB token diagnostics failed: %s", e)
+        return None
 
 
 def send_fb_alert(
@@ -851,218 +870,387 @@ def send_fb_alert(
     probability: float,
     timestamp: str,
     dry_run: bool = False,
+    force: bool = False,
 ) -> bool:
-    sep("STEP 4 — Facebook Alert")
-
+    """Send daily alert to Facebook. Only post once per day per tier."""
     if not FB_PAGE_ID or not FB_PAGE_TOKEN:
-        log.warning(
-            "FB credentials missing — skipping.\n"
-            "  FB_PAGE_ID    : %s\n"
-            "  FB_PAGE_TOKEN : %s",
-            "SET" if FB_PAGE_ID else "MISSING",
-            "SET" if FB_PAGE_TOKEN else "MISSING",
+        log.error(
+            "FB credentials missing — skipping. FB_PAGE_ID=%s FB_PAGE_TOKEN=%s",
+            'SET' if FB_PAGE_ID else 'MISSING', 'SET' if FB_PAGE_TOKEN else 'MISSING'
         )
         return False
 
     last = _load_fb_last_posted()
-    if last and last == timestamp:
-        log.info("FB: already posted for %s — skipping.", timestamp)
+    today = datetime.now().strftime("%Y-%m-%d")
+    # Only post once per day unless forced
+    if not force and last and last.startswith(today):
+        log.info("FB: already posted today — skipping.")
         return True
+    if force:
+        log.info("FB: force post enabled — bypassing once-per-day guard")
 
     template = FB_TIER_MESSAGE.get(tier, FB_TIER_MESSAGE["WARNING"])
     message  = template.format(prob_pct=f"{probability:.1%}", timestamp=timestamp)
     url      = f"https://graph.facebook.com/{FB_API_VERSION}/{FB_PAGE_ID}/feed"
 
-    log.info("Posting %s alert (prob=%.1f%%, ts=%s) ...", tier, probability * 100, timestamp)
+    log.info("Posting daily %s alert to Facebook...", tier)
 
     if dry_run:
         log.info("[DRY RUN] Would post to Facebook:\n%s", message)
-        _save_fb_last_posted(timestamp)
+        _save_fb_last_posted(now_iso())
         return True
 
     try:
-        res  = requests.post(
-            url,
-            data={"message": message, "access_token": FB_PAGE_TOKEN},
-            timeout=15,
-        )
-        data = res.json()
-        if "id" in data:
-            log.info("FB post successful — post id: %s", data["id"])
-            _save_fb_last_posted(timestamp)
-            return True
-        else:
-            err = data.get("error", {})
-            log.error("FB API error: %s", err.get("message", data))
+        # Diagnostic: log masked token and a short preview of the message
+        log.debug("FB POST -> url=%s token=%s message_len=%d", url, _mask_token(FB_PAGE_TOKEN), len(message))
+
+        # Run token diagnostics once before posting (helps reveal common issues)
+        try:
+            token_info = fb_token_info(dry_run=dry_run)
+            if token_info is None and not dry_run:
+                log.debug("FB token diagnostics returned no data — continuing to post attempt")
+        except Exception:
+            log.debug("FB token diagnostics raised an exception; continuing to post")
+
+        payload = {"message": message, "access_token": FB_PAGE_TOKEN}
+        res = requests.post(url, data=payload, timeout=15)
+
+        # Response diagnostics: headers, status, raw body
+        try:
+            data = res.json()
+        except ValueError:
+            data = {"_raw": res.text, "status_code": res.status_code}
+
+        log.debug("FB response status=%s headers=%s", res.status_code, dict(res.headers))
+        log.debug("FB response body=%s", data)
+
+        # Graph API error handling: include trace id and full error object in logs
+        if res.status_code >= 400 or (isinstance(data, dict) and data.get("error")):
+            err = data.get("error") if isinstance(data, dict) else data
+            err_type = err.get("type") if isinstance(err, dict) else None
+            err_code = err.get("code") if isinstance(err, dict) else None
+            err_msg = err.get("message") if isinstance(err, dict) else str(err)
+            trace = res.headers.get("x-fb-trace-id") or res.headers.get("x-fb-debug") or "-"
+            log.error("FB API error status=%s type=%s code=%s trace=%s message=%s full=%s", res.status_code, err_type, err_code, trace, err_msg, err)
             return False
+
+        post_id = data.get("id") if isinstance(data, dict) else None
+        trace = res.headers.get("x-fb-trace-id") or "-"
+        log.info("FB post successful — post id: %s trace=%s", post_id or "<unknown>", trace)
+        _save_fb_last_posted(now_iso())
+        return True
     except requests.Timeout:
         log.error("FB request timed out.")
         return False
     except Exception as e:
-        log.error("FB unexpected error: %s", e)
+        log.exception("FB unexpected error: %s", e)
         return False
 
 
 # ===========================================================================
-# FULL PIPELINE — one tick
+# MAIN PIPELINE
 # ===========================================================================
 
 def run_once(
     run_number: int,
-    tick_number: int,
-    uptime_ticks: int,
-    total_ticks: int,
+    ingest_number: int,
+    force_predict: bool = False,
     dry_run: bool = False,
-) -> tuple[str, int | None]:
+    force_fb: bool = False,
+) -> tuple[int, bool]:
     """
-    Execute one full pipeline tick.
-
-    Returns
-    -------
-    (status, supabase_row_id) where status is 'ACTIVE', 'SKIPPED', or 'FAILED'.
+    Run one tick: ingest all new rows, optionally predict.
+    
+    Returns:
+        (new_rows_ingested, prediction_ran)
     """
     tick_start = time.time()
     run_ts     = now_iso()
 
-    sep(f"SPEED TEST PIPELINE  [Run #{run_number}  |  {run_ts}]")
-    print(f"  Sensor CSV   : {SENSOR_CSV}")
-    print(f"  Predictions  : {SPEEDTEST_CSV}")
-    print(f"  Audit CSV    : {AUDIT_CSV}")
-    print(f"  Dry run      : {dry_run}")
+    sep(f"TICK #{run_number}  |  {run_ts}")
 
     # ------------------------------------------------------------------
-    # STEP 1 — Fetch latest row from Supabase
+    # PHASE 1: REAL-TIME INGESTION
     # ------------------------------------------------------------------
-    sep("STEP 1 — Fetch Latest Sensor Row")
+    sep("PHASE 1 — Real-time Ingestion")
 
-    latest_row = fetch_latest_row()
+    all_rows = fetch_latest_row()
+    if all_rows is None:
+        log.error("Fetch failed")
+        return 0, False
 
-    if latest_row is None:
-        log.warning("No valid sensor row found — skipping tick entirely.")
-        return "FAILED", None
+    # Provide a richer scan summary: fetched count, id range, last ingested id,
+    # number of new rows, id range for new rows, missing timestamps in new rows,
+    # and a sample newest/oldest timestamp (UTC) to help debugging.
+    total_fetched = len(all_rows)
+    if total_fetched == 0:
+        log.info("Scanned Supabase: 0 rows returned.")
+        last_ingest_id = get_last_ingested_id()
+        new_rows = []
+    else:
+        try:
+            fetched_high = all_rows[0].get(COL_ID) or "<none>"
+            fetched_low = all_rows[-1].get(COL_ID) or "<none>"
+        except Exception:
+            fetched_high = fetched_low = "<err>"
 
-    row_id = latest_row.get(COL_ID)
+        last_ingest_id = get_last_ingested_id()
+        if last_ingest_id is None:
+            new_rows = all_rows
+        else:
+            new_rows = [r for r in all_rows if (r.get(COL_ID) or 0) > (last_ingest_id or 0)]
 
-    # Skip if already processed
-    last_processed_id = get_last_processed_id()
-    if last_processed_id is not None and row_id == last_processed_id:
+        new_count = len(new_rows)
+        if new_count:
+            try:
+                new_high = new_rows[0].get(COL_ID) or "<none>"
+                new_low = new_rows[-1].get(COL_ID) or "<none>"
+            except Exception:
+                new_high = new_low = "<err>"
+        else:
+            new_high = new_low = "-"
+
+        def _sample_ts(r):
+            try:
+                return _row_timestamp_to_utc_iso(r) or "<no-ts>"
+            except Exception:
+                return "<err>"
+
+        sample_newest_ts = _sample_ts(all_rows[0])
+        sample_oldest_ts = _sample_ts(all_rows[-1])
+        missing_ts_in_new = sum(1 for r in new_rows if not r.get(COL_DATE) or not r.get(COL_TIME))
+
         log.info(
-            "Row id=%s already processed in a previous run — skipping tick entirely.",
-            row_id
+            "Scanned Supabase: fetched=%d ids=%s..%s last_ingest_id=%s new=%d ids=%s..%s missing_ts_in_new=%d newest_ts=%s oldest_ts=%s",
+            total_fetched, fetched_low, fetched_high, last_ingest_id, new_count, new_low, new_high, missing_ts_in_new, sample_newest_ts, sample_oldest_ts
         )
-        return "SKIPPED", row_id
 
-    supabase_saved_at = f"{latest_row.get(COL_DATE)} {latest_row.get(COL_TIME)}"
-    log.info("New row detected → id=%s  saved_at=%s", row_id, supabase_saved_at)
+    # Ingest new rows
+    new_ingested = 0
+    last_row_data = None
 
-    # Wall-clock at the moment the sensor timestamp was confirmed as new.
-    # Used as the "transmission start" reference for latency calculation.
-    sensor_epoch = time.time()
+    for row in new_rows:
+        row_id = row.get(COL_ID)
+        
+        # Calibrate
+        cal = calibrate_row(row)
+        if cal is None:
+            log.debug("Row id=%s calibration failed", row_id)
+            continue
+        
+        # Append to sensor CSV
+        if append_to_sensor_csv(row, cal, dry_run=dry_run):
+            new_ingested += 1
+            last_row_data = {
+                "row_id": row_id,
+                "date": row.get(COL_DATE),
+                "time": row.get(COL_TIME),
+                "cal": cal,
+            }
 
-    # ------------------------------------------------------------------
-    # STEP 1b — Calibrate
-    # ------------------------------------------------------------------
-    cal = calibrate_row(latest_row)
-    if cal is None:
-        log.warning("Calibration failed — skipping tick entirely.")
-        return "FAILED", row_id
+    if new_ingested > 0:
+        log.info("✅ Ingested %d new row(s)", new_ingested)
+        if not dry_run:
+            save_state(last_ingest_id=last_row_data["row_id"])
 
-    log.info(
-        "Calibrated → waterlevel=%.6f  soil=%.6f  humidity=%.6f",
-        cal["cal_waterlevel"], cal["cal_soil_moisture"], cal["cal_humidity"]
-    )
-
-    # Append calibrated row to sensor CSV for feature engineering
-    append_to_sensor_csv(latest_row, cal, dry_run=dry_run)
-
-    # ------------------------------------------------------------------
-    # STEP 2 — Predict
-    # ------------------------------------------------------------------
-    sep("STEP 2 — XGBoost Prediction")
-
-    prediction = run_prediction()
-
-    if prediction is None:
-        log.warning("Prediction failed — skipping tick entirely.")
-        return "FAILED", row_id
-
-    # Latency: sensor timestamp confirmed → prediction produced
-    transmission_speed_s = round(prediction["pred_epoch"] - sensor_epoch, 4)
-    log.info("Transmission speed (sensor→prediction) : %.4fs", transmission_speed_s)
-
-    save_predictions_csv(
-        prediction["results_df"],
-        transmission_speed_s=transmission_speed_s,
-        sensor_timestamp=supabase_saved_at,
-        prediction_created_at=prediction["prediction_created_at"],
-        dry_run=dry_run,
-    )
-
-    # ------------------------------------------------------------------
-    # STEP 3 — Supabase sync
-    # ------------------------------------------------------------------
-    sync_to_supabase(dry_run=dry_run)
-
-    # ------------------------------------------------------------------
-    # STEP 4 — Facebook alert
-    # ------------------------------------------------------------------
-    fb_posted = send_fb_alert(
-        tier=prediction["tier"],
-        probability=prediction["probability"],
-        timestamp=prediction["timestamp"],
-        dry_run=dry_run,
-    )
+    # Write ingestion audit
+    if not dry_run:
+        ingestion_audit = {
+            "run_number": run_number,
+            "run_timestamp": run_ts,
+            "rows_fetched": len(all_rows),
+            "new_rows_found": len(new_rows),
+            "new_rows_ingested": new_ingested,
+            "last_ingested_id": last_row_data["row_id"] if last_row_data else None,
+            "last_ingested_timestamp": (
+                f"{last_row_data['date']} {last_row_data['time']}"
+                if last_row_data else None
+            ),
+            "ingestion_errors": len(new_rows) - new_ingested,
+        }
+        os.makedirs(SPEEDTEST_OUTPUT_DIR, exist_ok=True)
+        audit_df = pd.DataFrame([ingestion_audit])
+        if not os.path.exists(INGESTION_AUDIT_CSV):
+            audit_df.to_csv(INGESTION_AUDIT_CSV, index=False)
+        else:
+            audit_df.to_csv(INGESTION_AUDIT_CSV, mode="a", header=False, index=False)
+        log.info("Ingestion audit recorded")
 
     # ------------------------------------------------------------------
-    # STEP 5 — Write audit row
+    # PHASE 2: DAILY PREDICTION (once per day, within window)
     # ------------------------------------------------------------------
-    sep("STEP 5 — Audit CSV")
+    prediction_ran = False
 
-    audit_row = {
-        "run_number":            run_number,
-        "run_timestamp":         run_ts,
-        "supabase_row_id":       row_id,
-        "supabase_saved_at":     supabase_saved_at,
-        "cal_waterlevel":        cal["cal_waterlevel"],
-        "cal_soil_moisture":     cal["cal_soil_moisture"],
-        "cal_humidity":          cal["cal_humidity"],
-        "flood_probability":     prediction["probability"],
-        "risk_tier":             prediction["tier"],
-        "prediction_created_at": prediction["prediction_created_at"],
-        "fb_posted":             fb_posted,
-    }
+    # Decide whether to run daily prediction.
+    # Run if forced, in the UTC prediction window, or if we've just ingested rows
+    # that belong to a new UTC date compared to the last prediction.
+    sep_flag = False
+    last_pred_ts_raw = get_last_prediction_timestamp()
+    last_pred_date = None
+    if last_pred_ts_raw:
+        try:
+            parsed = pd.to_datetime(last_pred_ts_raw, utc=True, errors="coerce")
+            if not pd.isna(parsed):
+                last_pred_date = parsed.strftime("%Y-%m-%d")
+            else:
+                # Fallback: assume stored value may already be a date string
+                last_pred_date = str(last_pred_ts_raw)[:10]
+        except Exception:
+            last_pred_date = str(last_pred_ts_raw)[:10]
 
-    write_audit_row(audit_row, dry_run=dry_run)
+    should_predict = False
+    if force_predict:
+        should_predict = True
+    elif is_prediction_time():
+        should_predict = True
+    else:
+        # If we ingested new rows, check whether the latest ingested row has a
+        # different UTC date than the last prediction — if so, run prediction now.
+        if new_ingested > 0 and last_row_data:
+            tmp_row = {COL_DATE: last_row_data.get("date"), COL_TIME: last_row_data.get("time")}
+            last_row_iso = _row_timestamp_to_utc_iso(tmp_row)
+            last_row_date_utc = None
+            if last_row_iso:
+                try:
+                    last_row_date_utc = pd.to_datetime(last_row_iso, utc=True).strftime("%Y-%m-%d")
+                except Exception:
+                    last_row_date_utc = str(last_row_iso)[:10]
+            # Run prediction if last prediction date is missing or different
+            if last_row_date_utc and last_row_date_utc != last_pred_date:
+                should_predict = True
 
-    # ------------------------------------------------------------------
-    # Tick summary
-    # ------------------------------------------------------------------
+    if should_predict:
+        sep("PHASE 2 — Daily Prediction")
+        sep_flag = True
+        # Double-check: avoid duplicate prediction for the same UTC date
+        if last_pred_date and new_ingested > 0 and last_row_data:
+            try:
+                tmp_row = {COL_DATE: last_row_data.get("date"), COL_TIME: last_row_data.get("time")}
+                last_row_iso = _row_timestamp_to_utc_iso(tmp_row)
+                last_row_date_utc = pd.to_datetime(last_row_iso, utc=True).strftime("%Y-%m-%d") if last_row_iso else None
+                if last_row_date_utc and last_row_date_utc == last_pred_date and not force_predict:
+                    log.info("Already predicted for UTC date %s — skipping.", last_pred_date)
+                    should_predict = False
+            except Exception:
+                pass
+
+    if should_predict:
+        log.info("Running daily prediction on accumulated history...")
+        prediction = run_prediction()
+
+        if prediction is None:
+            log.error("Prediction failed")
+        else:
+            prediction_ran = True
+            tier = prediction["tier"]
+            prob = prediction["probability"]
+
+            # Compute sensor timestamp and transmission speed (if possible)
+            sensor_iso = None
+            transmission_speed_s = None
+            if last_row_data:
+                try:
+                    sensor_iso = _row_timestamp_to_utc_iso({COL_DATE: last_row_data.get("date"), COL_TIME: last_row_data.get("time")})
+                    if sensor_iso:
+                        sensor_dt = pd.to_datetime(sensor_iso, utc=True)
+                        pred_dt = pd.to_datetime(prediction.get("prediction_created_at"), utc=True)
+                        transmission_speed_s = (pred_dt.timestamp() - sensor_dt.timestamp())
+                except Exception:
+                    sensor_iso = None
+                    transmission_speed_s = None
+
+            # Save summary prediction to speedtest_predictions.csv
+            try:
+                save_speedtest_prediction_row(prediction, sensor_timestamp=sensor_iso, transmission_speed_s=transmission_speed_s, dry_run=dry_run)
+                # Also sync to Supabase
+                try:
+                    sync_prediction_to_supabase(prediction, dry_run=dry_run)
+                except Exception as e:
+                    log.debug("Could not sync prediction to Supabase: %s", e)
+            except Exception as e:
+                log.debug("Could not save speedtest prediction row: %s", e)
+
+            # Send alert
+            fb_posted = send_fb_alert(
+                tier=tier,
+                probability=prob,
+                timestamp=prediction["timestamp"],
+                dry_run=dry_run,
+                force=force_fb,
+            )
+
+            # Write prediction audit
+            if not dry_run:
+                pred_audit = {
+                    "prediction_number": ingest_number,
+                    "prediction_timestamp": prediction["timestamp"],
+                    "rows_in_history": prediction["rows_in_history"],
+                    "flood_probability": prob,
+                    "risk_tier": tier,
+                    "watch_threshold": prediction.get("watch_threshold"),
+                    "warning_threshold": prediction.get("warning_threshold"),
+                    "danger_threshold": prediction.get("danger_threshold"),
+                    "fb_posted": fb_posted,
+                    "prediction_created_at": prediction["prediction_created_at"],
+                }
+                os.makedirs(SPEEDTEST_OUTPUT_DIR, exist_ok=True)
+                pred_df = pd.DataFrame([pred_audit])
+                if not os.path.exists(PREDICTION_AUDIT_CSV):
+                    pred_df.to_csv(PREDICTION_AUDIT_CSV, index=False)
+                else:
+                    pred_df.to_csv(PREDICTION_AUDIT_CSV, mode="a", header=False, index=False)
+                # Update state with UTC date only
+                try:
+                    save_state(last_predict_ts=datetime.now(pytz.UTC).strftime("%Y-%m-%d"))
+                except Exception:
+                    save_state(last_predict_ts=prediction.get("prediction_created_at", ""))
+
+            # Summary
+            sep("PREDICTION RESULT")
+            print(f"  {RISK_TIERS[tier]['emoji']}  {tier}")
+            print(f"  Probability: {prob:.1%}")
+            print(f"  History rows: {prediction['rows_in_history']}")
+            print(f"  FB posted: {fb_posted}")
+
     elapsed = time.time() - tick_start
-    tier    = prediction["tier"]
+
+    # Determine availability status for this tick
+    try:
+        if all_rows is None:
+            status = "FAILED"
+        elif new_ingested > 0:
+            # If prediction was requested this tick, require successful prediction
+            if 'should_predict' in locals() and should_predict:
+                status = "ACTIVE" if prediction_ran else "FAILED"
+            else:
+                status = "ACTIVE"
+        else:
+            status = "SKIPPED"
+    except Exception:
+        status = "FAILED"
+
+    supabase_row_id = last_row_data["row_id"] if last_row_data else None
+    try:
+        write_availability_row(status=status, supabase_row_id=supabase_row_id, dry_run=dry_run)
+    except Exception as e:
+        log.debug("Could not write availability row: %s", e)
+
     sep("TICK COMPLETE")
-    print(f"  {RISK_TIERS[tier]['emoji']}  {tier:<8}  prob={prediction['probability']:.1%}  ts={prediction['timestamp']}")
-    print(f"  Supabase row id      : {row_id}")
-    print(f"  Supabase saved at    : {supabase_saved_at}")
-    print(f"  cal_waterlevel       : {cal['cal_waterlevel']}")
-    print(f"  cal_soil_moisture    : {cal['cal_soil_moisture']}")
-    print(f"  cal_humidity         : {cal['cal_humidity']}")
-    print(f"  Prediction created   : {prediction['prediction_created_at']}")
-    print(f"  Transmission speed   : {transmission_speed_s:.4f}s  (sensor→prediction)")
-    print(f"  FB posted            : {fb_posted}")
-    print(f"  Elapsed              : {elapsed:.2f}s")
-    print(f"  Audit CSV            : {AUDIT_CSV}")
+    print(f"  New rows ingested: {new_ingested}")
+    print(f"  Prediction ran: {prediction_ran}")
+    print(f"  Elapsed: {elapsed:.2f}s")
     sep()
 
-    return "ACTIVE", row_id
+    return new_ingested, prediction_ran
 
 
 # ===========================================================================
-# MAIN
+# CLI
 # ===========================================================================
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Flood EWS Speed Test v2 — Full Pipeline Runner with Availability Tracking"
+        description="Real-time Ingestion + Daily Prediction Pipeline"
     )
     parser.add_argument(
         "--interval", type=int, default=30,
@@ -1070,107 +1258,251 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--once", action="store_true",
-        help="Run pipeline exactly once and exit"
+        help="Run once and exit"
+    )
+    parser.add_argument(
+        "--force-predict", action="store_true",
+        help="Force daily prediction now (ignore time window)"
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="Preview all steps without writing to disk, Supabase, or Facebook"
+        help="Preview only, no writes"
+    )
+    parser.add_argument(
+        "--realtime", action="store_true",
+        help="Run a realtime listener that ingests on new INSERTs"
+    )
+    parser.add_argument(
+        "--predict-on-insert", action="store_true",
+        help="If set with --realtime, run prediction on every new INSERT (expensive)"
+    )
+    parser.add_argument(
+        "--realtime-interval", type=int, default=5,
+        help="Polling interval in seconds when realtime subscription unavailable (default: 5)"
+    )
+    parser.add_argument(
+        "--test-fb", action="store_true",
+        help="Test Facebook posting once and exit (respect --dry-run)"
+    )
+    parser.add_argument(
+        "--fb-debug", action="store_true",
+        help="Run FB token diagnostics and a verbose test post (respect --dry-run)"
+    )
+    parser.add_argument(
+        "--force-fb", action="store_true",
+        help="Ignore once-per-day FB guard and post every prediction"
     )
     args = parser.parse_args()
 
-    print(f"\n  🚀  Speed test runner v2 starting — interval={args.interval}s")
-    print(f"  📂  Model        : {MODEL_FILE}")
-    print(f"  📊  Sensor CSV   : {SENSOR_CSV}")
-    print(f"  💾  Output CSV   : {SPEEDTEST_CSV}")
-    print(f"  📋  Audit CSV    : {AUDIT_CSV}")
-    print(f"  📈  Avail CSV    : {AVAILABILITY_CSV}")
-    print(f"  🗄️   Supabase src : {TABLE_ENV_DATA}")
-    print(f"  🗄️   Supabase dst : {SUPABASE_PRED_TABLE}")
-    print(f"  📘  FB Page ID   : {FB_PAGE_ID or 'MISSING'}")
+    print(f"\n  🚀  Real-time Ingestion + Daily Prediction Pipeline")
+    print(f"  📂  Sensor CSV   : {SENSOR_CSV}")
+    print(f"  📋  Ingestion    : {INGESTION_AUDIT_CSV}")
+    print(f"  📊  Predictions  : {PREDICTION_AUDIT_CSV}")
+    print(f"  ⏰  Predict time : {PREDICTION_HOUR_UTC:02d}:00–{PREDICTION_HOUR_UTC:02d}:{PREDICTION_WINDOW_MINUTES:02d} UTC")
     print(f"  🔑  Session ID   : {_SESSION_ID}")
     print(f"  Press Ctrl+C to stop.\n")
 
-    # ------------------------------------------------------------------
-    # --once mode
-    # ------------------------------------------------------------------
-    if args.once:
-        run_number = get_run_number()
-        uptime_ticks, total_ticks = get_availability_state()
-        total_ticks += 1
-
-        status, row_id = run_once(
-            run_number=run_number,
-            tick_number=total_ticks,
-            uptime_ticks=uptime_ticks,
-            total_ticks=total_ticks,
-            dry_run=args.dry_run,
-        )
-
-        if status == "ACTIVE":
-            uptime_ticks += 1
-
-        write_availability_row(
-            tick_number=total_ticks,
-            status=status,
-            supabase_row_id=row_id,
-            uptime_ticks=uptime_ticks,
-            total_ticks=total_ticks,
-            dry_run=args.dry_run,
-        )
-
-        live_ao = round(uptime_ticks / total_ticks * 100, 2) if total_ticks > 0 else 0.0
-        print(f"\n  📊  Final Availability (Aₒ) : {live_ao}%  ({uptime_ticks} active / {total_ticks} total ticks)")
+    # If the user requested a Facebook test, run it now and exit.
+    if args.test_fb:
+        print(f"\n  🔎  Testing Facebook posting (dry_run={args.dry_run})...")
+        ok = send_fb_alert(tier="WARNING", probability=0.5, timestamp=now_iso(), dry_run=args.dry_run, force=(args.force_fb or ALWAYS_POST_FB))
+        print(f"\n  Facebook test result: {'OK' if ok else 'FAILED'}\n")
         sys.exit(0)
 
-    # ------------------------------------------------------------------
-    # Continuous loop mode
-    # ------------------------------------------------------------------
-    run_number = get_run_number()
-    uptime_ticks, total_ticks = get_availability_state()
+    if args.fb_debug:
+        print(f"\n  🐞  Running Facebook diagnostics (dry_run={args.dry_run})...")
+        # Run token diagnostics first
+        info = fb_token_info(dry_run=args.dry_run)
+        print("\n  FB token diagnostics result (check logs for full details):")
+        print(f"    token_present = {'yes' if FB_PAGE_TOKEN else 'no'}")
+        if info is not None:
+            print(f"    token_info = {info}")
+        else:
+            print("    token_info = <none or dry-run>")
+
+        # Attempt a verbose test post (respects --dry-run)
+        ok = send_fb_alert(tier="WARNING", probability=0.5, timestamp=now_iso(), dry_run=args.dry_run, force=(args.force_fb or ALWAYS_POST_FB))
+        print(f"\n  Facebook post attempt result: {'OK' if ok else 'FAILED'}\n")
+        sys.exit(0)
+
+    if args.once:
+        run_number = 1
+        ingest_number = 1
+        new_rows, pred_ran = run_once(
+            run_number=run_number,
+            ingest_number=ingest_number,
+            force_predict=args.force_predict,
+            dry_run=args.dry_run,
+            force_fb=(args.force_fb or ALWAYS_POST_FB),
+        )
+        print(f"\n  Result: {new_rows} rows ingested, prediction={'RAN' if pred_ran else 'SKIPPED'}\n")
+        sys.exit(0)
+
+    # Continuous loop
+    run_number = 1
+    ingest_number = 1
+    # If realtime mode requested, start realtime listener instead of polling loop
+    if args.realtime:
+        def start_realtime_listener(poll_interval: int = 5, dry_run: bool = False, predict_on_insert: bool = False):
+            supabase = get_supabase()
+
+            def handle_payload(payload):
+                # normalize different payload shapes from client
+                new = None
+                if isinstance(payload, dict):
+                    new = payload.get("new") or payload.get("record")
+                    if new is None:
+                        payload_inner = payload.get("payload")
+                        if isinstance(payload_inner, dict):
+                            new = payload_inner.get("new") or payload_inner.get("record")
+
+                if not new:
+                    log.debug("Realtime payload without record: %s", payload)
+                    return
+
+                row_id = new.get(COL_ID)
+                log.info("Realtime INSERT id=%s", row_id)
+
+                # Calibrate
+                cal = calibrate_row(new)
+                if cal is None:
+                    log.debug("Realtime row id=%s calibration failed", row_id)
+                    write_availability_row("FAILED", supabase_row_id=row_id, dry_run=dry_run)
+                    _append_ingestion_audit_single(run_number=1, rows_fetched=1, new_rows_found=1, new_rows_ingested=0, last_ingested_id=None, last_ingested_timestamp=None, dry_run=dry_run)
+                    return
+
+                appended = append_to_sensor_csv(new, cal, dry_run=dry_run)
+                if appended and not dry_run:
+                    try:
+                        save_state(last_ingest_id=row_id)
+                    except Exception:
+                        pass
+
+                # Optionally run prediction on every insert
+                pred_ok = False
+                if predict_on_insert:
+                    pred = run_prediction()
+                    if pred is not None:
+                        pred_ok = True
+                        # compute sensor ts and speed
+                        sensor_iso = _row_timestamp_to_utc_iso(new)
+                        transmission_speed_s = None
+                        try:
+                            if sensor_iso:
+                                sensor_dt = pd.to_datetime(sensor_iso, utc=True)
+                                pred_dt = pd.to_datetime(pred.get("prediction_created_at"), utc=True)
+                                transmission_speed_s = pred_dt.timestamp() - sensor_dt.timestamp()
+                        except Exception:
+                            transmission_speed_s = None
+                        try:
+                            save_speedtest_prediction_row(pred, sensor_timestamp=sensor_iso, transmission_speed_s=transmission_speed_s, dry_run=dry_run)
+                        except Exception as e:
+                            log.debug("Could not save realtime prediction row: %s", e)
+                        try:
+                            sync_prediction_to_supabase(pred, dry_run=dry_run)
+                        except Exception as e:
+                            log.debug("Could not sync realtime prediction to Supabase: %s", e)
+                        # Attempt to post realtime prediction to Facebook (if configured)
+                        try:
+                            fb_ok = send_fb_alert(
+                                tier=pred.get("tier"),
+                                probability=pred.get("probability"),
+                                timestamp=pred.get("prediction_created_at") or pred.get("timestamp"),
+                                dry_run=dry_run,
+                                force=(predict_on_insert and (args.force_fb or ALWAYS_POST_FB)),
+                            )
+                            log.info("Realtime FB post attempted: %s", "posted" if fb_ok else "not-posted")
+                            if not fb_ok:
+                                log.debug("Realtime FB post returned False — check FB credentials / token or use --fb-debug for diagnostics")
+                        except Exception as e:
+                            log.exception("Realtime FB post failed: %s", e)
+
+                # Ingestion audit for this single insert
+                try:
+                    _append_ingestion_audit_single(run_number=1, rows_fetched=1, new_rows_found=1, new_rows_ingested=1 if appended else 0, last_ingested_id=row_id if appended else None, last_ingested_timestamp=(f"{new.get(COL_DATE)} {new.get(COL_TIME)}" if appended else None), dry_run=dry_run)
+                except Exception:
+                    pass
+
+                # Availability
+                status = "ACTIVE" if appended and (not predict_on_insert or pred_ok) else ("SKIPPED" if not appended else "FAILED")
+                try:
+                    write_availability_row(status=status, supabase_row_id=row_id, dry_run=dry_run)
+                except Exception as e:
+                    log.debug("Could not write realtime availability row: %s", e)
+
+            # Try realtime subscribe first
+            try:
+                log.info("Starting Supabase realtime listener on table '%s'...", TABLE_ENV_DATA)
+                supabase.from_(TABLE_ENV_DATA).on("INSERT", lambda payload: handle_payload(payload)).subscribe()
+                # keep process alive
+                while True:
+                    time.sleep(poll_interval)
+            except Exception as e:
+                log.warning("Realtime subscribe failed (%s). Falling back to polling every %ds", e, poll_interval)
+                # Fallback polling loop
+                last_seen = get_last_ingested_id() or 0
+                try:
+                    while True:
+                        rows = fetch_latest_row() or []
+                        total_fetched = len(rows)
+                        if total_fetched == 0:
+                            log.debug("Realtime poll: 0 rows returned from Supabase.")
+                            new_rows = []
+                        else:
+                            try:
+                                fetched_high = rows[0].get(COL_ID) or "<none>"
+                                fetched_low = rows[-1].get(COL_ID) or "<none>"
+                            except Exception:
+                                fetched_high = fetched_low = "<err>"
+                            new_rows = [r for r in rows if (r.get(COL_ID) or 0) > (last_seen or 0)]
+                            new_count = len(new_rows)
+                            if new_count:
+                                try:
+                                    new_high = new_rows[0].get(COL_ID) or "<none>"
+                                    new_low = new_rows[-1].get(COL_ID) or "<none>"
+                                except Exception:
+                                    new_high = new_low = "<err>"
+                            else:
+                                new_high = new_low = "-"
+                            log.info(
+                                "Realtime poll: fetched=%d ids=%s..%s last_seen=%s new=%d ids=%s..%s",
+                                total_fetched, fetched_low, fetched_high, last_seen, new_count, new_low, new_high
+                            )
+
+                        if new_rows:
+                            # process oldest-first
+                            for r in reversed(new_rows):
+                                handle_payload({"new": r})
+                                last_seen = max(last_seen, r.get(COL_ID) or last_seen)
+                        time.sleep(poll_interval)
+                except KeyboardInterrupt:
+                    log.info("Realtime polling stopped by user.")
+
+        # Start realtime listener (blocking)
+        start_realtime_listener(poll_interval=args.realtime_interval, dry_run=args.dry_run, predict_on_insert=args.predict_on_insert)
+        sys.exit(0)
 
     while True:
-        total_ticks += 1
-        live_ao_display = (
-            f"{round(uptime_ticks / (total_ticks - 1) * 100, 2)}%"
-            if total_ticks > 1 else "—"
-        )
-
-        print(f"\n{'─'*60}")
-        print(f"  RUN #{run_number}  |  {now_iso()}  |  Aₒ so far: {live_ao_display}")
-        print(f"{'─'*60}")
-
-        status = "FAILED"
-        row_id = None
+        print(f"\n{'─'*70}")
+        print(f"  RUN #{run_number}  |  {now_iso()}")
+        print(f"{'─'*70}")
 
         try:
-            status, row_id = run_once(
+            new_rows, pred_ran = run_once(
                 run_number=run_number,
-                tick_number=total_ticks,
-                uptime_ticks=uptime_ticks,
-                total_ticks=total_ticks,
+                ingest_number=ingest_number,
+                force_predict=args.force_predict,
                 dry_run=args.dry_run,
+                force_fb=(args.force_fb or ALWAYS_POST_FB),
             )
+            if new_rows > 0 or pred_ran:
+                ingest_number += 1
+            run_number += 1
         except KeyboardInterrupt:
             print("\n  Stopped by user.")
             sys.exit(0)
         except Exception as exc:
-            log.error("Unhandled error in pipeline: %s", exc, exc_info=True)
-
-        if status == "ACTIVE":
-            uptime_ticks += 1
-            run_number   += 1
-
-        write_availability_row(
-            tick_number=total_ticks,
-            status=status,
-            supabase_row_id=row_id,
-            uptime_ticks=uptime_ticks,
-            total_ticks=total_ticks,
-            dry_run=args.dry_run,
-        )
-
-        live_ao = round(uptime_ticks / total_ticks * 100, 2)
-        print(f"\n  📊  Live Availability (Aₒ) : {live_ao}%  ({uptime_ticks} active / {total_ticks} total ticks)")
+            log.error("Unhandled error: %s", exc, exc_info=True)
 
         try:
             countdown(args.interval, label="Next run in")
