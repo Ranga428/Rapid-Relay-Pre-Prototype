@@ -11,10 +11,10 @@ Runs the full pipeline in order, all incremental:
     Step 0a  sensor_ingest.py         — pull new hardware readings from Supabase
     Step 0b  Sat_SensorData_proxy.py  — pull new proxy data from GEE
     Step 0c  merge_sensor.py          — merge both into combined_sensor_context.csv
-    Step 1   RF_Predict.py            — live mode inference on combined CSV
-    Step 2   XGB_Predict.py           — comparison run (if --all-models)
+    Step 1   XGB_Predict.py           — live mode inference on combined CSV
+    Step 2   RF_Predict.py            — comparison run (if --all-models)
     Step 3   LGBM_Predict.py          — comparison run (if --all-models)
-    Step 4   Alert.py                 — dispatch alert based on flood_rf_sensor_predictions.csv
+    Step 4   Alert.py                 — dispatch alert based on flood_xgb_sensor_predictions.csv
     Step 5   Seasonal notification    — remind to retrain every ~90 days (manual trigger)
 
 ALL STEPS ARE INCREMENTAL
@@ -23,15 +23,15 @@ Every script only processes rows newer than what is already on disk:
     sensor_ingest   — fetches Supabase rows newer than latest obando_sensor_data.csv timestamp
     Sat_SensorData  — fetches GEE rows newer than latest obando_environmental_data.csv timestamp
     merge_sensor    — merges only rows newer than latest combined_sensor_context.csv timestamp
-    RF_Predict      — predicts only rows after LAST_TRAINING_DATE (filter_new_rows)
+    XGB_Predict     — predicts only rows after LAST_TRAINING_DATE (filter_new_rows)
     Alert           — FB check_duplicate=True; Supabase appends only new prediction rows
 
 ALERT DISPATCH
 --------------
 Alert.py always runs last, after all model predictions are complete.
-It reads the latest row from flood_rf_sensor_predictions.csv — the RF
+It reads the latest row from flood_xgb_sensor_predictions.csv — the XGB
 model is the primary operational model and is always the alert source.
-XGB and LGBM are comparison-only and do not trigger alerts.
+RF and LGBM are comparison-only and do not trigger alerts.
 
 SCHEDULER — MIDNIGHT-PINNED
 -----------------------------
@@ -72,7 +72,7 @@ Usage
     # Full scheduled run
     python Start.py --schedule
 
-    # Also run XGB and LGBM for comparison logging
+    # Also run RF and LGBM for comparison logging
     python Start.py --all-models
 """
 
@@ -163,22 +163,22 @@ def import_merge_module():
 
 
 def import_predict_module():
-    """Import RF_Predict (primary model). Hard exit if missing."""
+    """Import XGB_Predict (primary model). Hard exit if missing."""
     try:
-        import RF_Predict
-        return RF_Predict
+        import XGB_Predict
+        return XGB_Predict
     except ImportError as e:
         sys.exit(
-            f"\n  ERROR: Could not import RF_Predict.py.\n"
+            f"\n  ERROR: Could not import XGB_Predict.py.\n"
             f"  Make sure it is in the same folder as Start.py.\n"
             f"  Detail: {e}\n"
         )
 
 
 def import_comparison_modules():
-    """Import XGB and LGBM predict scripts for optional comparison logging."""
+    """Import RF and LGBM predict scripts for optional comparison logging."""
     modules = {}
-    for name in ("XGB_Predict", "LGBM_Predict"):
+    for name in ("RF_Predict", "LGBM_Predict"):
         try:
             mod = __import__(name)
             modules[name] = mod
@@ -192,15 +192,15 @@ def import_comparison_modules():
 # Retrain notification
 # ---------------------------------------------------------------------------
 
-def check_retrain_notification(RF_Predict) -> None:
+def check_retrain_notification(XGB_Predict) -> None:
     """
-    Read last_training_date from the RF model artifact.
+    Read last_training_date from the XGB model artifact.
     If >= RETRAIN_NOTIFY_DAYS have elapsed, print a prominent terminal
     notification and log it. Retraining is always a manual step.
     """
     try:
         import joblib
-        artifact   = joblib.load(RF_Predict.MODEL_FILE)
+        artifact   = joblib.load(XGB_Predict.MODEL_FILE)
         last_train = artifact.get("last_training_date")
 
         if last_train is None:
@@ -247,13 +247,13 @@ def check_retrain_notification(RF_Predict) -> None:
 # Read latest prediction from saved CSV
 # ---------------------------------------------------------------------------
 
-def read_latest_result(RF_Predict) -> dict | None:
+def read_latest_result(XGB_Predict) -> dict | None:
     """
-    Read the most recent row from flood_rf_sensor_predictions.csv.
-    This is always the alert source — RF is the primary operational model.
-    XGB and LGBM comparison runs do not affect alert dispatch.
+    Read the most recent row from flood_xgb_sensor_predictions.csv.
+    This is always the alert source — XGB is the primary operational model.
+    RF and LGBM comparison runs do not affect alert dispatch.
     """
-    csv_path = RF_Predict.PREDICTIONS_CSV
+    csv_path = XGB_Predict.PREDICTIONS_CSV
     if not os.path.exists(csv_path):
         print(f"  WARNING: Predictions CSV not found at {csv_path}")
         return None
@@ -302,13 +302,13 @@ def run_daily(
 
     separator("Flood Early Warning System — Daily Inference")
     print(f"  Run time        : {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f"  Primary model   : RF sensor (live mode — incremental)")
+    print(f"  Primary model   : XGB sensor (live mode — incremental)")
     print(f"  Hardware ingest : {'disabled (--skip-sensor)' if skip_sensor else 'enabled (Supabase incremental)'}")
     print(f"  Proxy fetch     : {'disabled (--skip-proxy)'  if skip_proxy  else 'enabled (GEE incremental)'}")
     print(f"  Merge           : enabled (combined_sensor_context.csv incremental)")
     print(f"  Facebook post   : {'disabled (--no-post)' if no_post else 'enabled if WATCH/WARNING/DANGER'}")
-    print(f"  Comparison run  : {'RF + XGB + LGBM' if run_all_models else 'RF only'}")
-    print(f"  Alert source    : flood_rf_sensor_predictions.csv (always RF)")
+    print(f"  Comparison run  : {'XGB + RF + LGBM' if run_all_models else 'XGB only'}")
+    print(f"  Alert source    : flood_xgb_sensor_predictions.csv (always XGB)")
 
     # ── Step 0a: Hardware sensor ingest (Supabase → obando_sensor_data.csv) ──
     separator("Step 0a — sensor_ingest.py (Supabase hardware pull)")
@@ -362,41 +362,41 @@ def run_daily(
                 print("  combined_sensor_context.csv already up to date — no new rows.")
         except Exception as e:
             print(f"\n  WARNING: Merge failed: {e}")
-            print("  RF_Predict will use whatever combined_sensor_context.csv currently exists.")
+            print("  XGB_Predict will use whatever combined_sensor_context.csv currently exists.")
             traceback.print_exc()
     else:
         print("  Skipped — merge_sensor module not available.")
-        print("  RF_Predict will fall back to obando_environmental_data.csv (proxy only).")
+        print("  XGB_Predict will fall back to obando_environmental_data.csv (proxy only).")
 
-    # ── Step 1: Import RF_Predict ──────────────────────────────────────────
-    RF_Predict = import_predict_module()
+    # ── Step 1: Import XGB_Predict ─────────────────────────────────────────
+    XGB_Predict = import_predict_module()
 
-    # ── Step 2: Run RF pipeline (live mode — incremental) ──────────────────
-    separator("Step 1 — RF_Predict.py (live mode — incremental)")
-    rf_ok = False
+    # ── Step 2: Run XGB pipeline (live mode — incremental) ─────────────────
+    separator("Step 1 — XGB_Predict.py (live mode — incremental)")
+    xgb_ok = False
     try:
-        RF_Predict.run_pipeline()
-        rf_ok = True
+        XGB_Predict.run_pipeline()
+        xgb_ok = True
     except SystemExit as e:
-        print(f"\n  RF_Predict exited early: {e}")
+        print(f"\n  XGB_Predict exited early: {e}")
         print("  Most likely: no new sensor rows after the training cutoff.")
         print("  Check that combined_sensor_context.csv has rows after LAST_TRAINING_DATE.")
     except Exception as e:
-        print(f"\n  RF_Predict.py ERROR: {e}")
+        print(f"\n  XGB_Predict.py ERROR: {e}")
         traceback.print_exc()
 
-    # ── Step 3: Optional comparison run (XGB + LGBM) ──────────────────────
+    # ── Step 3: Optional comparison run (RF + LGBM) ────────────────────────
     if run_all_models:
         comparison_mods = import_comparison_modules()
 
-        if "XGB_Predict" in comparison_mods:
-            separator("Step 2a — XGB_Predict.py (comparison)")
+        if "RF_Predict" in comparison_mods:
+            separator("Step 2a — RF_Predict.py (comparison)")
             try:
-                comparison_mods["XGB_Predict"].run_pipeline()
+                comparison_mods["RF_Predict"].run_pipeline()
             except SystemExit:
-                print("  XGB: no new rows or early exit.")
+                print("  RF: no new rows or early exit.")
             except Exception as e:
-                print(f"  XGB_Predict.py ERROR: {e}")
+                print(f"  RF_Predict.py ERROR: {e}")
 
         if "LGBM_Predict" in comparison_mods:
             separator("Step 2b — LGBM_Predict.py (comparison)")
@@ -407,20 +407,20 @@ def run_daily(
             except Exception as e:
                 print(f"  LGBM_Predict.py ERROR: {e}")
 
-    # ── Step 4: Alert dispatch — always based on RF predictions CSV ────────
+    # ── Step 4: Alert dispatch — always based on XGB predictions CSV ───────
     #
-    # Reads flood_rf_sensor_predictions.csv after ALL model runs are complete.
-    # XGB and LGBM are comparison-only — they never affect alert dispatch.
+    # Reads flood_xgb_sensor_predictions.csv after ALL model runs are complete.
+    # RF and LGBM are comparison-only — they never affect alert dispatch.
     #
-    separator("Step 3 — Alert.py (dispatch from flood_rf_sensor_predictions.csv)")
-    latest = read_latest_result(RF_Predict) if rf_ok else None
+    separator("Step 3 — Alert.py (dispatch from flood_xgb_sensor_predictions.csv)")
+    latest = read_latest_result(XGB_Predict) if xgb_ok else None
 
     if latest:
         tier  = latest["risk_tier"]
         prob  = latest["probability"]
         ts    = latest["timestamp"]
         emoji = {"CLEAR": "🟢", "WATCH": "🟡", "WARNING": "🟠", "DANGER": "🔴"}.get(tier, "")
-        print(f"\n  Latest RF prediction : {ts}  {emoji} {tier}  ({prob:.1%})")
+        print(f"\n  Latest XGB prediction : {ts}  {emoji} {tier}  ({prob:.1%})")
 
         if no_post:
             print("  --no-post flag set — skipping alert dispatch.")
@@ -430,19 +430,19 @@ def run_daily(
             # CLEAR — FB + Supabase still fire via ALWAYS_FIRE_CHANNELS
             Alert.dispatch_alert(tier=tier, probability=prob, timestamp=ts)
     else:
-        if rf_ok:
-            print("\n  WARNING: RF ran but could not read back results.")
+        if xgb_ok:
+            print("\n  WARNING: XGB ran but could not read back results.")
         print("  Skipping alert dispatch.")
 
     # ── Step 5: Seasonal retrain notification ──────────────────────────────
     separator("Step 4 — Seasonal Retrain Check")
-    check_retrain_notification(RF_Predict)
+    check_retrain_notification(XGB_Predict)
 
     # ── Summary ────────────────────────────────────────────────────────────
     separator("DONE")
-    if rf_ok:
-        print(f"  RF CSV  : {RF_Predict.PREDICTIONS_CSV}")
-        print(f"  RF plot : {RF_Predict.PLOT_FILE}")
+    if xgb_ok:
+        print(f"  XGB CSV  : {XGB_Predict.PREDICTIONS_CSV}")
+        print(f"  XGB plot : {XGB_Predict.PLOT_FILE}")
     separator()
 
 
@@ -505,10 +505,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
             "Flood Early Warning System — Daily Inference Orchestrator.\n"
-            "Steps: hardware ingest → proxy fetch → merge → RF predict → "
-            "XGB/LGBM (optional) → alert → retrain check.\n"
+            "Steps: hardware ingest → proxy fetch → merge → XGB predict → "
+            "RF/LGBM (optional) → alert → retrain check.\n"
             "All steps are incremental — only new rows processed each run.\n"
-            "Alert always dispatches from flood_rf_sensor_predictions.csv."
+            "Alert always dispatches from flood_xgb_sensor_predictions.csv."
         )
     )
     parser.add_argument(
@@ -529,7 +529,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--all-models", action="store_true",
-        help="Also run XGB_Predict.py and LGBM_Predict.py for comparison logging.",
+        help="Also run RF_Predict.py and LGBM_Predict.py for comparison logging.",
     )
     args = parser.parse_args()
 

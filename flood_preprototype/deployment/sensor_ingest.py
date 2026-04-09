@@ -12,7 +12,7 @@ same physical units the RF model was trained on, then writes them
 incrementally into the local ML-pipeline CSV.
 
 Two CSVs are produced on every ingest run:
-    obando_sensor_data.csv      ← calibrated values (used by RF model)
+    obando_sensor_data.csv      ← calibrated values (used by XGB model)
     obando_sensor_data_raw.csv  ← raw hardware values (no conversion)
 
 This file replaces both the old sensor_ingest.py AND sensor_normalize.py.
@@ -22,7 +22,7 @@ adds complexity with no benefit.
 ─────────────────────────────────────────────────────────────────────
 WHY CALIBRATION IS NEEDED
 ─────────────────────────────────────────────────────────────────────
-The RF model was trained on proxy satellite data with specific units:
+The XGB model was trained on proxy satellite data with specific units:
     waterlevel    → metres above UHSLC chart datum (Manila South Harbor)
     soil_moisture → ERA5-Land volumetric water content  (m³/m³, 0.22–0.50)
     humidity      → MODIS Column Water Vapor            (cm,    0.15–6.87)
@@ -176,19 +176,19 @@ INTEGRATION WITH Start.py
 ─────────────────────────────────────────────────────────────────────
     from sensor_ingest import ingest_latest, log_prediction
 
-    ingest_latest()                   # before RF_Predict.run_pipeline()
+    ingest_latest()                   # before XGB_Predict.run_pipeline()
     log_prediction(tier, prob, ts)    # after predictions are made
 
 ─────────────────────────────────────────────────────────────────────
 SUPABASE TABLE EXPECTED
 ─────────────────────────────────────────────────────────────────────
 obando_environmental_data
-    id          BIGINT PRIMARY KEY
-    date        DATE NOT NULL          ← calendar date
-    time        TIME NOT NULL          ← time of reading
-    soil        NUMERIC NOT NULL       ← raw Soil (%) from capacitive sensor
-    humidity    NUMERIC NOT NULL       ← raw Humidity (%) from RH sensor
-    distance    NUMERIC NOT NULL       ← raw Distance (m) from ultrasonic
+    id              BIGINT PRIMARY KEY
+    "Date"          DATE NOT NULL          ← calendar date
+    "Time"          TIME NOT NULL          ← time of reading
+    "Soil Moisture" REAL NOT NULL          ← raw Soil (%) from capacitive sensor
+    "Humidity"      REAL NOT NULL          ← raw Humidity (%) from RH sensor
+    "Final Distance" REAL NULL             ← raw Distance (m) from ultrasonic
 
 predictions
     id            BIGINT PRIMARY KEY
@@ -289,7 +289,14 @@ USE_HARDWARE = True
 TABLE_ENV_DATA    = "obando_environmental_data"
 TABLE_PREDICTIONS = "predictions"
 
-_SELECT = "date, time, soil, humidity, distance"
+# ── Column names matching the actual Supabase table schema ──────────────────
+COL_DATE     = "Date"
+COL_TIME     = "Time"
+COL_SOIL     = "Soil Moisture"
+COL_HUMIDITY = "Humidity"
+COL_DISTANCE = "Final Distance"
+
+_SELECT = f'"Date", "Time", "Soil Moisture", "Humidity", "Final Distance"'
 
 # ===========================================================================
 # END CONFIG
@@ -497,8 +504,15 @@ def _empty_df() -> pd.DataFrame:
 
 def _rows_to_df(data: list[dict]) -> pd.DataFrame:
     """
-    Convert raw Supabase rows (split date + time columns) into the internal
-    DataFrame format expected by calibrate_df().
+    Convert raw Supabase rows into the internal DataFrame format
+    expected by calibrate_df().
+
+    Maps actual table columns → internal pipeline names:
+        "Date"          → date component of timestamp
+        "Time"          → time component of timestamp
+        "Soil Moisture" → soil_moisture
+        "Humidity"      → humidity
+        "Final Distance"→ waterlevel (raw distance, calibrated later)
     """
     if not data:
         return _empty_df()
@@ -507,15 +521,16 @@ def _rows_to_df(data: list[dict]) -> pd.DataFrame:
 
     df["timestamp"] = (
         pd.to_datetime(
-            df["date"].astype(str) + " " + df["time"].astype(str),
+            df[COL_DATE].astype(str) + " " + df[COL_TIME].astype(str),
             utc=True,
         )
         .dt.strftime("%Y-%m-%dT%H:%M:%S")
     )
 
     df = df.rename(columns={
-        "distance": "waterlevel",
-        "soil":     "soil_moisture",
+        COL_DISTANCE: "waterlevel",    # "Final Distance" → raw distance m (calibrated later)
+        COL_SOIL:     "soil_moisture", # "Soil Moisture"  → raw %
+        COL_HUMIDITY: "humidity",      # "Humidity"       → raw %RH
     })
 
     return df[["timestamp", "waterlevel", "soil_moisture", "humidity"]]
@@ -525,13 +540,9 @@ def fetch_rows_since(after_timestamp: str | None) -> pd.DataFrame:
     """
     Fetch all rows strictly newer than after_timestamp. None = full table.
 
-    DUPLICATE FIX (BUG 1):
-        Previously used date >= cutoff_date, which re-fetched the cutoff
-        day's rows on every run (since calibrated rows use midnight timestamps,
-        the fine filter timestamp > after_timestamp evaluated equal, not
-        strictly greater).
-        Now uses date > cutoff_date so the day already in the CSV is never
-        re-fetched from Supabase at all.
+    Uses COL_DATE ("Date") to match the actual Supabase column name.
+    Uses gt (>) instead of gte (>=) to exclude the cutoff day entirely,
+    preventing duplicate rows on incremental runs.
 
     Paginates automatically to bypass the default 1000-row Supabase limit.
     """
@@ -539,7 +550,6 @@ def fetch_rows_since(after_timestamp: str | None) -> pd.DataFrame:
     all_rows: list[dict] = []
     offset = 0
 
-    # Use the date strictly AFTER the cutoff date — not the same day
     cutoff_date = str(after_timestamp)[:10] if after_timestamp else None
 
     while True:
@@ -548,13 +558,12 @@ def fetch_rows_since(after_timestamp: str | None) -> pd.DataFrame:
                 get_client()
                 .table(TABLE_ENV_DATA)
                 .select(_SELECT)
-                .order("date", desc=False)
-                .order("time", desc=False)
+                .order(COL_DATE, desc=False)
+                .order(COL_TIME, desc=False)
                 .range(offset, offset + PAGE_SIZE - 1)
             )
             if cutoff_date:
-                # gt (>) instead of gte (>=) — excludes the cutoff day entirely
-                query = query.gt("date", cutoff_date)
+                query = query.gt(COL_DATE, cutoff_date)
 
             response = query.execute()
         except Exception as exc:
@@ -576,7 +585,7 @@ def fetch_rows_since(after_timestamp: str | None) -> pd.DataFrame:
 
 
 def fetch_rows_for_date(target_date: str) -> pd.DataFrame:
-    """Fetch all rows whose date column equals target_date (YYYY-MM-DD). Paginated."""
+    """Fetch all rows whose Date column equals target_date (YYYY-MM-DD). Paginated."""
     PAGE_SIZE = 1000
     all_rows: list[dict] = []
     offset = 0
@@ -587,8 +596,8 @@ def fetch_rows_for_date(target_date: str) -> pd.DataFrame:
                 get_client()
                 .table(TABLE_ENV_DATA)
                 .select(_SELECT)
-                .eq("date", target_date)
-                .order("time", desc=False)
+                .eq(COL_DATE, target_date)
+                .order(COL_TIME, desc=False)
                 .range(offset, offset + PAGE_SIZE - 1)
                 .execute()
             )
@@ -620,9 +629,9 @@ def fetch_rows_for_range(days: int) -> pd.DataFrame:
                 get_client()
                 .table(TABLE_ENV_DATA)
                 .select(_SELECT)
-                .gte("date", cutoff)
-                .order("date", desc=False)
-                .order("time", desc=False)
+                .gte(COL_DATE, cutoff)
+                .order(COL_DATE, desc=False)
+                .order(COL_TIME, desc=False)
                 .range(offset, offset + PAGE_SIZE - 1)
                 .execute()
             )
@@ -692,11 +701,8 @@ def _existing_timestamps(csv_path: Path) -> set[str]:
 def append_rows_to_csv(rows: pd.DataFrame, dry_run: bool = False) -> int:
     """
     Write calibrated rows to the ML pipeline CSV.
-
-    DUPLICATE FIX (BUG 2):
-        Previously appended blindly. Now loads existing timestamps first
-        and drops any incoming row whose timestamp is already present.
-        Returns the number of rows actually written.
+    Drops any incoming row whose timestamp is already present (dedup safety net).
+    Returns the number of rows actually written.
     """
     if rows.empty:
         log.warning("Nothing to write — DataFrame is empty.")
@@ -704,7 +710,6 @@ def append_rows_to_csv(rows: pd.DataFrame, dry_run: bool = False) -> int:
 
     rows = rows[["timestamp", "waterlevel", "soil_moisture", "humidity"]].copy()
 
-    # Drop rows already in the CSV (safety net — primary prevention is in fetch)
     existing = _existing_timestamps(SENSOR_CSV)
     before   = len(rows)
     rows     = rows[~rows["timestamp"].astype(str).isin(existing)]
@@ -736,11 +741,8 @@ def append_rows_to_csv(rows: pd.DataFrame, dry_run: bool = False) -> int:
 def append_raw_rows_to_csv(rows: pd.DataFrame, dry_run: bool = False) -> int:
     """
     Write raw (pre-calibration) hardware readings to the raw CSV.
-
-    DUPLICATE FIX (BUG 2):
-        Same dedup logic as append_rows_to_csv — drops rows whose
-        timestamp is already in obando_sensor_data_raw.csv before writing.
-        Returns the number of rows actually written.
+    Drops rows whose timestamp is already in obando_sensor_data_raw.csv.
+    Returns the number of rows actually written.
     """
     if rows.empty:
         log.warning("Nothing to write — raw DataFrame is empty.")
@@ -764,7 +766,6 @@ def append_raw_rows_to_csv(rows: pd.DataFrame, dry_run: bool = False) -> int:
 
     log.info("Aggregated raw readings → %d daily mean row(s).", len(raw))
 
-    # Drop rows already in the raw CSV
     existing = _existing_timestamps(SENSOR_CSV_RAW)
     before   = len(raw)
     raw      = raw[~raw["timestamp"].astype(str).isin(existing)]
@@ -803,7 +804,7 @@ def ingest_latest(dry_run: bool = False) -> bool:
 
     Fetches only rows from dates strictly newer than the latest CSV timestamp,
     applies all three sensor calibrations, and appends to both CSVs:
-        obando_sensor_data.csv      ← calibrated (used by RF model)
+        obando_sensor_data.csv      ← calibrated (used by XGB model)
         obando_sensor_data_raw.csv  ← raw hardware values (no conversion)
 
     On first run (no CSV) pulls and calibrates the full table.
@@ -878,7 +879,7 @@ def log_prediction(risk_tier: str, probability: float, timestamp: str) -> None:
         "timestamp":   timestamp,
         "probability": round(probability, 4),
         "risk_tier":   risk_tier,
-        "model":       "RF",
+        "model":       "XGB",
     }
     ok = insert_prediction_row(record)
     if ok:
