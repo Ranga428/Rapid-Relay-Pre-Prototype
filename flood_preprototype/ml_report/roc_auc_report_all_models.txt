@@ -1,0 +1,50 @@
+==========================================================================================
+  ROC AUC REPORT – Flood Sensor Models (XGBoost / Random Forest / LightGBM)
+==========================================================================================
+
+  ── Overall AUC Scores ──
+  XGBoost          : 0.869025
+  Random Forest    : 0.844989
+  LightGBM         : 0.583661
+
+  ── Tier-Based Results ──
+  Model           Test#  Tier        Rows   TPR    FPR    AUC(Tier)   Total AUC   Remarks
+  --------------------------------------------------------------------------------------
+  XGBoost         1      CLEAR       77     nan    nan    nan         0.869       Insufficient data
+  XGBoost         2      WATCH       115    0.0    0.0175 0.9649      0.869       Excellent separation — model is well-calibrated for this tier
+  XGBoost         3      WARNING     66     0.0    0.0345 0.4157      0.869       Low coverage in tier — prioritize data collection here
+  XGBoost         4      DANGER      65     0.5581 0.5909 0.5719      0.869       Low coverage in tier — prioritize data collection here
+  --------------------------------------------------------------------------------------
+  Random Forest   1      CLEAR       96     nan    nan    nan         0.845       Insufficient data
+  Random Forest   2      WATCH       225    1.0    0.3684 0.8158      0.845       Developing well — review feature importance for this range
+  Random Forest   3      WARNING     117    1.0    1.0    0.5         0.845       Low coverage in tier — prioritize data collection here
+  Random Forest   4      DANGER      152    0.0    0.0141 0.6092      0.845       Low coverage in tier — prioritize data collection here
+  --------------------------------------------------------------------------------------
+  LightGBM        1      CLEAR       245    1.0    1.0    0.5         0.5837      Low coverage in tier — prioritize data collection here
+  LightGBM        2      WATCH       245    1.0    1.0    0.5         0.5837      Low coverage in tier — prioritize data collection here
+  LightGBM        3      WARNING     245    1.0    1.0    0.5         0.5837      Low coverage in tier — prioritize data collection here
+  LightGBM        4      DANGER      260    0.0123 0.0    0.5837      0.5837      Low coverage in tier — prioritize data collection here
+
+==========================================================================================
+  ★  MODEL RECOMMENDATION
+==========================================================================================
+  Recommended Model : Random Forest
+
+  Scoring Breakdown (weighted composite):
+  Model              Overall AUC    High/Ext AUC    Tier Std    Consistency    Composite Score
+  --------------------------------------------------------------------------------------
+  ★ Random Forest    0.845          0.0             0.131       0.3452         0.4743
+    XGBoost          0.869          0.0             0.2311      0.0            0.4345
+    LightGBM         0.5837         0.0             0.0362      0.8188         0.4146
+
+  Why this model?
+  • Highest composite score of 0.4743 across all three criteria.
+  • Overall AUC of 0.8450 — strong general discrimination.
+  • High/Extreme tier AUC of 0.0000 — reliable on severe flood events.
+  • Tier consistency score of 0.3452 (std = 0.1310) — stable across all severity levels.
+
+  Runner-up: XGBoost  (composite = 0.4345, gap = 0.0398)
+  Consider XGBoost if deployment constraints favour its architecture.
+==========================================================================================
+
+==========================================================================================
