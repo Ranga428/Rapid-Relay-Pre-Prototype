@@ -129,6 +129,16 @@ sys.path.insert(0, _SCRIPTS)
 # TERMINAL STYLE
 # ===========================================================================
 
+# Enable ANSI on Windows cmd.exe before class C evaluates isatty()
+if sys.platform == "win32":
+    import ctypes
+    try:
+        kernel32 = ctypes.windll.kernel32
+        # ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+    except Exception:
+        pass
+
 class C:
     """ANSI color codes. Auto-disabled if not a TTY."""
     _on = sys.stdout.isatty()
