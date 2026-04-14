@@ -83,7 +83,7 @@ HISTORY_START     = "2017-01-01"
 NAN_LOOKBACK_DAYS = 14          # ERA5 lag ~5-7d, MODIS ~2-4d, GPM ~1-2d
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
-_AOI_PATH   = _SCRIPT_DIR.parent / "config" / "HMS-HEC.geojson"   # unchanged
+_AOI_PATH   = _SCRIPT_DIR.parent / "config" / "aoi.geojson"   # unchanged
 OUTPUT_CSV  = _SCRIPT_DIR.parent / "data" / "HMS-HEC" / "HEC-HMS-Calibration_Data.csv"
 OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
 
