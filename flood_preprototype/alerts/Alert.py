@@ -67,6 +67,7 @@ sys.path.insert(0, SCRIPT_DIR)
 
 from Channels import FB_Alert
 import Channels.Supabase_Alert as _supabase_module
+from Channels import TG_Alert   
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +108,7 @@ ALWAYS_FIRE_CHANNELS = [
 
 # Tier-gated — only fire on WATCH / WARNING / DANGER
 CHANNELS = [
-
+    ("telegram", TG_Alert),
 ]
 
 

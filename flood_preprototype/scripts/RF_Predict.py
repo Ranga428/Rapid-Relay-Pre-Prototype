@@ -20,10 +20,19 @@ NEW 6 — LIVE_SENSOR_FILE updated to combined_sensor_context.csv (hardware +
 FIX — CalibratedRF class defined at module level so joblib.load() can
       unpickle the saved model correctly. Without this the load fails with
       AttributeError: Can't get attribute 'CalibratedRF'.
+
+STRESS TEST ADDITIONS
+---------------------
+NEW 7 — --output-dir flag overrides OUTPUT_DIR at runtime.
+NEW 8 — --stress-test flag accepts a glob pattern (e.g. "stress_*.csv") and
+         runs all matching CSVs through the pipeline, then prints a combined
+         accuracy summary table at the end.
+NEW 9 — --stress-summary-csv saves the combined summary table to a CSV file.
 """
 
 import os
 import sys
+import glob
 import time
 import argparse
 import joblib
@@ -58,11 +67,6 @@ from feature_engineering import build_features, SENSOR_FEATURE_COLUMNS
 MODEL_FILE       = r"..\model\flood_rf_sensor.pkl"
 OUTPUT_DIR       = r"..\predictions"
 
-# ── LIVE_SENSOR_FILE ────────────────────────────────────────────────────────
-# Points to the merged combined CSV (hardware Supabase + GEE proxy).
-# This is produced daily by merge_sensor.py (Step 0c in Start.py).
-# Do NOT point this at obando_environmental_data.csv (proxy-only) or
-# obando_sensor_data.csv (hardware-only) — the model expects the merged file.
 LIVE_SENSOR_FILE = os.path.join(
     SCRIPT_DIR, r"..\data\sensor\combined_sensor_context.csv"
 )
@@ -208,12 +212,10 @@ def load_live_features() -> pd.DataFrame:
           f"{sensor_df.index.max().date()}")
 
     separator("Building Sensor Features")
-    # Build on FULL dataframe — rolling windows need the complete time series
     features = build_features(sensor_df, freq=freq, mode="sensor",
                               flood_log_path=FLOOD_LOG_PATH)
     features = append_rolling_features(features)
 
-    # Drop incomplete rows AFTER feature engineering to preserve index range
     core_cols = ["waterlevel", "soil_moisture", "humidity"]
     present   = [c for c in core_cols if c in features.columns]
     before    = len(features)
@@ -498,12 +500,47 @@ def print_results(results, ground_truth=None,
 
 
 # ---------------------------------------------------------------------------
+# 4b. Collect metrics for stress test summary
+# ---------------------------------------------------------------------------
+
+def collect_metrics(results, ground_truth, watch_t, warn_t) -> dict:
+    """Return a dict of metrics for one scenario — used by stress test summary."""
+    from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                                 balanced_accuracy_score, f1_score)
+    row = {}
+    if ground_truth is None:
+        return row
+
+    gt         = ground_truth.reindex(results.index).dropna()
+    gt_aligned = gt.reindex(results.index).fillna(0).astype(int)
+    pred_warn  = (results["flood_probability"] >= warn_t).astype(int)
+
+    row["accuracy"]    = accuracy_score(gt_aligned, pred_warn)
+    row["precision"]   = precision_score(gt_aligned, pred_warn, zero_division=0)
+    row["recall"]      = recall_score(gt_aligned, pred_warn, zero_division=0)
+    row["bal_acc"]     = balanced_accuracy_score(gt_aligned, pred_warn)
+    row["f1"]          = f1_score(gt_aligned, pred_warn, zero_division=0)
+    tn = ((pred_warn == 0) & (gt_aligned == 0)).sum()
+    fp = ((pred_warn == 1) & (gt_aligned == 0)).sum()
+    fn = ((pred_warn == 0) & (gt_aligned == 1)).sum()
+    tp = ((pred_warn == 1) & (gt_aligned == 1)).sum()
+    row["specificity"] = tn / (tn + fp) if (tn + fp) > 0 else 0
+    row["TP"]          = int(tp)
+    row["FP"]          = int(fp)
+    row["TN"]          = int(tn)
+    row["FN"]          = int(fn)
+    row["flood_days"]  = int(gt_aligned.sum())
+    row["total_days"]  = int(len(gt_aligned))
+    return row
+
+
+# ---------------------------------------------------------------------------
 # 5. Save CSV
 # ---------------------------------------------------------------------------
 
 def save_csv(results, output_csv) -> None:
     separator("Saving CSV")
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
     if os.path.exists(output_csv):
         existing = pd.read_csv(output_csv, parse_dates=["timestamp"],
                                index_col="timestamp")
@@ -523,7 +560,7 @@ def save_csv(results, output_csv) -> None:
 def save_plot(results, watch_t, warn_t, danger_t,
               plot_file, ground_truth=None) -> None:
     separator("Saving Plot")
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(plot_file) or ".", exist_ok=True)
     fig, ax = plt.subplots(figsize=(14, 5))
     ax.plot(results.index, results["flood_probability"],
             color="steelblue", linewidth=1.5, label="Flood Probability", zorder=3)
@@ -567,11 +604,22 @@ def save_plot(results, watch_t, warn_t, danger_t,
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def run_pipeline(data_path=None, threshold_search=False) -> None:
+def run_pipeline(data_path=None, threshold_search=False,
+                 output_dir=None) -> tuple:
+    """
+    Run one prediction pass.  Returns (results, ground_truth, watch_t, warn_t)
+    so that run_stress_test() can collect metrics across scenarios.
+    """
+    global OUTPUT_DIR
+    if output_dir:
+        OUTPUT_DIR = output_dir
+
     batch_mode = data_path is not None
     separator(f"Flood Prediction — {MODEL_LABEL} Inference Pipeline")
     print(f"  Model  : {MODEL_FILE}")
     print(f"  Mode   : {'BATCH — ' + data_path if batch_mode else 'LIVE — ' + LIVE_SENSOR_FILE}")
+    if output_dir:
+        print(f"  Output : {OUTPUT_DIR}  (overridden via --output-dir)")
 
     model, feature_cols, watch_t, warn_t = load_model()
 
@@ -584,8 +632,10 @@ def run_pipeline(data_path=None, threshold_search=False) -> None:
         all_features = load_live_features()
         features     = filter_new_rows(all_features)
         ground_truth = None
-        output_csv   = PREDICTIONS_CSV
-        output_plot  = PLOT_FILE
+        output_csv   = os.path.join(OUTPUT_DIR,
+                           os.path.basename(PREDICTIONS_CSV))
+        output_plot  = os.path.join(OUTPUT_DIR,
+                           os.path.basename(PLOT_FILE))
 
     results, danger_t = run_predictions(model, feature_cols, features, watch_t, warn_t)
     print_results(results, ground_truth, watch_t, warn_t, danger_t)
@@ -598,12 +648,126 @@ def run_pipeline(data_path=None, threshold_search=False) -> None:
     print(f"  Plot : {output_plot}")
     separator()
 
+    return results, ground_truth, watch_t, warn_t
 
-def run_scheduled(interval_hours: int) -> None:
+
+# ---------------------------------------------------------------------------
+# Stress test runner  (NEW 8)
+# ---------------------------------------------------------------------------
+
+def run_stress_test(pattern: str, output_dir: str = None,
+                    summary_csv: str = None,
+                    threshold_search: bool = False) -> None:
+    """
+    Run the full pipeline on every CSV matching *pattern* (glob), then print
+    a combined accuracy summary table across all scenarios.
+
+    Usage examples
+    --------------
+    python RF_Predict.py --stress-test "stress_*.csv"
+    python RF_Predict.py --stress-test "stress_*.csv" --output-dir results/stress
+    python RF_Predict.py --stress-test "stress_*.csv" --stress-summary-csv stress_summary.csv
+    """
+    files = sorted(glob.glob(pattern))
+    if not files:
+        sys.exit(f"\n  ERROR: No files matched pattern: {pattern}\n")
+
+    separator(f"Stress Test — {len(files)} scenarios")
+    for f in files:
+        print(f"  {f}")
+
+    summary_rows = []
+
+    for csv_path in files:
+        scenario = os.path.splitext(os.path.basename(csv_path))[0]
+        print(f"\n\n{'#'*55}")
+        print(f"#  SCENARIO : {scenario}")
+        print(f"{'#'*55}")
+
+        try:
+            results, ground_truth, watch_t, warn_t = run_pipeline(
+                data_path=csv_path,
+                threshold_search=threshold_search,
+                output_dir=output_dir,
+            )
+            metrics = collect_metrics(results, ground_truth, watch_t, warn_t)
+            metrics["scenario"] = scenario
+            summary_rows.append(metrics)
+        except SystemExit as e:
+            print(f"\n  ⚠️  Scenario {scenario} failed: {e}")
+            summary_rows.append({"scenario": scenario})
+
+    # ── Print summary table ──────────────────────────────────────────────
+    separator("STRESS TEST SUMMARY")
+    if not summary_rows:
+        print("  No results to display.")
+        return
+
+    df = pd.DataFrame(summary_rows).set_index("scenario")
+    metric_cols = ["accuracy", "precision", "recall", "specificity",
+                   "bal_acc", "f1", "TP", "FP", "TN", "FN",
+                   "flood_days", "total_days"]
+    present_cols = [c for c in metric_cols if c in df.columns]
+    df = df[present_cols]
+
+    # Console table
+    header = f"  {'Scenario':<30}"
+    for col in present_cols:
+        header += f"  {col:>10}"
+    print(header)
+    print("  " + "-" * (30 + 12 * len(present_cols)))
+
+    float_cols = {"accuracy", "precision", "recall", "specificity", "bal_acc", "f1"}
+    for scenario, row in df.iterrows():
+        line = f"  {scenario:<30}"
+        for col in present_cols:
+            val = row.get(col, "")
+            if pd.isna(val):
+                line += f"  {'—':>10}"
+            elif col in float_cols:
+                line += f"  {val:>10.4f}"
+            else:
+                line += f"  {int(val):>10}"
+        print(line)
+
+    # Degradation note
+    if "accuracy" in df.columns and df["accuracy"].notna().sum() > 1:
+        first_acc = df["accuracy"].dropna().iloc[0]
+        last_acc  = df["accuracy"].dropna().iloc[-1]
+        delta     = last_acc - first_acc
+        sign      = "+" if delta >= 0 else ""
+        print(f"\n  Accuracy drift   : {first_acc:.4f} → {last_acc:.4f}  "
+              f"({sign}{delta:.4f} from {df.index[0]} to {df.index[-1]})")
+
+    if "recall" in df.columns and df["recall"].notna().sum() > 1:
+        first_rec = df["recall"].dropna().iloc[0]
+        last_rec  = df["recall"].dropna().iloc[-1]
+        delta     = last_rec - first_rec
+        sign      = "+" if delta >= 0 else ""
+        print(f"  Recall drift     : {first_rec:.4f} → {last_rec:.4f}  "
+              f"({sign}{delta:.4f})")
+
+    # Save summary CSV
+    if summary_csv:
+        out_dir = output_dir or OUTPUT_DIR
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, summary_csv) \
+                   if not os.path.isabs(summary_csv) else summary_csv
+        df.to_csv(out_path)
+        print(f"\n  Summary saved → {out_path}")
+
+    separator()
+
+
+# ---------------------------------------------------------------------------
+# Scheduled mode
+# ---------------------------------------------------------------------------
+
+def run_scheduled(interval_hours: int, output_dir: str = None) -> None:
     print(f"\n  Scheduled mode — running every {interval_hours}h")
     while True:
         try:
-            run_pipeline()
+            run_pipeline(output_dir=output_dir)
             next_run = pd.Timestamp.now() + pd.Timedelta(hours=interval_hours)
             print(f"\n  Next run : {next_run.strftime('%Y-%m-%d %H:%M')}")
             import time; time.sleep(interval_hours * 3600)
@@ -615,16 +779,81 @@ def run_scheduled(interval_hours: int) -> None:
             import time; time.sleep(interval_hours * 3600)
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Flood Prediction — Random Forest Sensor Model Inference"
     )
-    parser.add_argument("--data",             type=str, default=None)
-    parser.add_argument("--schedule",         action="store_true")
-    parser.add_argument("--interval",         type=int, default=12)
-    parser.add_argument("--threshold-search", action="store_true")
+    parser.add_argument(
+        "--data",
+        type=str, default=None,
+        help="Path to a single input CSV (batch mode)."
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str, default=None,
+        dest="output_dir",
+        help="Override the default OUTPUT_DIR for all saved files."
+    )
+    parser.add_argument(
+        "--stress-test",
+        type=str, default=None,
+        dest="stress_test",
+        metavar="GLOB",
+        help='Glob pattern of stress-test CSVs, e.g. "stress_*.csv". '
+             'Runs all matched files and prints a combined summary table.'
+    )
+    parser.add_argument(
+        "--stress-summary-csv",
+        type=str, default=None,
+        dest="stress_summary_csv",
+        metavar="FILENAME",
+        help="Filename for the combined stress-test summary CSV "
+             "(saved inside --output-dir if relative)."
+    )
+    parser.add_argument(
+        "--stress-output-name",
+        type=str, default=None,
+        dest="stress_output_name",
+        metavar="NAME",
+        help='Base name for per-scenario output files. '
+             'E.g. --stress-output-name "trial2" produces '
+             'flood_rf_trial2_stress_1p0x_rf_predictions.csv instead of '
+             'flood_rf_stress_1p0x_rf_predictions.csv.'
+    )
+    parser.add_argument(
+        "--schedule",
+        action="store_true",
+        help="Run in live scheduled mode."
+    )
+    parser.add_argument(
+        "--interval",
+        type=int, default=12,
+        help="Hours between scheduled runs (default: 12)."
+    )
+    parser.add_argument(
+        "--threshold-search",
+        action="store_true",
+        dest="threshold_search",
+        help="Run threshold search after predictions (batch mode only)."
+    )
     args = parser.parse_args()
-    if args.schedule:
-        run_scheduled(args.interval)
+
+    if args.stress_test:
+        run_stress_test(
+            pattern=args.stress_test,
+            output_dir=args.output_dir,
+            summary_csv=args.stress_summary_csv,
+            threshold_search=args.threshold_search,
+        )
+    elif args.schedule:
+        run_scheduled(args.interval, output_dir=args.output_dir)
     else:
-        run_pipeline(data_path=args.data, threshold_search=args.threshold_search)
+        run_pipeline(
+            data_path=args.data,
+            threshold_search=args.threshold_search,
+            output_dir=args.output_dir,
+        )
