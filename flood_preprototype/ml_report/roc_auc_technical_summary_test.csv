@@ -85,14 +85,11 @@ TRAPEZOID,Random Forest,test,Sensor-Only (Redundancy),2025-07-01 → 2026-03-23,
 TRAPEZOID,Random Forest,test,Sensor-Only (Redundancy),2025-07-01 → 2026-03-23,9,1.0,1.0,1.0,0.448087,1.0,0.551913,0.55191257,3.536145,1.0,0.847,0.8,TRUE,,
 TOTAL,Random Forest,test,Sensor-Only (Redundancy),2025-07-01 → 2026-03-23,TOTAL,,,3.536145,,,1.0,0.846995,3.536145,1.0,0.847,0.8,TRUE,Strong; Retained as a reliable backup model. Alternative evaluated for operational redundancy.,0.0144
 ,,,,,,,,,,,,,,,,,,,
-MODEL_HEADER,LightGBM,test,Sensor-Only (Experimental),2025-07-01 → 2026-03-23,,,,,,,,,,,0.5853,0.8,FALSE,Weak; Excluded from deployment consideration. Experimental architecture — does not clear WMO safety margin.,0.2762
-TRAPEZOID,LightGBM,test,Sensor-Only (Experimental),2025-07-01 → 2026-03-23,1,0.0,0.144578,0.072289,0.0,0.0,0.0,0.0,0.072289,0.0,0.5853,0.8,FALSE,,
-TRAPEZOID,LightGBM,test,Sensor-Only (Experimental),2025-07-01 → 2026-03-23,2,0.144578,0.180723,0.162651,0.0,0.021858,0.021858,0.0035552,0.23494,0.021858,0.5853,0.8,FALSE,,
-TRAPEZOID,LightGBM,test,Sensor-Only (Experimental),2025-07-01 → 2026-03-23,3,0.180723,0.192771,0.186747,0.021858,0.021858,0.0,0.0,0.421687,0.021858,0.5853,0.8,FALSE,,
-TRAPEZOID,LightGBM,test,Sensor-Only (Experimental),2025-07-01 → 2026-03-23,4,0.192771,0.192771,0.192771,0.021858,0.04918,0.027322,0.00526697,0.614458,0.04918,0.5853,0.8,FALSE,,
-TRAPEZOID,LightGBM,test,Sensor-Only (Experimental),2025-07-01 → 2026-03-23,5,0.192771,0.216867,0.204819,0.04918,0.04918,0.0,0.0,0.819277,0.04918,0.5853,0.8,FALSE,,
-TRAPEZOID,LightGBM,test,Sensor-Only (Experimental),2025-07-01 → 2026-03-23,6,0.216867,0.253012,0.23494,0.04918,0.098361,0.04918,0.01155441,1.054217,0.098361,0.5853,0.8,FALSE,,
-TRAPEZOID,LightGBM,test,Sensor-Only (Experimental),2025-07-01 → 2026-03-23,7,0.253012,1.0,0.626506,0.098361,1.0,0.901639,0.56488248,1.680723,1.0,0.5853,0.8,FALSE,,
-TOTAL,LightGBM,test,Sensor-Only (Experimental),2025-07-01 → 2026-03-23,TOTAL,,,1.680723,,,1.0,0.585259,1.680723,1.0,0.5853,0.8,FALSE,Weak; Excluded from deployment consideration. Experimental architecture — does not clear WMO safety margin.,0.2762
+MODEL_HEADER,LightGBM,test,Sensor-Only (Experimental),2025-07-01 → 2026-03-23,,,,,,,,,,,0.8573,0.8,TRUE,Weak; Excluded from deployment consideration. Experimental architecture — does not clear WMO safety margin.,0.0041
+TRAPEZOID,LightGBM,test,Sensor-Only (Experimental),2025-07-01 → 2026-03-23,1,0.0,0.156627,0.078313,0.0,0.010929,0.010929,0.00085588,0.078313,0.010929,0.8573,0.8,TRUE,,
+TRAPEZOID,LightGBM,test,Sensor-Only (Experimental),2025-07-01 → 2026-03-23,2,0.156627,0.228916,0.192771,0.010929,0.010929,0.0,0.0,0.271084,0.010929,0.8573,0.8,TRUE,,
+TRAPEZOID,LightGBM,test,Sensor-Only (Experimental),2025-07-01 → 2026-03-23,3,0.228916,0.927711,0.578313,0.010929,0.262295,0.251366,0.14536836,0.849398,0.262295,0.8573,0.8,TRUE,,
+TRAPEZOID,LightGBM,test,Sensor-Only (Experimental),2025-07-01 → 2026-03-23,4,0.927711,1.0,0.963855,0.262295,1.0,0.737705,0.71104088,1.813253,1.0,0.8573,0.8,TRUE,,
+TOTAL,LightGBM,test,Sensor-Only (Experimental),2025-07-01 → 2026-03-23,TOTAL,,,1.813253,,,1.0,0.857265,1.813253,1.0,0.8573,0.8,TRUE,Weak; Excluded from deployment consideration. Experimental architecture — does not clear WMO safety margin.,0.0041
 ,,,,,,,,,,,,,,,,,,,
-GLOBAL_SUMMARY,ALL MODELS,test,,2025-07-01 → 2026-03-23,,,,,,,,,,,0.8614,0.8,TRUE,Best model: XGBoost (AUC=0.8614). 2/3 models meet WMO ≥0.8 threshold. AUC = Σ(H×W) by trapezoidal rule. H = (TPR_i + TPR_{i-1})/2  |  W = FPR_i − FPR_{i-1}.,0.0
+GLOBAL_SUMMARY,ALL MODELS,test,,2025-07-01 → 2026-03-23,,,,,,,,,,,0.8614,0.8,TRUE,Best model: XGBoost (AUC=0.8614). 3/3 models meet WMO ≥0.8 threshold. AUC = Σ(H×W) by trapezoidal rule. H = (TPR_i + TPR_{i-1})/2  |  W = FPR_i − FPR_{i-1}.,0.0
