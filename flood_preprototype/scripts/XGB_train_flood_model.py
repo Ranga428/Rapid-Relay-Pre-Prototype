@@ -210,20 +210,17 @@ def tune_thresholds(probs, y_val, label=""):
         watch_t   = float(watch_row["Thresh"])
         print(f"  WATCH : data-driven threshold={watch_t:.2f}")
 
-    # --- WARNING threshold (CHANGE B) ---
-    warn_cands = results[
-        (results["Precision"] >= 0.55) &
-        (results["Thresh"]    >= watch_t + MIN_TIER_GAP)   # CHANGE F
-    ]
-    if len(warn_cands) == 0:
-        print(f"  ⚠️  No WARNING at precision >= 0.55 — falling back to 0.45")
-        warn_cands = results[
-            (results["Precision"] >= 0.45) &
-            (results["Thresh"]    >= watch_t + MIN_TIER_GAP)
-        ]
+    # --- WARNING threshold (Optimized for F1-Score) ---
+    # Filter valid candidates above the WATCH tier
+    warn_cands = results[results["Thresh"] >= watch_t + MIN_TIER_GAP]
+
     if len(warn_cands) > 0:
-        warn_row = warn_cands.loc[warn_cands["Recall"].idxmax()]
-        warn_t   = float(warn_row["Thresh"])
+        # Find the threshold that maximizes the F1-Score
+        warn_row = warn_cands.loc[warn_cands["F1"].idxmax()]
+        warn_t = float(warn_row["Thresh"])
+        
+        print(f"  WARNING : F1-optimized threshold={warn_t:.2f} "
+            f"(Precision: {warn_row['Precision']:.2f}, Recall: {warn_row['Recall']:.2f})")
     else:
         warn_t   = round(watch_t + MIN_TIER_GAP, 2)
         match    = results[results["Thresh"] == warn_t]

@@ -1,8 +1,8 @@
 Model,Test Number,Tier,Rows,TPR,FPR,AUC (Tier),AUC Method,Total AUC,Remarks
-XGBoost,1,CLEAR,16,1.0,1.0,0.0,tier-disc,0.869,[tier-disc] Low coverage in tier — prioritize data collection here
-XGBoost,2,WATCH,113,0.0,0.0089,0.9821,standard,0.869,Near-perfect separation — maintain current features
-XGBoost,3,WARNING,66,0.0,0.0345,0.4157,standard,0.869,Low coverage in tier — prioritize data collection here
-XGBoost,4,DANGER,65,0.5581,0.5909,0.5719,standard,0.869,Low coverage in tier — prioritize data collection here
+XGBoost,1,CLEAR,22,1.0,1.0,0.0,tier-disc,0.8684,[tier-disc] Low coverage in tier — prioritize data collection here
+XGBoost,2,WATCH,107,0.0,0.0094,0.9245,standard,0.8684,Strong performance — minor threshold tuning may improve recall
+XGBoost,3,WARNING,66,0.0,0.04,0.58,standard,0.8684,Low coverage in tier — prioritize data collection here
+XGBoost,4,DANGER,65,0.8205,0.5769,0.6529,standard,0.8684,Low coverage in tier — prioritize data collection here
 Random Forest,1,CLEAR,65,1.0,1.0,0.0795,tier-disc,0.845,[tier-disc] Low coverage in tier — prioritize data collection here
 Random Forest,2,WATCH,108,1.0,1.0,0.0,tier-disc,0.845,[tier-disc] Low coverage in tier — prioritize data collection here
 Random Forest,3,WARNING,65,1.0,1.0,0.5,standard,0.845,Low coverage in tier — prioritize data collection here
