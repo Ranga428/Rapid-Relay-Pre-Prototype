@@ -14,9 +14,10 @@ CHANGE B — WARNING precision floor lowered 0.65 → 0.55 in tune_thresholds().
 
 CHANGE C — Isotonic calibration moved from val set to held-out calibration
            fold (last 20% of training data).
-           The base LightGBM is fit on the full training set, then the
-           calibrator is fitted on train_cal (last 20% of train).
-           This prevents val-set class distribution leaking into calibration.
+           The base LightGBM is fit on train_core (first 80% of train),
+           then the calibrator is fitted on train_cal (last 20% of train).
+           This prevents the calibrator from seeing in-sample predictions,
+           which caused compressed probabilities and low AUC.
 
 CHANGE D — LightGBM hyperparameters updated for better learning:
            n_estimators      600 → 800   (more trees with lower learning rate)
@@ -173,8 +174,10 @@ def separator(title=""):
 
 def split_data(df, feature_cols):
     """
-    CHANGE C — returns a calibration fold (last 20% of train).
-    Base LGBM is fit on full train; calibrator is fit on train_cal only.
+    CHANGE C — splits train into train_core (first 80%) and train_cal (last 20%).
+    Base LGBM is fit on train_core only; isotonic calibrator is fit on train_cal.
+    This ensures the calibrator receives out-of-sample predictions from the base model,
+    preventing in-sample probability compression that caused low AUC.
     """
     avail      = [c for c in feature_cols if c in df.columns]
     train_full = df[df.index <= TRAIN_END]
@@ -190,7 +193,7 @@ def split_data(df, feature_cols):
         a = [c for c in avail if c in split.columns]
         return split[a], split["flood_label"]
 
-    return xy(train_full), xy(train_cal), xy(val), xy(test), \
+    return xy(train_full), xy(train_core), xy(train_cal), xy(val), xy(test), \
            train_full, train_core, train_cal, val, test, avail
 
 
@@ -436,7 +439,7 @@ def print_feature_importance(model_calib, feature_cols, save_path):
 def train_model(df, feature_cols, model_name, pkl_name):
     separator(f"Training — {model_name}")
 
-    (X_train, y_train), (X_cal, y_cal), (X_val, y_val), (X_test, y_test), \
+    (X_train, y_train), (X_core, y_core), (X_cal, y_cal), (X_val, y_val), (X_test, y_test), \
         tr_full, tr_core, tr_cal, va, te, avail = split_data(df, feature_cols)
 
     missing = [c for c in feature_cols if c not in df.columns]
@@ -447,6 +450,9 @@ def train_model(df, feature_cols, model_name, pkl_name):
     print(f"  Train full : {len(X_train)} rows  "
           f"({tr_full.index.min().date()} -> {tr_full.index.max().date()})  "
           f"flood={int(y_train.sum())}  no-flood={int((y_train==0).sum())}")
+    print(f"  Train core : {len(X_core)} rows  "
+          f"({tr_core.index.min().date()} -> {tr_core.index.max().date()})  "
+          f"flood={int(y_core.sum())}  [CHANGE C — base LGBM fit on this split]")
     print(f"  Train cal  : {len(X_cal)} rows  "
           f"({tr_cal.index.min().date()} -> {tr_cal.index.max().date()})  "
           f"flood={int(y_cal.sum())}  [CHANGE C — isotonic calibration fold]")
@@ -458,12 +464,14 @@ def train_model(df, feature_cols, model_name, pkl_name):
           f"flood={int(y_test.sum())}  no-flood={int((y_test==0).sum())}")
 
     separator(f"Fitting — {model_name}")
+    print(f"  CHANGE C — base LGBM fitted on train_core (first 80% of train) only.")
+    print(f"             Calibrator will be fitted on train_cal (last 20%) — out-of-sample.")
     lgbm_base = lgb.LGBMClassifier(
         **LGBM_PARAMS,
         scale_pos_weight=FLOOD_WEIGHT_OVERRIDE,
     )
     lgbm_base.fit(
-        X_train, y_train,
+        X_core, y_core,
         eval_set=[(X_val, y_val)],
         **LGBM_FIT_PARAMS,
     )
@@ -494,8 +502,16 @@ def train_model(df, feature_cols, model_name, pkl_name):
     print(f"  Cal set size : {len(X_cal)} rows")
     print(f"  Cal flood rate : {y_cal.mean()*100:.1f}%")
 
+    # Align cal columns to core columns (satellite features may differ in early years)
+    core_cols = list(X_core.columns)
+    X_cal_aligned = X_cal.reindex(columns=core_cols)
+    missing_cal = X_cal_aligned.isnull().all(axis=0)
+    if missing_cal.any():
+        print(f"  ⚠️  Cal columns all-NaN (filled 0): {list(missing_cal[missing_cal].index)}")
+    X_cal_aligned = X_cal_aligned.fillna(0)
+
     _iso = IsotonicRegression(out_of_bounds="clip")
-    _iso.fit(lgbm_base.predict_proba(X_cal)[:, 1], y_cal)
+    _iso.fit(lgbm_base.predict_proba(X_cal_aligned)[:, 1], y_cal)
     model = CalibratedLGBM(lgbm_base, _iso)
 
     probs_cal = model.predict_proba(X_val)[:, 1]
@@ -568,15 +584,15 @@ def main():
     print(f"  Output dir : {OUTPUT_DIR}")
     print(f"""
   Split strategy (chronological, no shuffling):
-    Train full : 2017-01-01 – {TRAIN_END}              (base LGBM fit)
-    Train cal  : last 20% of train period              (isotonic calibration)
-    Val        : {TRAIN_END} – {VAL_END}               (threshold tuning)
-    Test       : {VAL_END} – present                   (final evaluation)
+    Train core : 2017-01-01 – {TRAIN_END} (first 80%)   (base LGBM fit)
+    Train cal  : last 20% of train period                (isotonic calibration — out-of-sample)
+    Val        : {TRAIN_END} – {VAL_END}                 (threshold tuning + early stopping)
+    Test       : {VAL_END} – present                     (final evaluation)
 
   Key changes vs v2:
     CHANGE A — Flood weight        : 15.0  (was 10.0)
     CHANGE B — WARNING floor       : precision >= 0.55  (was 0.65)
-    CHANGE C — Calibration fold    : last 20% of train  (was val set)
+    CHANGE C — Calibration fold    : base LGBM on train_core (80%), isotonic on train_cal (20% — out-of-sample)
     CHANGE D — num_leaves=63, min_child_samples=10, n_estimators=800
                (min_child_samples was the primary cause of flat output)
     CHANGE E — WATCH threshold     : data-driven guard if override unreachable
