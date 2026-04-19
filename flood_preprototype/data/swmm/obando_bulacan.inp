@@ -1,0 +1,137 @@
+[TITLE]
+;;Project Title/Notes
+Rapid Relay EWS — Obando, Bulacan (Placeholder)
+Minimal SWMM model for stress-test CSV generation.
+Replace with calibrated HEC-HMS-derived geometry.
+
+[OPTIONS]
+;;Option             Value
+FLOW_UNITS           CMS
+INFILTRATION         HORTON
+FLOW_ROUTING         DYNWAVE
+LINK_OFFSETS         DEPTH
+MIN_SLOPE            0
+ALLOW_PONDING        NO
+SKIP_STEADY_STATE    NO
+START_DATE           01/01/2024
+START_TIME           00:00:00
+REPORT_START_DATE    01/01/2024
+REPORT_START_TIME    00:00:00
+END_DATE             01/31/2024
+END_TIME             23:00:00
+SWEEP_START          01/01
+SWEEP_END            12/31
+DRY_DAYS             0
+REPORT_STEP          01:00:00
+WET_STEP             00:05:00
+DRY_STEP             01:00:00
+ROUTING_STEP         0:00:30
+LENGTHENING_STEP     0
+VARIABLE_STEP        0.75
+MINIMUM_STEP         0.5
+INERTIAL_DAMPING     PARTIAL
+NORMAL_FLOW_LIMITED  BOTH
+FORCE_MAIN_EQUATION  H-W
+EVAP_INTERP          STEP
+
+[EVAPORATION]
+;;Data Source    Parameters
+;;-------------- ----------------
+CONSTANT         0.0
+DRY_ONLY         NO
+
+[RAINGAGES]
+;;Name           Format    Interval SCF      Source
+;;-------------- --------- ------ ------ ----------
+RG_OBANDO        INTENSITY 1:00     1.0      TIMESERIES TS_RAIN
+
+[SUBCATCHMENTS]
+;;Name           Rain Gage        Outlet           Area     %Imperv  Width    %Slope   CurbLen  SnowPack
+;;-------------- ---------------- ---------------- -------- -------- -------- -------- -------- --------
+SC_OBANDO        RG_OBANDO        J_SENSOR         250      35       500      1.5      0
+;;  Area   = 250 ha  (approximate Obando catchment draining to sensor node)
+;;  Width  = 500 m   (hydraulic width, adjust from DEM/survey)
+;;  Slope  = 1.5%    (gentle lowland slope typical of Bulacan)
+
+[SUBAREAS]
+;;Subcatchment   N-Imperv   N-Perv     S-Imperv   S-Perv     PctZero    RouteTo    PctRouted
+;;-------------- ---------- ---------- ---------- ---------- ---------- ---------- ---------
+SC_OBANDO        0.015      0.24       1.8        3.5        25         OUTLET
+
+[INFILTRATION]
+;;Subcatchment   MaxRate    MinRate    Decay      DryTime    MaxInfil
+;;-------------- ---------- ---------- ---------- ---------- ----------
+;;  Horton parameters calibrated to Bulacan loam/clay soils (approx.)
+SC_OBANDO        76.2       3.81       4.14       7          0
+
+[JUNCTIONS]
+;;Name           Elevation  MaxDepth   InitDepth  SurDepth   Aponded
+;;-------------- ---------- ---------- ---------- ---------- ----------
+J_SENSOR         1.20       3.00       0.60       0          500
+;;  J_SENSOR: representative sensor location on Obando River
+;;  Elevation 1.20 m MSL (approximate; replace with survey benchmark)
+;;  MaxDepth  3.00 m corresponds to DANGER ceiling (2.58 m) + freeboard
+
+[OUTFALLS]
+;;Name           Elevation  Type       Stage Data       Gated    Route To
+;;-------------- ---------- ---------- ---------------- -------- ----------------
+OUT_MANILA_BAY   0.00       FREE                        NO
+
+[CONDUITS]
+;;Name           From Node        To Node          Length     Roughness  InOffset   OutOffset  InitFlow   MaxFlow
+;;-------------- ---------------- ---------------- ---------- ---------- ---------- ---------- ---------- ----------
+C_MAIN           J_SENSOR         OUT_MANILA_BAY   8000       0.018      0          0          0          0
+;;  C_MAIN: ~8 km main channel from sensor node to Manila Bay outfall
+;;  Roughness 0.018 = concrete-lined; increase to 0.035 for natural channel
+
+[XSECTIONS]
+;;Link           Shape        Geom1            Geom2      Geom3      Geom4      Barrels    Culvert
+;;-------------- ------------ ---------------- ---------- ---------- ---------- ---------- ----------
+C_MAIN           TRAPEZOIDAL  3.0              20         2          2          1
+
+[TIMESERIES]
+;;Name           Date       Time       Value
+;;-------------- ---------- ---------- ----------
+;;  CLEAR scenario: ~1.5 mm/hr (dry season baseline)
+TS_RAIN          01/01/2024 00:00      1.5
+TS_RAIN          01/01/2024 06:00      1.8
+TS_RAIN          01/01/2024 12:00      1.2
+TS_RAIN          01/01/2024 18:00      0.8
+;;  Extend or replace with actual PAGASA rainfall records.
+;;  For stress-test scenarios, this timeseries is overridden
+;;  programmatically by stress_test_gen.py via pyswmm.
+
+[REPORT]
+;;Reporting Options
+INPUT      NO
+CONTROLS   NO
+SUBCATCHMENTS ALL
+NODES ALL
+LINKS ALL
+
+[TAGS]
+
+[MAP]
+DIMENSIONS 120.919 14.820 120.985 14.872
+Units      Degrees
+
+[COORDINATES]
+;;Node           X-Coord            Y-Coord
+;;-------------- ------------------ ------------------
+J_SENSOR         120.9520           14.8320
+OUT_MANILA_BAY   120.9600           14.8150
+
+[VERTICES]
+
+[Polygons]
+;;Subcatchment   X-Coord            Y-Coord
+;;-------------- ------------------ ------------------
+SC_OBANDO        120.9300           14.8400
+SC_OBANDO        120.9700           14.8400
+SC_OBANDO        120.9700           14.8200
+SC_OBANDO        120.9300           14.8200
+
+[SYMBOLS]
+;;Gage           X-Coord            Y-Coord
+;;-------------- ------------------ ------------------
+RG_OBANDO        120.9400           14.8500

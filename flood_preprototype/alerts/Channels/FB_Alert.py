@@ -90,29 +90,35 @@ TIER_EMOJI = {
 }
 
 TIER_MESSAGE = {
-    "WATCH": (
-        "🟡 FLOOD WATCH — Obando, Bulacan\n\n"
-        "Elevated flood risk detected by the Rapid Relay Early Warning System.\n"
-        "Monitor water levels closely. Be prepared to act.\n\n"
-        "Flood Probability : {prob_pct}\n"
-        "Date              : {timestamp}\n\n"
-        "Stay safe. Follow official advisories from local DRRMO."
+"WATCH": (
+        "🟡 **MAGMASID (WATCH)** — Obando, Bulacan\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "⚠️ **STATUS:** May bahagyang banta ng baha sa nakuhang data.\n"
+        "📢 **ACTION:** Magmasid sa lebel ng tubig. Maging handa.\n\n"
+        "📊 **DATA:**\n"
+        "• Prob. ng Baha: {prob_pct}\n"
+        "• Oras: {timestamp}\n\n"
+        "Stay safe. Follow official DRRMO advisories."
     ),
     "WARNING": (
-        "🟠 FLOOD WARNING — Obando, Bulacan\n\n"
-        "High flood risk detected by the Rapid Relay Early Warning System.\n"
-        "Prepare for possible flooding. Move valuables to higher ground.\n\n"
-        "Flood Probability : {prob_pct}\n"
-        "Date              : {timestamp}\n\n"
-        "Stay safe. Follow official advisories from local DRRMO."
+        "🟠 **BABALA (WARNING)** — Obando, Bulacan\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "⚠️ **STATUS:** Mataas ang posibilidad ng pagbaha.\n"
+        "📢 **ACTION:** Maghanda na. Itaas ang mga mahahalagang gamit.\n\n"
+        "📊 **DATA:**\n"
+        "• Prob. ng Baha: {prob_pct}\n"
+        "• Oras: {timestamp}\n\n"
+        "Stay safe. Follow official DRRMO advisories."
     ),
     "DANGER": (
-        "🔴 FLOOD DANGER — Obando, Bulacan\n\n"
-        "IMMINENT or ONGOING flood detected by the Rapid Relay Early Warning System.\n"
-        "Take immediate action. Evacuate if in flood-prone areas.\n\n"
-        "Flood Probability : {prob_pct}\n"
-        "Date              : {timestamp}\n\n"
-        "🚨 Follow evacuation orders from local DRRMO immediately."
+        "🔴 **PELIGRO (DANGER)** — Obando, Bulacan\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🚨 **STATUS:** MAY BAHA NA o malapit na ang matinding pagbaha.\n"
+        "📢 **ACTION:** LUMIKAS NA AGAD kung ikaw ay nasa mababang lugar.\n\n"
+        "📊 **DATA:**\n"
+        "• Prob. ng Baha: {prob_pct}\n"
+        "• Oras: {timestamp}\n\n"
+        "‼️ **SUMUNOD SA UTOS NG DRRMO PARA SA EVACUATION.**"
     ),
 }
 

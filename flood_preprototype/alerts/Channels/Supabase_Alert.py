@@ -38,7 +38,7 @@ CSV_PATH = os.path.abspath(
         SCRIPT_DIR,
         "..", "..",
         "predictions",
-        "flood_rf_sensor_predictions.csv"
+        "flood_xgb_sensor_predictions.csv"
     )
 )
 
