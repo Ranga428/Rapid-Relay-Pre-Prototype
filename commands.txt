@@ -74,3 +74,8 @@ python RF_Predict.py --data ..\data\flood_dataset_test.csv
 python LGBM_Predict.py --data ..\data\sensor\combined_sensor_context.csv
 python XGB_Predict.py --data ..\data\sensor\combined_sensor_context.csv
 python RF_Predict.py --data ..\data\sensor\combined_sensor_context.csv
+
+
+
+### TERMINAL DESIGN ###
+pip install pyfiglet

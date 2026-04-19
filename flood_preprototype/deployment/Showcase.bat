@@ -6,7 +6,7 @@ REM Activate the virtual environment (two levels up from deployment\)
 call ..\..\floodenv\Scripts\activate.bat
 
 REM Move into the scripts folder where Rapid_Relay_Showcase.py lives
-cd /d "%~dp0..\scripts"
+cd /d "%~dp0..\showcase"
 
 REM Run the realtime pipeline
 python Rapid_Relay_Showcase.py --realtime --predict-on-insert
