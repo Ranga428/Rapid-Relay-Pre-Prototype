@@ -31,10 +31,7 @@ EOF
 cd "$SCRIPT_DIR/../showcase"
 
 # Run the realtime pipeline
-python Rapid_Relay_Showcase.py \
-    --realtime \
-    --predict-on-insert \
-    --force-fb
+python python .\showcase_start.py
 
 # Keep terminal open on crash so you can read the error
 echo ""
