@@ -15,6 +15,13 @@ Changes from original:
   - All other calibration logic is identical to the original.
   - ingest_latest() updated to full-sync mode: fetches ALL Supabase rows and
     appends any that are missing from the CSV, regardless of insertion order.
+  - ingest_latest() returns (wrote: bool, supabase_has_new: bool) so the
+    pipeline always continues even when a new Supabase row produces a
+    duplicate entry.
+  - COL_SOIL corrected to "Moisture" to match actual Supabase schema.
+  - Rows are ingested as-is (no daily aggregation).
+  - Deduplication is row-count based — every new Supabase row appended is
+    treated as genuinely new regardless of timestamp.
 
 Usage
 -----
@@ -102,7 +109,7 @@ TABLE_PREDICTIONS = "predictions"
 
 COL_DATE     = "Date"
 COL_TIME     = "Time"
-COL_SOIL     = "Soil Moisture"
+COL_SOIL     = "Soil Moisture"          # matches actual Supabase column name
 COL_HUMIDITY = "Humidity"
 COL_DISTANCE = "Final Distance"
 
@@ -168,26 +175,22 @@ def _calibrate_humidity(hw_rh: float) -> float:
 
 
 def calibrate_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply hardware calibration to each row individually.
+    No daily aggregation — every reading is preserved as-is.
+    """
     out = df.copy()
     out["waterlevel"] = out["waterlevel"].apply(_calibrate_waterlevel)
     invalid = out["waterlevel"].isna().sum()
     out = out.dropna(subset=["waterlevel"])
     out["soil_moisture"] = out["soil_moisture"].apply(_calibrate_soil_moisture)
     out["humidity"]      = out["humidity"].apply(_calibrate_humidity)
-    out["date"] = out["timestamp"].str[:10]
-    daily = (
-        out.groupby("date", sort=True)[["waterlevel", "soil_moisture", "humidity"]]
-        .mean()
-        .round(6)
-        .reset_index()
-    )
-    daily["timestamp"] = daily["date"] + "T00:00:00"
-    daily = daily[["timestamp", "waterlevel", "soil_moisture", "humidity"]]
+    out = out[["timestamp", "waterlevel", "soil_moisture", "humidity"]]
     log.info(
-        "Aggregated %d calibrated reading(s) → %d daily mean row(s) (dropped %d invalid).",
-        len(out), len(daily), invalid,
+        "Calibrated %d reading(s) (dropped %d invalid).",
+        len(out), invalid,
     )
-    return daily
+    return out
 
 
 def print_calibration_summary() -> None:
@@ -374,30 +377,28 @@ def date_already_in_csv(target_date: str) -> bool:
         return False
 
 
-def _existing_timestamps(csv_path: Path) -> set[str]:
+def _existing_row_count(csv_path: Path) -> int:
+    """Return the number of data rows currently in the CSV (excluding header)."""
     if not csv_path.exists():
-        return set()
+        return 0
     try:
-        df = pd.read_csv(csv_path, usecols=["timestamp"])
-        return set(df["timestamp"].astype(str).tolist())
+        df = pd.read_csv(csv_path, usecols=["row_number"])
+        return len(df)
     except Exception:
-        return set()
+        # Fallback: count all rows if row_number column not present yet
+        try:
+            return sum(1 for _ in open(csv_path)) - 1  # subtract header
+        except Exception:
+            return 0
 
 
 def append_rows_to_csv(rows: pd.DataFrame, dry_run: bool = False) -> int:
     if rows.empty:
         return 0
 
-    rows = rows[["timestamp", "waterlevel", "soil_moisture", "humidity"]].copy()
-    existing = _existing_timestamps(SENSOR_CSV)
-    before   = len(rows)
-    rows     = rows[~rows["timestamp"].astype(str).isin(existing)]
-    skipped  = before - len(rows)
-    if skipped:
-        log.warning("Skipped %d row(s) already present in showcase_sensor.csv.", skipped)
-
-    if rows.empty:
-        return 0
+    # Strictly enforce your required columns
+    cols = ["timestamp", "waterlevel", "soil_moisture", "humidity"]
+    rows = rows[cols].copy()
 
     SENSOR_CSV.parent.mkdir(parents=True, exist_ok=True)
 
@@ -406,10 +407,12 @@ def append_rows_to_csv(rows: pd.DataFrame, dry_run: bool = False) -> int:
         print(rows.to_string(index=False))
         return len(rows)
 
+    # Write logic
     if not SENSOR_CSV.exists():
         rows.to_csv(SENSOR_CSV, index=False)
         log.info("Created %s with %d row(s)", SENSOR_CSV, len(rows))
     else:
+        # Append mode: header=False ensures we don't repeat 'timestamp, waterlevel...' mid-file
         rows.to_csv(SENSOR_CSV, mode="a", header=False, index=False)
         log.info("Appended %d new row(s) to %s", len(rows), SENSOR_CSV)
 
@@ -417,25 +420,33 @@ def append_rows_to_csv(rows: pd.DataFrame, dry_run: bool = False) -> int:
 
 
 def append_raw_rows_to_csv(rows: pd.DataFrame, dry_run: bool = False) -> int:
+    """
+    Write raw (uncalibrated, distance-converted) rows to showcase_sensor_raw.csv.
+    Rows are stored as-is — no daily aggregation.
+    """
     if rows.empty:
         return 0
 
     raw = rows[["timestamp", "waterlevel", "soil_moisture", "humidity"]].copy()
     raw["waterlevel"] = (DIKE_HEIGHT_M - raw["waterlevel"]).round(6)
-    raw["date"] = raw["timestamp"].str[:10]
-    daily_raw = (
-        raw.groupby("date", sort=True)[["waterlevel", "soil_moisture", "humidity"]]
-        .mean()
-        .round(6)
-        .reset_index()
-    )
-    daily_raw["timestamp"] = daily_raw["date"] + "T00:00:00"
-    raw = daily_raw[["timestamp", "waterlevel", "soil_moisture", "humidity"]]
 
-    existing = _existing_timestamps(SENSOR_CSV_RAW)
-    before   = len(raw)
-    raw      = raw[~raw["timestamp"].astype(str).isin(existing)]
-    skipped  = before - len(raw)
+    # Assign sequential row numbers starting after the last existing row
+    existing_count = _existing_row_count(SENSOR_CSV_RAW)
+    raw.insert(0, "row_number", range(existing_count, existing_count + len(raw)))
+
+    # Dedup by row_number
+    existing_row_nums: set[int] = set()
+    if SENSOR_CSV_RAW.exists():
+        try:
+            existing_row_nums = set(
+                pd.read_csv(SENSOR_CSV_RAW, usecols=["row_number"])["row_number"].tolist()
+            )
+        except Exception:
+            pass
+
+    before  = len(raw)
+    raw     = raw[~raw["row_number"].isin(existing_row_nums)]
+    skipped = before - len(raw)
     if skipped:
         log.warning("Skipped %d raw row(s) already present in showcase_sensor_raw.csv.", skipped)
 
@@ -462,56 +473,65 @@ def append_raw_rows_to_csv(rows: pd.DataFrame, dry_run: bool = False) -> int:
 # Public API
 # ---------------------------------------------------------------------------
 
-def ingest_latest(dry_run: bool = False) -> bool:
+def ingest_latest(dry_run: bool = False) -> tuple[bool, bool]:
     """
-    Full-sync ingest. Fetches ALL rows from Supabase, calibrates them to
-    daily aggregates, then appends any rows not already present in
-    showcase_sensor.csv — regardless of when they were inserted.
+    Full-sync ingest. Fetches ALL rows from Supabase, calibrates them
+    individually (no daily aggregation), then appends rows not yet in
+    showcase_sensor.csv — determined by row count, not timestamp.
 
-    This means late-arriving or backfilled historical rows in Supabase will
-    always be picked up, not just rows newer than the CSV's latest timestamp.
+    Every new Supabase row appended triggers a pipeline run, regardless of
+    whether its timestamp duplicates an existing row.
 
-    Returns True if at least one new row was written.
+    Returns
+    -------
+    (wrote, supabase_has_new)
+        wrote            : True if at least one new row was written to CSV
+        supabase_has_new : True if Supabase had rows at all — tells the
+                           pipeline to keep running even when the new row
+                           is invalid (null timestamp etc).
     """
     if not USE_HARDWARE:
         log.info("USE_HARDWARE=False — ingestion skipped.")
-        return False
+        return False, False
 
-    # Get all timestamps already in the CSV
-    existing_ts = _existing_timestamps(SENSOR_CSV)
-    log.info("CSV currently has %d row(s).", len(existing_ts))
+    existing_count = _existing_row_count(SENSOR_CSV)
+    log.info("CSV currently has %d row(s).", existing_count)
 
     # Fetch ALL rows from Supabase (no date cutoff)
     raw = fetch_rows_since(after_timestamp=None)
 
     if raw.empty:
         log.info("No rows in Supabase — nothing to do.")
-        return False
+        return False, False
 
-    # Calibrate to daily aggregates
+    # Calibrate each row individually
     calibrated = calibrate_df(raw)
 
     if calibrated.empty:
         log.warning("All fetched rows were discarded as invalid sensor readings.")
-        return False
+        return False, True
 
-    # Find which calibrated rows are missing from the CSV
-    new_rows = calibrated[~calibrated["timestamp"].astype(str).isin(existing_ts)]
+    # New rows = everything in calibrated beyond what the CSV already holds.
+    # This is position-based, not timestamp-based — so duplicate timestamps
+    # each count as distinct rows.
+    new_rows = calibrated.iloc[existing_count:]
 
     if new_rows.empty:
         log.info(
-            "CSV already has all %d Supabase row(s) — up to date.", len(calibrated)
+            "CSV already has all %d Supabase row(s) — no new rows to write, "
+            "pipeline will still proceed.",
+            len(calibrated),
         )
-        return False
+        return False, True
 
     log.info(
-        "Found %d new/missing row(s) not in CSV (Supabase has %d, CSV has %d).",
-        len(new_rows), len(calibrated), len(existing_ts),
+        "Found %d new row(s) (Supabase has %d calibrated, CSV has %d).",
+        len(new_rows), len(calibrated), existing_count,
     )
 
-    append_raw_rows_to_csv(raw, dry_run=dry_run)
+    append_raw_rows_to_csv(raw.iloc[existing_count:], dry_run=dry_run)
     written = append_rows_to_csv(new_rows, dry_run=dry_run)
-    return written > 0
+    return written > 0, True
 
 
 # ---------------------------------------------------------------------------
@@ -586,11 +606,11 @@ def _watch_realtime(dry_run: bool = False,
 
         def _do_ingest():
             try:
-                wrote = ingest_latest(dry_run=dry_run)
+                wrote, _ = ingest_latest(dry_run=dry_run)
                 if wrote:
                     print(f"  [realtime] ✅  showcase_sensor.csv updated.")
                 else:
-                    print(f"  [realtime] No new calibrated rows (all invalid or duplicates).")
+                    print(f"  [realtime] No new rows (all invalid or duplicates).")
             except Exception as exc:
                 print(f"  [realtime] ⚠️  Ingest error: {exc}")
                 log.exception("Ingest error after realtime trigger")
@@ -659,11 +679,11 @@ def _watch_polling(poll_interval: int = DEFAULT_POLL_INTERVAL,
                 print(f"\n  [poll] ✅ {new_rows_detected} new row(s) detected "
                       f"(count: {last_count} → {current_count})")
                 last_count = current_count
-                wrote = ingest_latest(dry_run=dry_run)
+                wrote, _ = ingest_latest(dry_run=dry_run)
                 if wrote:
                     print(f"  [poll] showcase_sensor.csv updated.")
                 else:
-                    print(f"  [poll] No calibrated rows written (all invalid or duplicates).")
+                    print(f"  [poll] No rows written (all invalid or duplicates).")
             else:
                 ts = pd.Timestamp.now().strftime("%H:%M:%S")
                 print(f"  [poll] {ts}  No new rows (count={current_count})", end="\r")
@@ -674,9 +694,6 @@ def _watch_polling(poll_interval: int = DEFAULT_POLL_INTERVAL,
 
 def ingest_date(target_date: str, dry_run: bool = False) -> bool:
     if not USE_HARDWARE:
-        return False
-    if date_already_in_csv(target_date):
-        log.info("%s already in showcase_sensor.csv — skipping.", target_date)
         return False
     raw = fetch_rows_for_date(target_date)
     if raw.empty:
@@ -703,6 +720,8 @@ if __name__ == "__main__":
             "Showcase sensor ingest — writes to showcase_sensor.csv.\n"
             "Default: one-shot full-sync ingest (fetches all Supabase rows,\n"
             "appends any missing from CSV regardless of insertion order).\n"
+            "Rows are stored as individual readings — no daily aggregation.\n"
+            "Deduplication is row-count based, not timestamp based.\n"
             "--watch         : Realtime websocket (fires on INSERT, zero latency).\n"
             "--watch --poll  : Polling fallback (checks row count every N seconds)."
         )
