@@ -8,7 +8,8 @@ Changes from original:
   - Hardware input: showcase_sensor.csv  (instead of obando_sensor_data.csv)
   - Output CSV    : showcase_merge.csv   (instead of combined_sensor_context.csv)
   - All paths resolved relative to showcase/ folder.
-  - All merge logic is identical to the original.
+  - Keeps ALL sub-daily rows (no daily flooring, no dropping duplicates).
+  - Merges on exact raw timestamps.
 
 Usage
 -----
@@ -31,7 +32,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))   # showcase/
-PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)                   # flood_preprototype/
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)                  # flood_preprototype/
 DATA_ROOT    = os.path.join(PROJECT_ROOT, "data")
 SENSOR_DIR   = os.path.join(DATA_ROOT, "sensor")
 
@@ -90,7 +91,7 @@ def get_cutoff_date(output_path: str) -> "pd.Timestamp | None":
             return None
         existing.index = pd.to_datetime(existing.index, utc=True)
         cutoff = existing.index.max()
-        print(f"  showcase_merge.csv last row : {cutoff.date()}  ({len(existing):,} rows)")
+        print(f"  showcase_merge.csv last row : {cutoff}  ({len(existing):,} rows)")
         return cutoff
     except Exception as e:
         print(f"  WARNING: Could not read output CSV ({e}) — full rebuild.")
@@ -116,20 +117,20 @@ def load_csv(path: str, label: str,
 
         df.index = pd.to_datetime(df.index, utc=True)
         df = df.sort_index()
-        df.index = df.index.floor("D")
-        df = df[~df.index.duplicated(keep="last")]
-        total_rows = len(df)
+        
+        # REMOVED: df.index = df.index.floor("D") 
+        # REMOVED: df = df[~df.index.duplicated(keep="last")]
 
         if history_start is not None:
             df = df[df.index >= history_start]
 
         if after is not None:
             df = df[df.index > after]
-            print(f"  {label:<12}: {len(df):>4} new rows after {after.date()}")
+            print(f"  {label:<12}: {len(df):>4} new rows after {after}")
         else:
             if len(df) > 0:
                 print(f"  {label:<12}: {len(df):>6,} rows  "
-                      f"| {df.index.min().date()} → {df.index.max().date()}")
+                      f"| {df.index.min()} → {df.index.max()}")
             else:
                 print(f"  {label:<12}: 0 rows after HISTORY_START filter")
 
@@ -165,25 +166,14 @@ def merge_sources(proxy: "pd.DataFrame | None",
         print("  NOTE: No hardware data — output is proxy-only.")
         return proxy[SENSOR_COLS].copy()
 
-    all_dates = pd.date_range(
-        start = min(proxy.index.min(), hardware.index.min()),
-        end   = max(proxy.index.max(), hardware.index.max()),
-        freq  = "D",
-        tz    = "UTC",
-    )
-
-    proxy_r    = proxy.reindex(all_dates)
-    hardware_r = hardware.reindex(all_dates)
-    merged     = hardware_r.combine_first(proxy_r)
+    # combine_first automatically aligns the exact sub-daily timestamps from both frames.
+    # Where both exist at the exact same time, hardware takes precedence.
+    merged = hardware.combine_first(proxy)
     merged.index.name = "timestamp"
 
-    hw_count    = hardware_r.notna().all(axis=1).sum()
-    proxy_count = (~hardware_r.notna().all(axis=1) & proxy_r.notna().all(axis=1)).sum()
-    gap_count   = (~hardware_r.notna().all(axis=1) & ~proxy_r.notna().all(axis=1)).sum()
-
-    print(f"  Hardware rows used : {hw_count:,}")
-    print(f"  Proxy fill rows    : {proxy_count:,}")
-    print(f"  Remaining gaps     : {gap_count:,}")
+    print(f"  Hardware rows provided : {len(hardware):,}")
+    print(f"  Proxy rows provided    : {len(proxy):,}")
+    print(f"  Total merged timeline  : {len(merged):,} rows")
 
     return merged[SENSOR_COLS]
 
@@ -202,9 +192,18 @@ def interpolate_gaps(merged: pd.DataFrame) -> pd.DataFrame:
         return merged
 
     merged = merged.copy()
-    merged[SENSOR_COLS] = merged[SENSOR_COLS].interpolate(
-        method="time", limit=MAX_INTERPOLATION_GAP
-    )
+    
+    # Method="time" crashes if there are literal duplicate timestamps in the index.
+    # We fallback to standard linear interpolation if you have exact timestamp duplicates.
+    try:
+        merged[SENSOR_COLS] = merged[SENSOR_COLS].interpolate(
+            method="time", limit=MAX_INTERPOLATION_GAP
+        )
+    except ValueError:
+        merged[SENSOR_COLS] = merged[SENSOR_COLS].interpolate(
+            method="linear", limit=MAX_INTERPOLATION_GAP
+        )
+        
     still_empty = merged[SENSOR_COLS[0]].isna().sum()
     filled      = n_gaps - still_empty
     print(f"  Gap interpolation : {n_gaps} gaps — {filled} filled, {still_empty} left as NaN")
@@ -239,8 +238,11 @@ def save_output(merged: pd.DataFrame, output_path: str, overwrite: bool = False)
                 existing.index = pd.to_datetime(existing.index, utc=True)
                 existing = existing[[c for c in SENSOR_COLS if c in existing.columns]]
                 existing = existing.dropna(subset=SENSOR_COLS, how="any")
-                combined = pd.concat([existing, merged[SENSOR_COLS]])
-                combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+                
+                # Append new rows and sort. 
+                # REMOVED: combined = combined[~combined.index.duplicated(keep="last")]
+                combined = pd.concat([existing, merged[SENSOR_COLS]]).sort_index()
+                
                 print(f"  Existing rows    : {len(existing):,}")
                 print(f"  Appended rows    : {len(merged):,}")
                 print(f"  Final row count  : {len(combined):,}")

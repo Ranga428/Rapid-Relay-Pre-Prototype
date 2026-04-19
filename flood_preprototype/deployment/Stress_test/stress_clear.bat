@@ -9,7 +9,7 @@ REM Move into the scripts folder where stress_test_gen.py lives
 cd /d "%~dp0..\..\scripts"
 
 REM Default count = 1. Override by calling: stress_clear.bat 31
-SET COUNT=31
+SET COUNT=1
 IF NOT "%~1"=="" SET COUNT=%~1
 
 echo.

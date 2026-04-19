@@ -3,10 +3,10 @@ report_date,metric,uptime_days,downtime_days,total_expected,availability_pct,not
 2026-04-19,Data availability — proxy  (showcase_proxy.csv),279,14,293,95.22,"Calendar days 2025-07-01 → 2026-04-19 with a complete non-null row. uptime=279 days present, downtime=14 days missing."
 2026-04-19,Data availability — merge  (showcase_merge.csv),283,10,293,96.59,"Calendar days 2025-07-01 → 2026-04-19 with a complete non-null row. uptime=283 days present, downtime=10 days missing."
 2026-04-19,Data availability — predict(showcase_predict.csv),283,10,293,96.59,"Calendar days 2025-07-01 → 2026-04-19 with a complete non-null row. uptime=283 days present, downtime=10 days missing."
-2026-04-19,Pipeline availability (runs completed),4,0,4,100.0,uptime=4 runs with latency>0 and known tier. downtime=0 runs failed or produced unrecognised tier.
-2026-04-19,Pipeline speed — ≤60s latency runs,2,2,4,50.0,Runs completing within 60 seconds end-to-end. downtime here = runs that took longer than 60s (2).
-2026-04-19,Pipeline speed — 60–300s latency runs,1,3,4,25.0,Runs completing between 60–300 seconds. downtime = runs outside this bracket (3).
-2026-04-19,Pipeline speed — >300s latency runs,1,3,4,25.0,Runs taking more than 5 minutes. downtime = runs that finished faster (3).
+2026-04-19,Pipeline availability (runs completed),13,0,13,100.0,uptime=13 runs with latency>0 and known tier. downtime=0 runs failed or produced unrecognised tier.
+2026-04-19,Pipeline speed — ≤60s latency runs,11,2,13,84.62,Runs completing within 60 seconds end-to-end. downtime here = runs that took longer than 60s (2).
+2026-04-19,Pipeline speed — 60–300s latency runs,1,12,13,7.69,Runs completing between 60–300 seconds. downtime = runs outside this bracket (12).
+2026-04-19,Pipeline speed — >300s latency runs,1,12,13,7.69,Runs taking more than 5 minutes. downtime = runs that finished faster (12).
 2026-04-19,Alert channel — Facebook (at least one post confirmed),1,0,1,100.0,Last post timestamp found in showcase_last_fb_posted.json. uptime=1 means ≥1 successful post exists; downtime=1 means no post recorded.
 2026-04-19,Alert channel — Telegram (at least one send confirmed),1,0,1,100.0,Last send timestamp found in showcase_last_tg_sent.json. uptime=1 means ≥1 successful send; downtime=1 means no send recorded.
-2026-04-19,Alert channel — Supabase (rows in showcase_predict.csv),284,0,3,9466.67,uptime=284 rows present in showcase_predict.csv. total=3 distinct prediction dates logged. downtime=0 dates without a prediction row.
+2026-04-19,Alert channel — Supabase (rows in showcase_predict.csv),304,0,3,10133.33,uptime=304 rows present in showcase_predict.csv. total=3 distinct prediction dates logged. downtime=0 dates without a prediction row.

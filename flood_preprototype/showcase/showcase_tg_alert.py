@@ -155,7 +155,7 @@ def send_telegram_message(token: str, chat_id: str, message_content: str) -> boo
 # ---------------------------------------------------------------------------
 
 def send(tier: str, probability: float, timestamp: str,
-         check_duplicate: bool = True) -> bool:
+         check_duplicate: bool = False) -> bool:
     """
     Standard send() interface for showcase_alert.py integration.
 
@@ -178,12 +178,6 @@ def send(tier: str, probability: float, timestamp: str,
     if tier in SKIP_TIERS:
         print(f"  [TG_Alert] Tier is {tier} — skipping (in SKIP_TIERS).")
         return False
-
-    if check_duplicate:
-        last_sent = _load_last_sent()
-        if last_sent == timestamp:
-            print(f"  [TG_Alert] Already sent for {timestamp} — skipping.")
-            return False
 
     template = TIER_MESSAGE.get(tier)
     if not template:
@@ -227,12 +221,7 @@ if __name__ == "__main__":
         print(f"  ⏭️  Tier {tier} is in SKIP_TIERS — no message sent.")
         _save_last_sent(ts)
         exit(0)
-
-    last_sent = _load_last_sent()
-    if last_sent == ts:
-        print(f"  ⏭️  Already sent for {ts}")
-        exit(0)
-
+        
     template = TIER_MESSAGE.get(tier)
     if not template:
         print(f"  ❌ Unknown tier '{tier}'.")

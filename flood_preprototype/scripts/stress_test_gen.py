@@ -758,20 +758,27 @@ def insert_stress_rows_to_supabase(
         return 0
 
     inserted = 0
+    # Get the current system time to use as the base for all inserts
+    now = datetime.now()
+
     for repeat in range(count):
         for i, (_, row) in enumerate(rows_df.iterrows()):
-            offset_min = base_time_offset_minutes + (repeat * len(rows_df)) + i
-            hour       = 12 + offset_min // 60
-            minute     = offset_min % 60
-            time_str   = f"{hour:02d}:{minute:02d}:00"
+            # Calculate offset: starting from 'now', increment by 1 minute per row
+            total_offset = base_time_offset_minutes + (repeat * len(rows_df)) + i
+            current_ts = now + timedelta(minutes=total_offset)
+            
+            time_str = current_ts.strftime("%H:%M:%S")
+            date_str = current_ts.strftime("%Y-%m-%d")
 
-            # Offset date by repeat index so rows land on different dates
+            # Update the row's timestamp so reverse calibration uses the correct date/time context
             row_with_offset = row.copy()
-            ts = pd.Timestamp(row["timestamp"]) + pd.Timedelta(days=repeat)
-            row_with_offset["timestamp"] = ts.strftime("%Y-%m-%dT%H:%M:%S")
+            row_with_offset["timestamp"] = current_ts.strftime("%Y-%m-%dT%H:%M:%S")
 
+            # Convert to hardware units using the dynamic time strings
             record = _row_to_hardware(row_with_offset, time_str)
-            tier   = row.get("_tier_label", "?")
+            record[COL_DATE] = date_str # Ensure Date column matches our calculated TS
+            
+            tier = row.get("_tier_label", "?")
 
             print(f"  [SUPABASE] Inserting {tier} row {repeat+1}/{count} → "
                   f"Date={record[COL_DATE]}  Time={record[COL_TIME]}  "

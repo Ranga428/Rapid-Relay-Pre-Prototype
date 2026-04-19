@@ -9,6 +9,7 @@ Changes from original:
   - Plot PNG          : showcase_predict.png
   - All script references updated to showcase/ folder.
   - All model/inference logic is identical to the original.
+  - Predicts on every single new row — no training cutoff filter.
 
 Usage
 -----
@@ -207,11 +208,9 @@ def load_live_features() -> pd.DataFrame:
 
 
 def filter_new_rows(features: pd.DataFrame) -> pd.DataFrame:
-    separator("Filtering to New Data Only")
-    training_cutoff = pd.Timestamp(LAST_TRAINING_DATE, tz="UTC")
+    separator("Filtering to New Rows Only")
 
     already_predicted = set()
-    csv_cutoff = training_cutoff
 
     if os.path.exists(PREDICTIONS_CSV):
         try:
@@ -220,32 +219,27 @@ def filter_new_rows(features: pd.DataFrame) -> pd.DataFrame:
             if not existing.empty:
                 if existing.index.tzinfo is None:
                     existing.index = existing.index.tz_localize("UTC")
-
-                last_saved        = existing.index.max()
                 already_predicted = set(existing.index)
-                csv_cutoff        = last_saved
-                print(f"  showcase_predict.csv last row : {last_saved.date()}")
-                print(f"  showcase_predict.csv rows     : {len(existing):,}")
+                print(f"  showcase_predict.csv rows : {len(existing):,}")
             else:
                 print("  showcase_predict.csv exists but is empty.")
         except Exception as e:
-            print(f"  Could not read predictions CSV ({e}) — processing from training cutoff")
+            print(f"  Could not read predictions CSV ({e}) — processing all rows")
     else:
-        print("  showcase_predict.csv not found — processing all data from training cutoff")
+        print("  showcase_predict.csv not found — processing all rows")
 
-    candidate_df = features[features.index > training_cutoff]
-    new_df       = candidate_df[~candidate_df.index.isin(already_predicted)]
+    new_df = features[~features.index.isin(already_predicted)]
 
-    print(f"  Training cutoff  : {LAST_TRAINING_DATE}")
-    print(f"  Full history     : {len(features):,} rows")
+    print(f"  Total rows       : {len(features):,}")
     print(f"  Already saved    : {len(already_predicted):,} rows (skipped)")
     print(f"  New rows         : {len(new_df):,}")
 
     if len(new_df) == 0:
         sys.exit(
-            f"\n  No new data found after {csv_cutoff.date()}.\n"
+            f"\n  No new rows found.\n"
             f"  Append new sensor rows to showcase_merge.csv and re-run.\n"
         )
+
     print(f"  Date range       : {new_df.index[0].date()} → {new_df.index[-1].date()}")
     return new_df
 

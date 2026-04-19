@@ -237,11 +237,16 @@ def run_pipeline(run_n: int, delta: int, total: int,
     SensorIngest = _import("showcase_sensor_ingest")
     if SensorIngest:
         try:
-            updated = SensorIngest.ingest_latest()
-            if updated:
+            wrote, supabase_has_new = SensorIngest.ingest_latest()
+            if wrote:
                 print(f"  {C.GREEN}✓{C.RESET}  showcase_sensor.csv updated.")
+            elif supabase_has_new:
+                print(
+                    f"  {C.DIM}No new rows to write — "
+                    f"CSV unchanged, pipeline continuing.{C.RESET}"
+                )
             else:
-                print(f"  {C.DIM}No new calibrated rows (may be same-day duplicate).{C.RESET}")
+                print(f"  {C.DIM}No rows in Supabase — nothing ingested.{C.RESET}")
         except Exception as e:
             print(f"  {C.YELLOW}WARNING{C.RESET}  Sensor ingest failed: {e}")
             traceback.print_exc()
@@ -295,7 +300,7 @@ def run_pipeline(run_n: int, delta: int, total: int,
         print(f"  {C.GREEN}✓{C.RESET}  Prediction complete.")
     except SystemExit as e:
         print(f"  {C.YELLOW}predict exited early:{C.RESET} {e}")
-        print(f"  {C.DIM}No new rows past training cutoff.{C.RESET}")
+        print(f"  {C.DIM}No new rows to predict on.{C.RESET}")
     except Exception as e:
         print(f"  {C.RED}ERROR{C.RESET}  showcase_predict.py: {e}")
         traceback.print_exc()
