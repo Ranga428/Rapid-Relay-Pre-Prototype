@@ -44,9 +44,9 @@ SWMM model:
   If the file does not exist, a minimal placeholder is auto-written.
 
 Value ranges from HEC-HMS calibration data (2017–2026):
-  waterlevel   : 0.60 – 2.58 m
-  soil_moisture: 0.22 – 0.50 (normalized)
-  humidity     : 0.15 – 6.87 (CWV scaled)
+  waterlevel   : 0.40 – 3.00 m  (expanded for extreme stress test coverage)
+  soil_moisture: 0.15 – 0.55 (normalized)
+  humidity     : 0.05 – 8.50 (CWV scaled)
 
 ─────────────────────────────────────────────────────────────────────
 --supabase FLAG  (NEW)
@@ -137,23 +137,23 @@ SWMM_RAINGAUGE     = "RG_OBANDO"    # rain gauge whose timeseries we override
 # ---------------------------------------------------------------------------
 
 TIER_RAINFALL_MM_HR = {
-    "clear":   1.5,
+    "clear":   0.5,    # near-zero rainfall — deep dry season baseline
     "watch":   10.0,
-    "warning": 30.0,
-    "danger":  60.0,
+    "warning": 35.0,   # slightly more aggressive than before
+    "danger":  90.0,   # typhoon-level forcing — extreme event
 }
 
 # ---------------------------------------------------------------------------
-# TIER PROFILES  (fallback ranges used when pyswmm is unavailable)
+# TIER PROFILES
 # ---------------------------------------------------------------------------
 
 TIER_PROFILES = {
     "clear": {
         "label":         "CLEAR",
-        "description":   "Dry season baseline — low water, dry soil, low humidity.",
-        "waterlevel":    (0.60, 0.75),
-        "soil_moisture": (0.22, 0.30),
-        "humidity":      (0.15, 1.50),
+        "description":   "Deep dry season — bone-dry soil, near-zero humidity, minimal water.",
+        "waterlevel":    (0.40, 0.65),    # was (0.60, 0.75) — pushed lower
+        "soil_moisture": (0.15, 0.24),    # was (0.22, 0.30) — truly dry soil
+        "humidity":      (0.05, 0.80),    # was (0.15, 1.50) — near-zero atmospheric moisture
     },
     "watch": {
         "label":         "WATCH",
@@ -165,16 +165,16 @@ TIER_PROFILES = {
     "warning": {
         "label":         "WARNING",
         "description":   "Active flood conditions — high water, saturating soil.",
-        "waterlevel":    (1.20, 2.00),
-        "soil_moisture": (0.38, 0.45),
-        "humidity":      (3.00, 4.50),
+        "waterlevel":    (1.35, 2.10),    # was (1.20, 2.00) — shifted higher
+        "soil_moisture": (0.40, 0.47),    # was (0.38, 0.45) — approaching saturation
+        "humidity":      (3.20, 5.00),    # was (3.00, 4.50) — shifted higher
     },
     "danger": {
         "label":         "DANGER",
-        "description":   "Extreme flood — peak water level, soil at capacity.",
-        "waterlevel":    (2.00, 2.58),
-        "soil_moisture": (0.45, 0.50),
-        "humidity":      (4.50, 6.87),
+        "description":   "Catastrophic flood — overtopping risk, soil fully saturated.",
+        "waterlevel":    (2.20, 3.00),    # was (2.00, 2.58) — exceeds historical peak
+        "soil_moisture": (0.47, 0.55),    # was (0.45, 0.50) — beyond field saturation
+        "humidity":      (5.50, 8.50),    # was (4.50, 6.87) — well above calibrated max
     },
 }
 
@@ -184,12 +184,12 @@ ESCALATION_ORDER = ["clear", "watch", "warning", "danger"]
 # SENSOR SCALING CONSTANTS
 # ---------------------------------------------------------------------------
 
-SM_OUT_LO, SM_OUT_HI = 0.22, 0.50
+SM_OUT_LO, SM_OUT_HI = 0.15, 0.55   # updated to match new CLEAR low / DANGER high
 SM_IN_LO,  SM_IN_HI  = 0.00, 1.00
 
 HUMIDITY_RUNOFF_PEAK = 50.0
-HUMIDITY_CWV_MIN     = 0.15
-HUMIDITY_CWV_MAX     = 6.87
+HUMIDITY_CWV_MIN     = 0.05          # updated to match new CLEAR low
+HUMIDITY_CWV_MAX     = 8.50          # updated to match new DANGER high
 
 # ---------------------------------------------------------------------------
 # CALIBRATION CONSTANTS  (must mirror sensor_ingest.py exactly)
@@ -210,8 +210,8 @@ SOIL_PROXY_WET = 0.463
 
 HUMIDITY_HW_MIN    = 78.5
 HUMIDITY_HW_MAX    = 88.78
-HUMIDITY_PROXY_MIN = 0.15
-HUMIDITY_PROXY_MAX = 6.87
+HUMIDITY_PROXY_MIN = 0.05            # updated to match new CLEAR low
+HUMIDITY_PROXY_MAX = 8.50            # updated to match new DANGER high
 
 # Supabase table + column names (must mirror sensor_ingest.py)
 TABLE_ENV_DATA = "obando_environmental_data"
@@ -271,7 +271,7 @@ DRY_ONLY         NO
 
 [JUNCTIONS]
 ;;Name  Elev  MaxDepth  InitDepth  SurDepth  Aponded
-{sensor_node}  1.2  3.0  0.6  0  500
+{sensor_node}  1.2  3.0  0.4  0  500
 
 [OUTFALLS]
 ;;Name  Elev  Type  Gated
@@ -842,21 +842,22 @@ TIER_COLORS = {
     "all_tiers_sequence": {"bg": "#e3f2fd", "line": "#0d47a1", "label": "ALL TIERS"},
 }
 
+# Updated thresholds to match new tier profile boundaries
 WL_THRESHOLDS = {
     "WATCH entry":   (0.75,  "gold"),
-    "WARNING entry": (1.20,  "orange"),
-    "DANGER entry":  (2.00,  "red"),
+    "WARNING entry": (1.35,  "orange"),   # was 1.20
+    "DANGER entry":  (2.20,  "red"),      # was 2.00
 }
 
 _COL_THRESHOLDS = [
-    [(0.75, "gold",   "WATCH"), (1.20, "orange", "WARNING"), (2.00, "red",    "DANGER")],
-    [(0.30, "gold",   "WATCH"), (0.38, "orange", "WARNING"), (0.45, "red",    "DANGER")],
-    [(1.50, "gold",   "WATCH"), (3.00, "orange", "WARNING"), (4.50, "red",    "DANGER")],
+    [(0.75, "gold",   "WATCH"), (1.35, "orange", "WARNING"), (2.20, "red",    "DANGER")],
+    [(0.30, "gold",   "WATCH"), (0.40, "orange", "WARNING"), (0.47, "red",    "DANGER")],
+    [(1.50, "gold",   "WATCH"), (3.20, "orange", "WARNING"), (5.50, "red",    "DANGER")],
 ]
 _COL_SPANS = [
-    [(0, 0.75, "green"), (0.75, 1.20, "gold"), (1.20, 2.00, "orange"), (2.00, 3.10, "red")],
-    [(0, 0.30, "green"), (0.30, 0.38, "gold"), (0.38, 0.45, "orange"), (0.45, 0.56, "red")],
-    [(0, 1.50, "green"), (1.50, 3.00, "gold"), (3.00, 4.50, "orange"), (4.50, 7.80, "red")],
+    [(0, 0.75, "green"), (0.75, 1.35, "gold"), (1.35, 2.20, "orange"), (2.20, 3.20, "red")],
+    [(0, 0.30, "green"), (0.30, 0.40, "gold"), (0.40, 0.47, "orange"), (0.47, 0.60, "red")],
+    [(0, 1.50, "green"), (1.50, 3.20, "gold"), (3.20, 5.50, "orange"), (5.50, 9.00, "red")],
 ]
 _TIER_ZONE_LEGEND = [
     mpatches.Patch(color="green",      alpha=0.5, label="CLEAR zone"),
@@ -964,14 +965,14 @@ def plot_stress_csv(df: pd.DataFrame, tier_key: str, out_dir: Path) -> Path:
         ax1.axhline(tval, color=tcolor, linestyle="--", linewidth=1.1,
                     alpha=0.8, label=f"{tlabel} ({tval}m)")
     ax1.axhspan(0,    0.75, alpha=0.06, color="green",  zorder=0)
-    ax1.axhspan(0.75, 1.20, alpha=0.07, color="gold",   zorder=0)
-    ax1.axhspan(1.20, 2.00, alpha=0.07, color="orange", zorder=0)
-    ax1.axhspan(2.00, 3.00, alpha=0.08, color="red",    zorder=0)
+    ax1.axhspan(0.75, 1.35, alpha=0.07, color="gold",   zorder=0)
+    ax1.axhspan(1.35, 2.20, alpha=0.07, color="orange", zorder=0)
+    ax1.axhspan(2.20, 3.20, alpha=0.08, color="red",    zorder=0)
     for ylo, yhi, tlabel, tcolor in [
         (0,    0.75, "CLEAR",   "green"),
-        (0.75, 1.20, "WATCH",   "goldenrod"),
-        (1.20, 2.00, "WARNING", "darkorange"),
-        (2.00, 3.00, "DANGER",  "red"),
+        (0.75, 1.35, "WATCH",   "goldenrod"),
+        (1.35, 2.20, "WARNING", "darkorange"),
+        (2.20, 3.20, "DANGER",  "red"),
     ]:
         ax1.annotate(
             tlabel, xy=(1.002, (ylo + yhi) / 2),
@@ -990,14 +991,14 @@ def plot_stress_csv(df: pd.DataFrame, tier_key: str, out_dir: Path) -> Path:
     ax2.plot(dates, df["soil_moisture"], color="sienna", linewidth=2,
              label="Soil Moisture  ← SWMM SC_OBANDO moisture_deficit (inverted)", zorder=3)
     ax2.axhline(0.30, color="gold",   linestyle="--", linewidth=1.1, alpha=0.8, label="WATCH entry (0.30)")
-    ax2.axhline(0.38, color="orange", linestyle="--", linewidth=1.1, alpha=0.8, label="WARNING entry (0.38)")
-    ax2.axhline(0.45, color="red",    linestyle="--", linewidth=1.1, alpha=0.8, label="DANGER entry (0.45)")
+    ax2.axhline(0.40, color="orange", linestyle="--", linewidth=1.1, alpha=0.8, label="WARNING entry (0.40)")
+    ax2.axhline(0.47, color="red",    linestyle="--", linewidth=1.1, alpha=0.8, label="DANGER entry (0.47)")
     ax2.axhspan(0,    0.30, alpha=0.06, color="green",  zorder=0)
-    ax2.axhspan(0.30, 0.38, alpha=0.07, color="gold",   zorder=0)
-    ax2.axhspan(0.38, 0.45, alpha=0.07, color="orange", zorder=0)
-    ax2.axhspan(0.45, 0.55, alpha=0.08, color="red",    zorder=0)
+    ax2.axhspan(0.30, 0.40, alpha=0.07, color="gold",   zorder=0)
+    ax2.axhspan(0.40, 0.47, alpha=0.07, color="orange", zorder=0)
+    ax2.axhspan(0.47, 0.60, alpha=0.08, color="red",    zorder=0)
     ax2.set_ylabel("Soil Moisture", fontsize=10)
-    ax2.set_ylim(0, 0.55)
+    ax2.set_ylim(0, 0.60)
     ax2.legend(loc="upper left", fontsize=8, framealpha=0.7)
     ax2.grid(axis="y", alpha=0.3)
     ax2.tick_params(labelbottom=False)
@@ -1008,12 +1009,12 @@ def plot_stress_csv(df: pd.DataFrame, tier_key: str, out_dir: Path) -> Path:
     ax3.plot(dates, df["humidity"], color="teal", linewidth=2,
              label="Humidity (CWV proxy)  ← SWMM SC_OBANDO runoff scaled", zorder=3)
     ax3.axhline(1.50, color="gold",   linestyle="--", linewidth=1.1, alpha=0.8, label="WATCH entry (1.50)")
-    ax3.axhline(3.00, color="orange", linestyle="--", linewidth=1.1, alpha=0.8, label="WARNING entry (3.00)")
-    ax3.axhline(4.50, color="red",    linestyle="--", linewidth=1.1, alpha=0.8, label="DANGER entry (4.50)")
+    ax3.axhline(3.20, color="orange", linestyle="--", linewidth=1.1, alpha=0.8, label="WARNING entry (3.20)")
+    ax3.axhline(5.50, color="red",    linestyle="--", linewidth=1.1, alpha=0.8, label="DANGER entry (5.50)")
     ax3.axhspan(0,    1.50, alpha=0.06, color="green",  zorder=0)
-    ax3.axhspan(1.50, 3.00, alpha=0.07, color="gold",   zorder=0)
-    ax3.axhspan(3.00, 4.50, alpha=0.07, color="orange", zorder=0)
-    ax3.axhspan(4.50, 7.50, alpha=0.08, color="red",    zorder=0)
+    ax3.axhspan(1.50, 3.20, alpha=0.07, color="gold",   zorder=0)
+    ax3.axhspan(3.20, 5.50, alpha=0.07, color="orange", zorder=0)
+    ax3.axhspan(5.50, 9.00, alpha=0.08, color="red",    zorder=0)
     ax3.set_ylabel("Humidity (CWV)", fontsize=10)
     ax3.set_ylim(bottom=0)
     ax3.legend(loc="upper left", fontsize=8, framealpha=0.7)
@@ -1091,10 +1092,10 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Scenarios:
-  clear    — dry-season baseline  (1.5 mm/hr rainfall forcing)
-  watch    — early wet season     (10 mm/hr)
-  warning  — active flooding      (30 mm/hr)
-  danger   — extreme flood peak   (60 mm/hr)
+  clear    — deep dry-season baseline  (0.5 mm/hr rainfall forcing)
+  watch    — early wet season          (10 mm/hr)
+  warning  — active flooding           (35 mm/hr)
+  danger   — catastrophic flood peak   (90 mm/hr)
   all      — all four tiers in sequence
   escalate — one appended row per tier (escalation order)
 
@@ -1167,7 +1168,7 @@ Examples:
     if not inp_path.exists():
         default_rain = TIER_RAINFALL_MM_HR.get(
             args.scenario if args.scenario not in ("all", "escalate") else "clear",
-            1.5,
+            0.5,
         )
         _write_minimal_inp(inp_path, default_rain, args.days)
 
