@@ -9,7 +9,7 @@ REM Move into the scripts folder where Rapid_Relay_Showcase.py lives
 cd /d "%~dp0..\showcase"
 
 REM Run the realtime pipeline
-python python .\showcase_start.py
+python .\showcase_start.py
 
 REM Keep the window open to see output
 pause

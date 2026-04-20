@@ -52,17 +52,17 @@ class _SupabaseChannel:
 
 # ---------------------------------------------------------------------------
 # Facebook channel shim — wraps showcase_fb_alert.send()
+# showcase_fb_alert.send() always posts (no duplicate check) so no
+# check_duplicate parameter is needed or accepted here.
 # ---------------------------------------------------------------------------
 
 class _FBChannel:
     @staticmethod
-    def send(tier: str, probability: float, timestamp: str,
-             check_duplicate: bool = True) -> bool:
+    def send(tier: str, probability: float, timestamp: str) -> bool:
         return _fb_send(
             tier=tier,
             probability=probability,
             timestamp=timestamp,
-            check_duplicate=check_duplicate,
         )
 
 
@@ -129,22 +129,13 @@ def dispatch_alert(tier: str, probability: float, timestamp: str) -> dict:
     print(f"\n  [showcase_alert] Dispatching {emoji} {tier} — {probability:.1%} on {timestamp}")
     print(f"  [showcase_alert] All tiers are dispatched in showcase mode (including CLEAR)")
 
-    # All channels fire for all tiers
     for label, module in ALWAYS_FIRE_CHANNELS:
         try:
-            if label == "facebook":
-                results[label] = module.send(
-                    tier=tier,
-                    probability=probability,
-                    timestamp=timestamp,
-                    check_duplicate=True,
-                )
-            else:
-                results[label] = module.send(
-                    tier=tier,
-                    probability=probability,
-                    timestamp=timestamp,
-                )
+            results[label] = module.send(
+                tier=tier,
+                probability=probability,
+                timestamp=timestamp,
+            )
         except Exception as e:
             print(f"  [showcase_alert] {label} raised an exception: {e}")
             results[label] = False
