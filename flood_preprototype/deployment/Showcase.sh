@@ -31,7 +31,7 @@ EOF
 cd "$SCRIPT_DIR/../showcase"
 
 # Run the realtime pipeline
-python python .\showcase_start.py
+python ./showcase_start.py
 
 # Keep terminal open on crash so you can read the error
 echo ""
