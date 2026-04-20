@@ -18,11 +18,18 @@ confirmed, and polling only resumes after the pipeline fully completes.
 Pipeline steps (fired on every new row):
     0a  showcase_sensor_ingest.py   ingest + calibrate → showcase_sensor.csv
     0b  showcase_proxy.py           GEE proxy → showcase_proxy.csv
-    0c  showcase_merge.py           merge → showcase_merge.csv
-    1   showcase_predict.py         XGB inference → showcase_predict.csv
+    0c  showcase_merge.py           merge → showcase_merge.csv  (always runs)
+    1   showcase_predict.py         XGB inference on showcase_sensor.csv
+                                    → showcase_predict.csv
     2   showcase_alert.py           dispatch ALL tiers (incl. CLEAR)
     3   showcase_transmission_speed log latency
     4   showcase_availability.py    recalculate → availability_report.csv
+
+NOTE on merge (step 0c):
+    showcase_predict.py reads directly from showcase_sensor.csv and no
+    longer depends on showcase_merge.csv.  However, showcase_merge.py is
+    kept in the pipeline so that showcase_merge.csv stays up to date for
+    any downstream consumers (dashboards, exports, etc.).
 
 Usage
 -----
@@ -232,12 +239,18 @@ def run_pipeline(run_n: int, delta: int, total: int,
     ingest_start = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
     # ── 0a  Sensor ingest ──────────────────────────────────────────────────
+    # Pass expected_count=total so ingest_latest waits until Supabase SELECT
+    # actually returns the row(s) that triggered this run.  This eliminates
+    # the race condition where the pipeline fires before the new row(s) are
+    # queryable, causing them to be silently skipped.
     print_phase("0a", "showcase_sensor_ingest.py",
                 "Supabase pull → calibrate → showcase_sensor.csv")
     SensorIngest = _import("showcase_sensor_ingest")
     if SensorIngest:
         try:
-            wrote, supabase_has_new = SensorIngest.ingest_latest()
+            wrote, supabase_has_new = SensorIngest.ingest_latest(
+                expected_count=total,   # ← race-condition fix
+            )
             if wrote:
                 print(f"  {C.GREEN}✓{C.RESET}  showcase_sensor.csv updated.")
             elif supabase_has_new:
@@ -272,8 +285,11 @@ def run_pipeline(run_n: int, delta: int, total: int,
                 traceback.print_exc()
 
     # ── 0c  Merge ──────────────────────────────────────────────────────────
+    # Always runs — showcase_predict.py reads from showcase_sensor.csv
+    # directly, but showcase_merge.csv is kept current for downstream use
+    # (dashboards, exports, etc.).
     print_phase("0c", "showcase_merge.py",
-                "sensor + proxy → showcase_merge.csv")
+                "sensor + proxy → showcase_merge.csv  (kept current for downstream use)")
     Merge = _import("showcase_merge")
     if Merge:
         try:
@@ -288,7 +304,7 @@ def run_pipeline(run_n: int, delta: int, total: int,
 
     # ── 1  Predict ─────────────────────────────────────────────────────────
     print_phase("1", "showcase_predict.py",
-                "XGB inference → showcase_predict.csv")
+                "XGB inference on showcase_sensor.csv → showcase_predict.csv")
     ShowcasePredict = _import("showcase_predict", fatal=True)
     predict_ok         = False
     predict_done_clock = None
@@ -417,12 +433,13 @@ def run_forever(interval: int, skip_proxy: bool,
                 last_count = current_count
 
                 # Run the full pipeline synchronously.
-                # Polling is implicitly paused — we don't call time.sleep
-                # or check the count again until run_pipeline() returns.
+                # current_count is forwarded as expected_count so that
+                # ingest_latest() can wait for Supabase SELECT consistency
+                # before proceeding — this is the race-condition fix.
                 run_pipeline(
                     run_n           = run_n,
                     delta           = delta,
-                    total           = current_count,
+                    total           = current_count,   # ← forwarded to ingest
                     skip_proxy      = skip_proxy,
                     no_post         = no_post,
                     no_availability = no_availability,

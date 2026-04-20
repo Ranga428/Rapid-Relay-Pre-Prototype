@@ -7,7 +7,7 @@ Changes from original:
   - Reads from  : showcase_predict.csv  (instead of flood_rf_sensor_predictions.csv)
   - State file  : showcase_last_fb_posted.json
   - CLEAR tier  : POSTED (not skipped) — showcase dispatches all tiers
-  - All Graph API logic is identical to the original.
+  - All Graph API logic mirrors FB_Alert.py exactly.
 
 Usage
 -----
@@ -17,7 +17,6 @@ Usage
 """
 
 import os
-import json
 import requests
 import pandas as pd
 from dotenv import load_dotenv
@@ -38,7 +37,7 @@ CSV_PATH = os.path.abspath(
     os.path.join(SCRIPT_DIR, "..", "predictions", "showcase_predict.csv")
 )
 
-STATE_PATH = os.path.join(SCRIPT_DIR, "showcase_last_fb_posted.json")
+
 
 # Showcase: CLEAR tier is posted (not skipped)
 SKIP_TIERS: set = set()
@@ -94,35 +93,12 @@ TIER_MESSAGE = {
 }
 
 
-# ---------------------------------------------------------------------------
-# State helpers
-# ---------------------------------------------------------------------------
-
-def _load_last_posted() -> str | None:
-    try:
-        if not os.path.exists(STATE_PATH):
-            return None
-        with open(STATE_PATH, "r") as f:
-            data = json.load(f)
-            return data.get("last_posted_timestamp")
-    except Exception as e:
-        print(f"  ⚠️  Could not read state file: {e}")
-        return None
-
-
-def _save_last_posted(timestamp: str) -> None:
-    try:
-        with open(STATE_PATH, "w") as f:
-            json.dump({"last_posted_timestamp": timestamp}, f, indent=2)
-        print(f"  💾 FB state saved — last posted: {timestamp}")
-    except Exception as e:
-        print(f"  ⚠️  Could not save state file: {e}")
-
 
 def _check_credentials() -> bool:
     if not PAGE_ID or not TOKEN:
-        print("  ❌ Missing FB credentials.")
-        print(f"  📂 .env path: {os.path.abspath(_ENV_PATH)}")
+        print("  ❌ Missing credentials.")
+        print(f"  📂 .env path checked: {os.path.abspath(_ENV_PATH)}")
+        print("  ℹ️  Ensure FB_PAGE_ID and FB_PAGE_TOKEN are set in .env")
         return False
     return True
 
@@ -139,73 +115,84 @@ def build_message(tier: str, probability: float, timestamp: str) -> str:
 def read_latest_from_csv() -> dict | None:
     """Read the latest row from showcase_predict.csv."""
     print(f"  📂 CSV path: {CSV_PATH}")
+
     if not os.path.exists(CSV_PATH):
         print("  ❌ showcase_predict.csv not found.")
         return None
+
     try:
         df = pd.read_csv(CSV_PATH)
+
         if df.empty:
+            print("  ❌ CSV is empty.")
             return None
+
         required = ["timestamp", "flood_probability", "risk_tier"]
         for col in required:
             if col not in df.columns:
                 print(f"  ❌ Missing column: {col}")
                 return None
+
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         latest = df.sort_values("timestamp").iloc[-1]
-        return {
+
+        row = {
             "tier":        str(latest["risk_tier"]).upper(),
             "probability": float(latest["flood_probability"]),
             "timestamp":   latest["timestamp"].strftime("%Y-%m-%d %H:%M UTC"),
         }
+
+        print(f"  ℹ️  Latest row — tier: {row['tier']} | prob: {row['probability']:.1%} | ts: {row['timestamp']}")
+        return row
+
     except Exception as e:
         print(f"  ❌ Failed to read CSV: {e}")
         return None
 
 
-def send(tier: str, probability: float, timestamp: str,
-         check_duplicate: bool = False) -> bool:
+def send(tier: str, probability: float, timestamp: str) -> bool:
     """
     Post a flood alert to the configured Facebook Page.
     In showcase mode CLEAR is posted — SKIP_TIERS is empty.
+    No duplicate check — always posts on every pipeline run.
 
     Parameters
     ----------
-    tier             : "CLEAR", "WATCH", "WARNING", or "DANGER"
-    probability      : float 0.0–1.0
-    timestamp        : date string e.g. "2025-07-14"
-    check_duplicate  : if True, skips posting if timestamp matches state file
+    tier        : "CLEAR", "WATCH", "WARNING", or "DANGER"
+    probability : float 0.0–1.0
+    timestamp   : date string e.g. "2025-07-14"
 
-    Returns True on success (or skip), False on any failure.
+    Returns True on success, False on any failure.
     """
     if not _check_credentials():
         return False
 
     # Showcase: no tiers are silently skipped — even CLEAR gets posted
     if tier in SKIP_TIERS:
-        print(f"  ⏭️  No post needed — tier is {tier}")
-        _save_last_posted(timestamp)
+        print(f"  ⏭️  No post needed — tier is {tier} (prob: {probability:.1%}, ts: {timestamp})")
         return True
-
-    if check_duplicate:
-        last = _load_last_posted()
-        if last and last == timestamp:
-            print(f"  ⏭️  [FB] Skipped — already posted for: {timestamp}")
-            return True
 
     message = build_message(tier, probability, timestamp)
     url     = f"https://graph.facebook.com/{VERSION}/{PAGE_ID}/feed"
 
     emoji = TIER_EMOJI.get(tier, "")
-    print(f"  🚀 [FB] Sending {emoji} {tier} alert to Facebook Page")
+    print(f"  🚀 Sending {emoji} {tier} alert to Facebook Page")
+    print(f"  ℹ️  PAGE_ID loaded : {'✅' if PAGE_ID else '❌ MISSING'}")
+    print(f"  ℹ️  TOKEN loaded   : {'✅' if TOKEN else '❌ MISSING'}")
 
     try:
-        res  = requests.post(url, data={"message": message, "access_token": TOKEN}, timeout=15)
+        res = requests.post(
+            url,
+            data={
+                "message":      message,
+                "access_token": TOKEN,
+            },
+            timeout=15,
+        )
         data = res.json()
 
         if "id" in data:
-            print(f"  ✅ [FB] Posted — post id: {data['id']}")
-            _save_last_posted(timestamp)
+            print(f"  ✅ [FB] Posted successfully — post id: {data['id']}")
             return True
         else:
             error = data.get("error", {})
@@ -240,16 +227,22 @@ if __name__ == "__main__":
 
     if args.post:
         print(f"\n  🚀 showcase_fb_alert --post")
+        print(f"  ℹ️  PAGE_ID loaded : {'✅' if PAGE_ID else '❌ MISSING'}")
+        print(f"  ℹ️  TOKEN loaded   : {'✅' if TOKEN else '❌ MISSING'}")
+        print(f"  📂 .env resolved  : {os.path.abspath(_ENV_PATH)}")
         row = read_latest_from_csv()
         if row is None:
             print("\n  ❌ FAILED — could not read CSV.")
         else:
             ok = send(tier=row["tier"], probability=row["probability"],
-                      timestamp=row["timestamp"], check_duplicate=True)
+                      timestamp=row["timestamp"])
             print(f"\n  {'✅ SUCCESS' if ok else '❌ FAILED'}")
 
     elif args.test:
         print(f"\n  🚀 showcase_fb_alert --test — tier={args.tier}")
+        print(f"  ℹ️  PAGE_ID loaded : {'✅' if PAGE_ID else '❌ MISSING'}")
+        print(f"  ℹ️  TOKEN loaded   : {'✅' if TOKEN else '❌ MISSING'}")
+        print(f"  📂 .env resolved  : {os.path.abspath(_ENV_PATH)}")
         ok = send(tier=args.tier, probability=0.12, timestamp=str(date.today()))
         print(f"\n  {'✅ SUCCESS' if ok else '❌ FAILED'}")
 

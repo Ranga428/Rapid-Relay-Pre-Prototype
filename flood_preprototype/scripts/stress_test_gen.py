@@ -38,40 +38,49 @@ Usage examples:
   # Combine with --append or --csv as needed:
   python stress_test_gen.py --scenario warning --append --supabase
 
+  # Insert with date anchored to day AFTER the 30-day context CSV:
+  python stress_test_gen.py --scenario clear --supabase --count 1 \
+      --after-csv data/stress_test/stress_clear.csv
+
 SWMM model:
   Default path: <project_root>/data/swmm/obando_bulacan.inp
   Override:     --inp /path/to/your_model.inp
   If the file does not exist, a minimal placeholder is auto-written.
 
-Value ranges from HEC-HMS calibration data (2017–2026):
-  waterlevel   : 0.40 – 3.00 m  (expanded for extreme stress test coverage)
-  soil_moisture: 0.15 – 0.55 (normalized)
-  humidity     : 0.05 – 8.50 (CWV scaled)
+Value ranges from HEC-HMS calibration data (2017-2026):
+  waterlevel   : 0.40 - 2.72 m  (DANGER hi capped: hw distance floor at 0.05 m
+                                  is reached at proxy ~2.86; 2.72 keeps 0.062 m)
+  soil_moisture: 0.15 - 0.55 (normalized)
+  humidity     : 0.05 - 8.50 (CWV scaled)
 
-─────────────────────────────────────────────────────────────────────
---supabase FLAG  (NEW)
-─────────────────────────────────────────────────────────────────────
+---------------------------------------------------------------------------
+--supabase FLAG
+---------------------------------------------------------------------------
 Inserts one synthetic row per tier into the live Supabase table
-`obando_environmental_data` using raw hardware units — the same units
+`obando_environmental_data` using raw hardware units -- the same units
 the real sensors produce.
 
 The calibrated (proxy) values from the SWMM sim are inverted back to
 hardware units before insert:
 
-  FINAL DISTANCE (m)  ← reverse water-level calibration
-      proxy_wl → hw_wl_m  →  distance = DIKE_HEIGHT_M - hw_wl_m
+  FINAL DISTANCE (m)  <- reverse water-level calibration
+      proxy_wl -> hw_wl_m  ->  distance = DIKE_HEIGHT_M - hw_wl_m
       (reverse of sensor_ingest.py CONVERSION 1)
 
-  SOIL MOISTURE (%)   ← reverse soil calibration
-      proxy_sm → t  →  hw_pct = SOIL_HW_DRY + t*(SOIL_HW_WET-SOIL_HW_DRY)
+  SOIL MOISTURE (%)   <- reverse soil calibration
+      proxy_sm -> t  ->  hw_pct = SOIL_HW_DRY + t*(SOIL_HW_WET-SOIL_HW_DRY)
       (reverse of sensor_ingest.py CONVERSION 2)
 
-  HUMIDITY (%RH)      ← reverse humidity calibration
-      proxy_hum → t  →  hw_rh = HUMIDITY_HW_MIN + t*(HUMIDITY_HW_MAX-HUMIDITY_HW_MIN)
+  HUMIDITY (%RH)      <- reverse humidity calibration
+      proxy_hum -> t  ->  hw_rh = HUMIDITY_HW_MIN + t*(HUMIDITY_HW_MAX-HUMIDITY_HW_MIN)
       (reverse of sensor_ingest.py CONVERSION 3)
 
-Each inserted row uses today's date + a time of 12:00:00 (or offset
-minutes apart for escalate/all to avoid PK collisions).
+--after-csv CSV_PATH  (NEW)
+  When provided, reads the last `timestamp` in the given stress CSV and
+  sets the Supabase row date to that date + 1 day, time 12:00:00.
+  Example: if the 30-day context ends on 2025-05-19 the live row will
+  be dated 2025-05-20 12:00:00, making it the natural 31st entry.
+  Without this flag the current wall-clock date is used (legacy behaviour).
 
 Requires the same .env file as sensor_ingest.py:
   SUPABASE_URL         = https://<project-ref>.supabase.co
@@ -120,17 +129,17 @@ warnings.filterwarnings("ignore")
 SCRIPT_DIR    = Path(__file__).resolve().parent
 _PROJECT_ROOT = SCRIPT_DIR.parent
 
-MERGE_FILE    = _PROJECT_ROOT / "data" / "sensor" / "speedtest_merge.csv"
+MERGE_FILE     = _PROJECT_ROOT / "data" / "sensor" / "speedtest_merge.csv"
 STRESS_CSV_DIR = _PROJECT_ROOT / "data" / "stress_test"
-DEFAULT_INP   = _PROJECT_ROOT / "data" / "swmm" / "obando_bulacan.inp"
+DEFAULT_INP    = _PROJECT_ROOT / "data" / "swmm" / "obando_bulacan.inp"
 
 # .env location (mirrors sensor_ingest.py)
 _ENV_PATH = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", ".env"))
 
 # SWMM element names that must exist in the .inp model
-SWMM_SENSOR_NODE   = "J_SENSOR"     # junction → waterlevel
-SWMM_SUBCATCHMENT  = "SC_OBANDO"    # subcatchment → soil_moisture, humidity proxy
-SWMM_RAINGAUGE     = "RG_OBANDO"    # rain gauge whose timeseries we override
+SWMM_SENSOR_NODE  = "J_SENSOR"    # junction -> waterlevel
+SWMM_SUBCATCHMENT = "SC_OBANDO"   # subcatchment -> soil_moisture, humidity proxy
+SWMM_RAINGAUGE    = "RG_OBANDO"   # rain gauge whose timeseries we override
 
 # ---------------------------------------------------------------------------
 # TIER RAINFALL FORCING  (mm/hr)
@@ -151,9 +160,9 @@ TIER_PROFILES = {
     "clear": {
         "label":         "CLEAR",
         "description":   "Deep dry season — bone-dry soil, near-zero humidity, minimal water.",
-        "waterlevel":    (0.40, 0.65),    # was (0.60, 0.75) — pushed lower
-        "soil_moisture": (0.15, 0.24),    # was (0.22, 0.30) — truly dry soil
-        "humidity":      (0.05, 0.80),    # was (0.15, 1.50) — near-zero atmospheric moisture
+        "waterlevel":    (0.40, 0.65),
+        "soil_moisture": (0.15, 0.24),
+        "humidity":      (0.05, 0.80),
     },
     "watch": {
         "label":         "WATCH",
@@ -165,16 +174,16 @@ TIER_PROFILES = {
     "warning": {
         "label":         "WARNING",
         "description":   "Active flood conditions — high water, saturating soil.",
-        "waterlevel":    (1.35, 2.10),    # was (1.20, 2.00) — shifted higher
-        "soil_moisture": (0.40, 0.47),    # was (0.38, 0.45) — approaching saturation
-        "humidity":      (3.20, 5.00),    # was (3.00, 4.50) — shifted higher
+        "waterlevel":    (1.35, 2.10),
+        "soil_moisture": (0.40, 0.47),
+        "humidity":      (3.20, 5.00),
     },
     "danger": {
         "label":         "DANGER",
         "description":   "Catastrophic flood — overtopping risk, soil fully saturated.",
-        "waterlevel":    (2.20, 3.00),    # was (2.00, 2.58) — exceeds historical peak
-        "soil_moisture": (0.47, 0.55),    # was (0.45, 0.50) — beyond field saturation
-        "humidity":      (5.50, 8.50),    # was (4.50, 6.87) — well above calibrated max
+        "waterlevel":    (2.20, 2.72),
+        "soil_moisture": (0.47, 0.55),
+        "humidity":      (5.50, 8.50),
     },
 }
 
@@ -184,12 +193,12 @@ ESCALATION_ORDER = ["clear", "watch", "warning", "danger"]
 # SENSOR SCALING CONSTANTS
 # ---------------------------------------------------------------------------
 
-SM_OUT_LO, SM_OUT_HI = 0.15, 0.55   # updated to match new CLEAR low / DANGER high
+SM_OUT_LO, SM_OUT_HI = 0.15, 0.55
 SM_IN_LO,  SM_IN_HI  = 0.00, 1.00
 
 HUMIDITY_RUNOFF_PEAK = 50.0
-HUMIDITY_CWV_MIN     = 0.05          # updated to match new CLEAR low
-HUMIDITY_CWV_MAX     = 8.50          # updated to match new DANGER high
+HUMIDITY_CWV_MIN     = 0.05
+HUMIDITY_CWV_MAX     = 8.50
 
 # ---------------------------------------------------------------------------
 # CALIBRATION CONSTANTS  (must mirror sensor_ingest.py exactly)
@@ -201,7 +210,7 @@ DIKE_HEIGHT_M = 4.039
 HW_WL_DRY    = 3.819
 HW_WL_WET    = 3.999
 PROXY_WL_DRY = 0.718
-PROXY_WL_WET = 2.197
+PROXY_WL_WET = 3.00   # extended to cover DANGER tier
 
 SOIL_HW_DRY    = 71.8
 SOIL_HW_WET    = 85.0
@@ -210,8 +219,8 @@ SOIL_PROXY_WET = 0.463
 
 HUMIDITY_HW_MIN    = 78.5
 HUMIDITY_HW_MAX    = 88.78
-HUMIDITY_PROXY_MIN = 0.05            # updated to match new CLEAR low
-HUMIDITY_PROXY_MAX = 8.50            # updated to match new DANGER high
+HUMIDITY_PROXY_MIN = 0.05
+HUMIDITY_PROXY_MAX = 8.50
 
 # Supabase table + column names (must mirror sensor_ingest.py)
 TABLE_ENV_DATA = "obando_environmental_data"
@@ -336,7 +345,7 @@ def _write_minimal_inp(inp_path: Path, rain_mm_hr: float, days: int) -> None:
         sensor_node     = SWMM_SENSOR_NODE,
     )
     inp_path.write_text(content)
-    print(f"  [INP] Wrote placeholder model → {inp_path}")
+    print(f"  [INP] Wrote placeholder model -> {inp_path}")
 
 
 def _patch_inp_dates_and_rain(
@@ -424,7 +433,7 @@ def run_swmm_simulation(
     records: list[dict] = []
     try:
         print(f"  [SWMM] Running {label} scenario  "
-              f"(rain={rain_mm_hr} mm/hr, days={days}) …")
+              f"(rain={rain_mm_hr} mm/hr, days={days}) ...")
 
         with Simulation(str(tmp_inp)) as sim:
             node_collection = Nodes(sim)
@@ -456,11 +465,11 @@ def run_swmm_simulation(
                 hum = round(hum, 6)
 
                 records.append({
-                    "timestamp":    ts.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "waterlevel":   wl,
+                    "timestamp":     ts.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "waterlevel":    wl,
                     "soil_moisture": sm,
-                    "humidity":     hum,
-                    "_tier_label":  label,
+                    "humidity":      hum,
+                    "_tier_label":   label,
                 })
 
                 if len(records) >= days * 24:
@@ -539,11 +548,11 @@ def _numpy_fallback(tier_key: str, days: int, seed: int = 42) -> pd.DataFrame:
     dates = pd.date_range(start, periods=days, freq="D", tz="UTC")
 
     df = pd.DataFrame({
-        "timestamp":    [d.strftime("%Y-%m-%dT%H:%M:%S") for d in dates],
-        "waterlevel":   _ramp(*p["waterlevel"],   days, seed=seed),
+        "timestamp":     [d.strftime("%Y-%m-%dT%H:%M:%S") for d in dates],
+        "waterlevel":    _ramp(*p["waterlevel"],    days, seed=seed),
         "soil_moisture": _ramp(*p["soil_moisture"], days, seed=seed + 1),
-        "humidity":     _ramp(*p["humidity"],     days, seed=seed + 2),
-        "_tier_label":  label,
+        "humidity":      _ramp(*p["humidity"],      days, seed=seed + 2),
+        "_tier_label":   label,
     })
     return df
 
@@ -585,56 +594,39 @@ def _single_row_fallback(
     vals = [
         (p["waterlevel"][0],    p["soil_moisture"][0],    p["humidity"][0]),
         (
-            round(sum(p["waterlevel"])   / 2, 6),
+            round(sum(p["waterlevel"])    / 2, 6),
             round(sum(p["soil_moisture"]) / 2, 6),
-            round(sum(p["humidity"])     / 2, 6),
+            round(sum(p["humidity"])      / 2, 6),
         ),
         (p["waterlevel"][1],    p["soil_moisture"][1],    p["humidity"][1]),
     ]
     wl, sm, hum = vals[pick]
     ts = pd.Timestamp.utcnow().floor("D") + pd.Timedelta(days=offset_days)
     return {
-        "timestamp":    ts.strftime("%Y-%m-%dT%H:%M:%S"),
-        "waterlevel":   wl,
+        "timestamp":     ts.strftime("%Y-%m-%dT%H:%M:%S"),
+        "waterlevel":    wl,
         "soil_moisture": sm,
-        "humidity":     hum,
-        "_tier_label":  p["label"],
+        "humidity":      hum,
+        "_tier_label":   p["label"],
     }
 
 
 # ===========================================================================
-# REVERSE CALIBRATION  (proxy units → raw hardware units)
-#
-# Inverts the three conversions in sensor_ingest.py so that synthetic
-# calibrated values can be stored in obando_environmental_data in the
-# same raw units the physical sensors produce.
+# REVERSE CALIBRATION  (proxy units -> raw hardware units)
 # ===========================================================================
 
 def _reverse_waterlevel(proxy_wl: float) -> float:
-    """
-    Proxy waterlevel (m above UHSLC datum) → Final Distance (m).
-
-    Inverse of sensor_ingest._calibrate_waterlevel():
-      1. Reverse linear stretch  →  hw_wl_m
-      2. hw_wl_m → distance_m = DIKE_HEIGHT_M - hw_wl_m
-
-    Result is clamped to the valid sensor range [0.05, 4.039].
-    """
+    """Proxy waterlevel (m) -> Final Distance (m)."""
     t = (proxy_wl - PROXY_WL_DRY) / (PROXY_WL_WET - PROXY_WL_DRY)
     t = max(0.0, min(1.0, t))
-    hw_wl_m = HW_WL_DRY + t * (HW_WL_WET - HW_WL_DRY)
+    hw_wl_m    = HW_WL_DRY + t * (HW_WL_WET - HW_WL_DRY)
     distance_m = DIKE_HEIGHT_M - hw_wl_m
-    # Clamp to the valid sensor window used by sensor_ingest.py
     distance_m = max(0.05, min(DIKE_HEIGHT_M, distance_m))
     return round(distance_m, 4)
 
 
 def _reverse_soil_moisture(proxy_sm: float) -> float:
-    """
-    Proxy soil moisture (m³/m³) → raw capacitive sensor reading (%).
-
-    Inverse of sensor_ingest._calibrate_soil_moisture().
-    """
+    """Proxy soil moisture (m3/m3) -> raw capacitive sensor reading (%)."""
     t = (proxy_sm - SOIL_PROXY_DRY) / (SOIL_PROXY_WET - SOIL_PROXY_DRY)
     t = max(0.0, min(1.0, t))
     hw_pct = SOIL_HW_DRY + t * (SOIL_HW_WET - SOIL_HW_DRY)
@@ -642,11 +634,7 @@ def _reverse_soil_moisture(proxy_sm: float) -> float:
 
 
 def _reverse_humidity(proxy_hum: float) -> float:
-    """
-    Proxy humidity (cm CWV) → raw relative humidity reading (%RH).
-
-    Inverse of sensor_ingest._calibrate_humidity().
-    """
+    """Proxy humidity (cm CWV) -> raw relative humidity reading (%RH)."""
     t = (proxy_hum - HUMIDITY_PROXY_MIN) / (HUMIDITY_PROXY_MAX - HUMIDITY_PROXY_MIN)
     t = max(0.0, min(1.0, t))
     hw_rh = HUMIDITY_HW_MIN + t * (HUMIDITY_HW_MAX - HUMIDITY_HW_MIN)
@@ -654,43 +642,27 @@ def _reverse_humidity(proxy_hum: float) -> float:
 
 
 def _row_to_hardware(row: dict, time_str: str) -> dict:
-    """
-    Convert one calibrated synthetic row → raw hardware record ready
-    for insertion into obando_environmental_data.
-
-    Parameters
-    ----------
-    row      : dict with keys timestamp, waterlevel, soil_moisture, humidity
-    time_str : HH:MM:SS string to use for the Time column
-
-    Returns
-    -------
-    dict matching the Supabase column names exactly.
-    """
+    """Convert one calibrated synthetic row -> raw hardware record for Supabase."""
     ts = pd.Timestamp(row["timestamp"])
     return {
-        COL_DATE:     ts.strftime("%Y-%m-%d"),   # "Date"
-        COL_TIME:     time_str,                   # "Time"
-        COL_DISTANCE: _reverse_waterlevel(row["waterlevel"]),
-        COL_SOIL:     _reverse_soil_moisture(row["soil_moisture"]),
-        COL_HUMIDITY: _reverse_humidity(row["humidity"]),
+        COL_DATE:        ts.strftime("%Y-%m-%d"),
+        COL_TIME:        time_str,
+        COL_DISTANCE:    _reverse_waterlevel(row["waterlevel"]),
+        COL_SOIL:        _reverse_soil_moisture(row["soil_moisture"]),
+        COL_HUMIDITY:    _reverse_humidity(row["humidity"]),
         "Temperature":   0,
         "Pressure":      0,
     }
 
 
 # ---------------------------------------------------------------------------
-# SUPABASE CLIENT  (lazy, mirrors sensor_ingest.py pattern)
+# SUPABASE CLIENT  (lazy singleton, mirrors sensor_ingest.py)
 # ---------------------------------------------------------------------------
 
 _supabase_client = None
 
 
 def _get_supabase_client():
-    """
-    Lazy singleton Supabase client.
-    Loads credentials from the same .env as sensor_ingest.py.
-    """
     global _supabase_client
     if _supabase_client is not None:
         return _supabase_client
@@ -726,12 +698,9 @@ def _get_supabase_client():
 
 
 def _supabase_insert_row(record: dict, dry_run: bool = False) -> bool:
-    """
-    Insert one hardware-unit record into obando_environmental_data.
-    Returns True on success, False on failure.
-    """
+    """Insert one hardware-unit record into obando_environmental_data."""
     if dry_run:
-        print(f"  [DRY RUN] Would insert → {record}")
+        print(f"  [DRY RUN] Would insert -> {record}")
         return True
 
     try:
@@ -744,7 +713,7 @@ def _supabase_insert_row(record: dict, dry_run: bool = False) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# PUBLIC: insert one stress-test row per tier into Supabase
+# PUBLIC: insert stress-test rows into Supabase
 # ---------------------------------------------------------------------------
 
 def insert_stress_rows_to_supabase(
@@ -752,35 +721,58 @@ def insert_stress_rows_to_supabase(
     dry_run: bool = False,
     base_time_offset_minutes: int = 0,
     count: int = 1,
+    after_csv_date: "pd.Timestamp | None" = None,
 ) -> int:
+    """
+    Insert rows into Supabase obando_environmental_data.
+
+    Parameters
+    ----------
+    rows_df      : DataFrame with columns timestamp, waterlevel,
+                   soil_moisture, humidity, _tier_label.
+    dry_run      : If True, print what would be inserted without writing.
+    base_time_offset_minutes : Extra minute offset added to the first row.
+    count        : How many times to repeat the insert (each repeat shifts
+                   by 1 minute to avoid PK collisions).
+    after_csv_date : pd.Timestamp or None.
+        KEY PARAMETER — when provided, the inserted row(s) are dated to
+        ``after_csv_date + 1 day`` at 12:00:00, anchoring the live row
+        immediately after the 30-day context window.
+        Example: context CSV ends 2025-05-19  ->  insert date 2025-05-20.
+        When None (default), the current wall-clock date is used.
+    """
     if rows_df.empty:
         print("  [SUPABASE] Nothing to insert — DataFrame is empty.")
         return 0
 
     inserted = 0
-    # Get the current system time to use as the base for all inserts
-    now = datetime.now()
+
+    # ── Date anchor ────────────────────────────────────────────────────────
+    # --after-csv supplied  ->  last CSV date + 1 day, fixed at noon.
+    # No --after-csv        ->  today's date (legacy behaviour).
+    if after_csv_date is not None:
+        base_date = (after_csv_date + pd.Timedelta(days=1)).normalize()
+    else:
+        base_date = pd.Timestamp(datetime.now()).normalize()
 
     for repeat in range(count):
         for i, (_, row) in enumerate(rows_df.iterrows()):
-            # Calculate offset: starting from 'now', increment by 1 minute per row
+            # Each repeat/row shifts by 1 minute to avoid PK collisions.
             total_offset = base_time_offset_minutes + (repeat * len(rows_df)) + i
-            current_ts = now + timedelta(minutes=total_offset)
-            
+            current_ts   = base_date + pd.Timedelta(hours=12, minutes=total_offset)
+
             time_str = current_ts.strftime("%H:%M:%S")
             date_str = current_ts.strftime("%Y-%m-%d")
 
-            # Update the row's timestamp so reverse calibration uses the correct date/time context
             row_with_offset = row.copy()
             row_with_offset["timestamp"] = current_ts.strftime("%Y-%m-%dT%H:%M:%S")
 
-            # Convert to hardware units using the dynamic time strings
             record = _row_to_hardware(row_with_offset, time_str)
-            record[COL_DATE] = date_str # Ensure Date column matches our calculated TS
-            
+            record[COL_DATE] = date_str
+
             tier = row.get("_tier_label", "?")
 
-            print(f"  [SUPABASE] Inserting {tier} row {repeat+1}/{count} → "
+            print(f"  [SUPABASE] Inserting {tier} row {repeat+1}/{count} -> "
                   f"Date={record[COL_DATE]}  Time={record[COL_TIME]}  "
                   f"Dist={record[COL_DISTANCE]:.4f}m  "
                   f"Soil={record[COL_SOIL]:.2f}%  "
@@ -790,7 +782,7 @@ def insert_stress_rows_to_supabase(
             if ok:
                 inserted += 1
             else:
-                print(f"  [SUPABASE] ✗  Failed to insert {tier} row.")
+                print(f"  [SUPABASE] x  Failed to insert {tier} row.")
 
     label = "would insert" if dry_run else "inserted"
     print(f"  [SUPABASE] {label} {inserted}/{count * len(rows_df)} row(s) into {TABLE_ENV_DATA}.")
@@ -815,7 +807,7 @@ def append_to_merge(rows_df: pd.DataFrame, merge_path: Path) -> None:
         combined = out
 
     combined.to_csv(merge_path, index=False)
-    print(f"  Appended {len(out)} row(s) → {merge_path}  (total: {len(combined)} rows)")
+    print(f"  Appended {len(out)} row(s) -> {merge_path}  (total: {len(combined)} rows)")
 
 
 def save_stress_csv(df: pd.DataFrame, tier_key: str, out_dir: Path) -> Path:
@@ -823,7 +815,7 @@ def save_stress_csv(df: pd.DataFrame, tier_key: str, out_dir: Path) -> Path:
     fname = f"stress_{tier_key}.csv"
     path  = out_dir / fname
     df.drop(columns=["_tier_label"], errors="ignore").to_csv(path, index=False)
-    print(f"  Saved stress CSV → {path}  ({len(df)} rows)")
+    print(f"  Saved stress CSV -> {path}  ({len(df)} rows)")
     print(f"  Run: python XGB_Predict.py --data \"{path}\"")
     plot_stress_csv(df, tier_key, out_dir)
     return path
@@ -842,11 +834,10 @@ TIER_COLORS = {
     "all_tiers_sequence": {"bg": "#e3f2fd", "line": "#0d47a1", "label": "ALL TIERS"},
 }
 
-# Updated thresholds to match new tier profile boundaries
 WL_THRESHOLDS = {
-    "WATCH entry":   (0.75,  "gold"),
-    "WARNING entry": (1.35,  "orange"),   # was 1.20
-    "DANGER entry":  (2.20,  "red"),      # was 2.00
+    "WATCH entry":   (0.75, "gold"),
+    "WARNING entry": (1.35, "orange"),
+    "DANGER entry":  (2.20, "red"),
 }
 
 _COL_THRESHOLDS = [
@@ -855,7 +846,7 @@ _COL_THRESHOLDS = [
     [(1.50, "gold",   "WATCH"), (3.20, "orange", "WARNING"), (5.50, "red",    "DANGER")],
 ]
 _COL_SPANS = [
-    [(0, 0.75, "green"), (0.75, 1.35, "gold"), (1.35, 2.20, "orange"), (2.20, 3.20, "red")],
+    [(0, 0.75, "green"), (0.75, 1.35, "gold"), (1.35, 2.20, "orange"), (2.20, 2.90, "red")],
     [(0, 0.30, "green"), (0.30, 0.40, "gold"), (0.40, 0.47, "orange"), (0.47, 0.60, "red")],
     [(0, 1.50, "green"), (1.50, 3.20, "gold"), (3.20, 5.50, "orange"), (5.50, 9.00, "red")],
 ]
@@ -931,7 +922,7 @@ def _plot_all_tiers_sequence(df: pd.DataFrame, out_dir: Path) -> Path:
     plot_path = out_dir / "stress_all_tiers_sequence.png"
     plt.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"  Saved plot   → {plot_path}")
+    print(f"  Saved plot   -> {plot_path}")
     return plot_path
 
 
@@ -960,19 +951,19 @@ def plot_stress_csv(df: pd.DataFrame, tier_key: str, out_dir: Path) -> Path:
     ax1.set_facecolor(tc["bg"])
     ax1.fill_between(dates, df["waterlevel"], alpha=0.25, color=tc["line"])
     ax1.plot(dates, df["waterlevel"], color=tc["line"], linewidth=2,
-             label="Water Level (m)  ← SWMM J_SENSOR depth", zorder=3)
+             label="Water Level (m)  <- SWMM J_SENSOR depth", zorder=3)
     for tlabel, (tval, tcolor) in WL_THRESHOLDS.items():
         ax1.axhline(tval, color=tcolor, linestyle="--", linewidth=1.1,
                     alpha=0.8, label=f"{tlabel} ({tval}m)")
     ax1.axhspan(0,    0.75, alpha=0.06, color="green",  zorder=0)
     ax1.axhspan(0.75, 1.35, alpha=0.07, color="gold",   zorder=0)
     ax1.axhspan(1.35, 2.20, alpha=0.07, color="orange", zorder=0)
-    ax1.axhspan(2.20, 3.20, alpha=0.08, color="red",    zorder=0)
+    ax1.axhspan(2.20, 2.90, alpha=0.08, color="red",    zorder=0)
     for ylo, yhi, tlabel, tcolor in [
         (0,    0.75, "CLEAR",   "green"),
         (0.75, 1.35, "WATCH",   "goldenrod"),
         (1.35, 2.20, "WARNING", "darkorange"),
-        (2.20, 3.20, "DANGER",  "red"),
+        (2.20, 2.90, "DANGER",  "red"),
     ]:
         ax1.annotate(
             tlabel, xy=(1.002, (ylo + yhi) / 2),
@@ -989,7 +980,7 @@ def plot_stress_csv(df: pd.DataFrame, tier_key: str, out_dir: Path) -> Path:
     ax2.set_facecolor(tc["bg"])
     ax2.fill_between(dates, df["soil_moisture"], alpha=0.25, color="sienna")
     ax2.plot(dates, df["soil_moisture"], color="sienna", linewidth=2,
-             label="Soil Moisture  ← SWMM SC_OBANDO moisture_deficit (inverted)", zorder=3)
+             label="Soil Moisture  <- SWMM SC_OBANDO moisture_deficit (inverted)", zorder=3)
     ax2.axhline(0.30, color="gold",   linestyle="--", linewidth=1.1, alpha=0.8, label="WATCH entry (0.30)")
     ax2.axhline(0.40, color="orange", linestyle="--", linewidth=1.1, alpha=0.8, label="WARNING entry (0.40)")
     ax2.axhline(0.47, color="red",    linestyle="--", linewidth=1.1, alpha=0.8, label="DANGER entry (0.47)")
@@ -1007,7 +998,7 @@ def plot_stress_csv(df: pd.DataFrame, tier_key: str, out_dir: Path) -> Path:
     ax3.set_facecolor(tc["bg"])
     ax3.fill_between(dates, df["humidity"], alpha=0.25, color="teal")
     ax3.plot(dates, df["humidity"], color="teal", linewidth=2,
-             label="Humidity (CWV proxy)  ← SWMM SC_OBANDO runoff scaled", zorder=3)
+             label="Humidity (CWV proxy)  <- SWMM SC_OBANDO runoff scaled", zorder=3)
     ax3.axhline(1.50, color="gold",   linestyle="--", linewidth=1.1, alpha=0.8, label="WATCH entry (1.50)")
     ax3.axhline(3.20, color="orange", linestyle="--", linewidth=1.1, alpha=0.8, label="WARNING entry (3.20)")
     ax3.axhline(5.50, color="red",    linestyle="--", linewidth=1.1, alpha=0.8, label="DANGER entry (5.50)")
@@ -1032,7 +1023,7 @@ def plot_stress_csv(df: pd.DataFrame, tier_key: str, out_dir: Path) -> Path:
     plot_path = out_dir / f"stress_{tier_key}.png"
     plt.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"  Saved plot   → {plot_path}")
+    print(f"  Saved plot   -> {plot_path}")
     return plot_path
 
 
@@ -1058,10 +1049,7 @@ def preview(rows_df: pd.DataFrame, scenario_label: str) -> None:
 
 
 def preview_hardware(rows_df: pd.DataFrame) -> None:
-    """
-    Print the reverse-calibrated hardware values that will actually be
-    inserted into Supabase, so you can verify them before committing.
-    """
+    """Print reverse-calibrated hardware values before Supabase insert."""
     print(f"\n  {'─'*72}")
     print(f"  Supabase insert preview  (raw hardware units — what will be stored)")
     print(f"  {'─'*72}")
@@ -1072,7 +1060,7 @@ def preview_hardware(rows_df: pd.DataFrame) -> None:
         hour       = 12 + offset_min // 60
         minute     = offset_min % 60
         time_str   = f"{hour:02d}:{minute:02d}:00"
-        hw = _row_to_hardware(row, time_str)
+        hw   = _row_to_hardware(row, time_str)
         tier = row.get("_tier_label", "")
         print(
             f"  {hw[COL_DATE]:<12} {hw[COL_TIME]:<10} "
@@ -1103,24 +1091,26 @@ Output modes (can be combined freely):
   --append     append row(s) to speedtest_merge.csv
   --csv        save full CSV for XGB_Predict.py --data
   --supabase   insert one raw hardware row per tier into Supabase
-               (reverse-calibrates proxy values back to sensor units)
   --dry-run    preview all outputs without writing or inserting anything
 
-SWMM model:
-  --inp    path to .inp model (auto-created if absent)
+Date anchoring for --supabase:
+  --after-csv CSV_PATH
+               Read the last timestamp in CSV_PATH and set the insert
+               date to that date + 1 day at 12:00:00.  Use this after
+               step 1 (--csv) so the live row is the natural day 31
+               of the 30-day context window.
+               Without this flag the current date is used (legacy behaviour).
 
 Examples:
   python stress_test_gen.py --scenario clear   --append
   python stress_test_gen.py --scenario all     --days 30 --csv
-  python stress_test_gen.py --scenario warning --days 14 --csv --append
-  python stress_test_gen.py --scenario escalate --append
 
-  # Supabase insert examples:
-  python stress_test_gen.py --scenario clear    --supabase
-  python stress_test_gen.py --scenario warning  --supabase --dry-run
-  python stress_test_gen.py --scenario all      --supabase
-  python stress_test_gen.py --scenario escalate --supabase
-  python stress_test_gen.py --scenario danger   --append --supabase
+  # Supabase insert anchored to day-after-context:
+  python stress_test_gen.py --scenario clear --supabase --count 1 \\
+      --after-csv data/stress_test/stress_clear.csv
+
+  python stress_test_gen.py --scenario warning --supabase --dry-run \\
+      --after-csv data/stress_test/stress_warning.csv
         """,
     )
 
@@ -1151,12 +1141,22 @@ Examples:
     parser.add_argument("--out-dir", type=str, default=str(STRESS_CSV_DIR),
                         help="Output directory for stress CSVs.")
     parser.add_argument("--count", type=int, default=1,
-                    help="Number of rows to insert per tier into Supabase (default: 1).")
+                        help="Number of rows to insert per tier into Supabase (default: 1).")
+    parser.add_argument(
+        "--after-csv", dest="after_csv", type=str, default=None,
+        metavar="CSV_PATH",
+        help=(
+            "Path to the stress CSV generated in step 1.  The Supabase insert "
+            "date is set to the day AFTER the last timestamp in that file "
+            "(e.g. context ends 2025-05-19 -> insert date 2025-05-20 12:00:00). "
+            "Without this flag the current wall-clock date is used."
+        ),
+    )
 
     args = parser.parse_args()
 
     if not args.append and not args.csv and not args.supabase:
-        print("\n  ⚠️  No output mode selected. Use --append, --csv, and/or --supabase.\n")
+        print("\n  Warning: No output mode selected. Use --append, --csv, and/or --supabase.\n")
         parser.print_help()
         sys.exit(1)
 
@@ -1164,13 +1164,33 @@ Examples:
     merge_path = Path(args.merge_file)
     out_dir    = Path(args.out_dir)
 
-    # Auto-create .inp if missing
     if not inp_path.exists():
         default_rain = TIER_RAINFALL_MM_HR.get(
             args.scenario if args.scenario not in ("all", "escalate") else "clear",
             0.5,
         )
         _write_minimal_inp(inp_path, default_rain, args.days)
+
+    # ── Resolve after_csv_date ─────────────────────────────────────────────
+    # Read the last timestamp from the context CSV (produced in step 1) and
+    # set the Supabase row date to that date + 1 day.
+    # This ensures the live row is the natural 31st entry of the 30-day window.
+    after_csv_date: "pd.Timestamp | None" = None
+    if args.after_csv:
+        csv_path = Path(args.after_csv)
+        if csv_path.exists():
+            try:
+                _ctx          = pd.read_csv(csv_path, usecols=["timestamp"])
+                last_ts       = pd.to_datetime(_ctx["timestamp"]).max()
+                after_csv_date = last_ts
+                insert_date   = (last_ts + pd.Timedelta(days=1)).date()
+                print(f"  [after-csv] Last context date : {last_ts.date()}")
+                print(f"  [after-csv] Supabase row date : {insert_date}")
+            except Exception as _e:
+                print(f"  [after-csv] WARNING: could not read {csv_path}: {_e}")
+                print("  [after-csv] Falling back to today's date.")
+        else:
+            print(f"  [after-csv] WARNING: CSV not found at {csv_path} — using today's date.")
 
     dry_tag = "  [DRY RUN]" if args.dry_run else ""
     print(f"\n{'='*60}")
@@ -1183,14 +1203,17 @@ Examples:
     )
     print(f"  Mode       : {modes}")
     print(f"  SWMM .inp  : {inp_path}")
-    print(f"  pyswmm     : {'available ✓' if PYSWMM_AVAILABLE else 'NOT installed — NumPy fallback'}")
+    print(f"  pyswmm     : {'available' if PYSWMM_AVAILABLE else 'NOT installed — NumPy fallback'}")
     if args.csv:
         print(f"  Days       : {args.days}")
     print(f"  Position   : {args.position}  (for single-row modes)")
+    if after_csv_date is not None:
+        print(f"  After-CSV  : context ends {after_csv_date.date()} "
+              f"-> insert date {(after_csv_date + pd.Timedelta(days=1)).date()}")
     if args.dry_run:
-        print(f"  ⚠  DRY RUN — nothing will be written or inserted.")
+        print(f"  DRY RUN — nothing will be written or inserted.")
 
-    # ── ESCALATE ──────────────────────────────────────────────────────
+    # ── ESCALATE ──────────────────────────────────────────────────────────
     if args.scenario == "escalate":
         rows = []
         for i, tier_key in enumerate(ESCALATION_ORDER):
@@ -1198,7 +1221,7 @@ Examples:
                                        position=args.position)
             rows.append(row)
         df = pd.DataFrame(rows)
-        preview(df, "Escalation: CLEAR → WATCH → WARNING → DANGER")
+        preview(df, "Escalation: CLEAR -> WATCH -> WARNING -> DANGER")
 
         if args.append:
             if not args.dry_run:
@@ -1208,7 +1231,10 @@ Examples:
 
         if args.supabase:
             preview_hardware(df)
-            insert_stress_rows_to_supabase(df, dry_run=args.dry_run, count=args.count)
+            insert_stress_rows_to_supabase(
+                df, dry_run=args.dry_run, count=args.count,
+                after_csv_date=after_csv_date,
+            )
 
         if args.csv:
             if not args.dry_run:
@@ -1216,12 +1242,11 @@ Examples:
             else:
                 print(f"  [DRY RUN] Would save stress CSV for escalate scenario.")
 
-    # ── ALL ───────────────────────────────────────────────────────────
+    # ── ALL ───────────────────────────────────────────────────────────────
     elif args.scenario == "all":
         all_dfs: list[pd.DataFrame] = []
-
-        # Collect one representative row per tier for --append and --supabase
         single_rows = []
+
         for i, tier_key in enumerate(ESCALATION_ORDER):
             if args.csv:
                 df = run_swmm_simulation(inp_path, tier_key, args.days, seed=i * 10)
@@ -1234,7 +1259,7 @@ Examples:
 
             if args.append or args.supabase:
                 row = single_row_from_swmm(tier_key, inp_path, offset_days=i,
-                                            position=args.position)
+                                           position=args.position)
                 single_rows.append(row)
 
         if single_rows:
@@ -1249,7 +1274,10 @@ Examples:
 
             if args.supabase:
                 preview_hardware(single_df)
-                insert_stress_rows_to_supabase(single_df, dry_run=args.dry_run, count=args.count)
+                insert_stress_rows_to_supabase(
+                    single_df, dry_run=args.dry_run, count=args.count,
+                    after_csv_date=after_csv_date,
+                )
 
         if args.csv and all_dfs:
             combined = pd.concat(all_dfs, ignore_index=True)
@@ -1258,7 +1286,7 @@ Examples:
             else:
                 print(f"  [DRY RUN] Would save combined stress CSV.")
 
-    # ── SINGLE TIER ───────────────────────────────────────────────────
+    # ── SINGLE TIER ───────────────────────────────────────────────────────
     else:
         tier_key = args.scenario
         label    = TIER_PROFILES[tier_key]["label"]
@@ -1277,7 +1305,10 @@ Examples:
 
             if args.supabase:
                 preview_hardware(row_df)
-                insert_stress_rows_to_supabase(row_df, dry_run=args.dry_run, count=args.count)
+                insert_stress_rows_to_supabase(
+                    row_df, dry_run=args.dry_run, count=args.count,
+                    after_csv_date=after_csv_date,
+                )
 
         if args.csv:
             df = run_swmm_simulation(inp_path, tier_key, args.days, seed=42)

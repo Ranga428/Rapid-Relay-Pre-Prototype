@@ -4,18 +4,22 @@ showcase_predict.py
 SHOWCASE VERSION of XGB_Predict.py
 
 Changes from original:
-  - Live sensor input : showcase_merge.csv  (instead of combined_sensor_context.csv)
+  - Live sensor input : showcase_sensor.csv  (direct — skips merge step)
   - Predictions CSV   : showcase_predict.csv
   - Plot PNG          : showcase_predict.png
   - All script references updated to showcase/ folder.
   - All model/inference logic is identical to the original.
   - Predicts on every single new row — no training cutoff filter.
+  - --seed mode: writes a CSV's rows directly into showcase_sensor.csv
+    as rolling-window context without triggering any alert or prediction.
 
 Usage
 -----
-    python showcase_predict.py                 # live mode inference
-    python showcase_predict.py --data file.csv # batch mode
-    python showcase_predict.py --schedule      # scheduled mode
+    python showcase_predict.py                        # live mode inference
+    python showcase_predict.py --data file.csv        # batch mode (isolated output)
+    python showcase_predict.py --seed file.csv        # seed showcase_sensor.csv
+                                                      # with context rows (no alert)
+    python showcase_predict.py --schedule             # scheduled mode
 """
 
 import os
@@ -57,8 +61,9 @@ MODEL_FILE = os.path.join(_PROJECT_ROOT, "model", "flood_xgb_sensor.pkl")
 # Showcase outputs — same predictions/ folder as the originals
 OUTPUT_DIR = os.path.join(_PROJECT_ROOT, "predictions")
 
+# Direct sensor input — no merge step required
 LIVE_SENSOR_FILE = os.path.join(
-    _PROJECT_ROOT, "data", "sensor", "showcase_merge.csv"
+    _PROJECT_ROOT, "data", "sensor", "showcase_sensor.csv"
 )
 
 FLOOD_LOG_PATH = os.path.join(_PROJECT_ROOT, "data", "flood_event_log.csv")
@@ -163,7 +168,7 @@ def load_model() -> tuple:
     print(f"  WATCH threshold   : {watch_t:.2f}")
     print(f"  WARNING threshold : {warn_t:.2f}")
     print(f"  Last training date: {LAST_TRAINING_DATE}")
-    print(f"  Live sensor input : showcase_merge.csv")
+    print(f"  Live sensor input : showcase_sensor.csv")
     print(f"  Predictions out   : showcase_predict.csv")
 
     return model, feature_cols, watch_t, warn_t
@@ -174,13 +179,13 @@ def load_model() -> tuple:
 # ---------------------------------------------------------------------------
 
 def load_live_features() -> pd.DataFrame:
-    separator("Loading Showcase Merge Data")
+    separator("Loading Showcase Sensor Data")
     print(f"  Source : {LIVE_SENSOR_FILE}")
     if not os.path.exists(LIVE_SENSOR_FILE):
         sys.exit(
-            f"\n  ERROR: Showcase merge file not found.\n"
+            f"\n  ERROR: Showcase sensor file not found.\n"
             f"  Expected : {LIVE_SENSOR_FILE}\n"
-            f"  Fix      : Run showcase_merge.py first.\n"
+            f"  Fix      : Run showcase_sensor_ingest.py first.\n"
         )
     sensor_df, freq = load_sensor(sensor_path=LIVE_SENSOR_FILE)
     print(f"  Raw rows loaded  : {len(sensor_df):,}")
@@ -237,7 +242,7 @@ def filter_new_rows(features: pd.DataFrame) -> pd.DataFrame:
     if len(new_df) == 0:
         sys.exit(
             f"\n  No new rows found.\n"
-            f"  Append new sensor rows to showcase_merge.csv and re-run.\n"
+            f"  Append new sensor rows to showcase_sensor.csv and re-run.\n"
         )
 
     print(f"  Date range       : {new_df.index[0].date()} → {new_df.index[-1].date()}")
@@ -275,6 +280,89 @@ def load_batch_features(data_path: str, feature_cols: list) -> tuple:
         features = append_rolling_features(features)
 
     return features, ground_truth
+
+
+# ---------------------------------------------------------------------------
+# 2c. Seed mode  —  write context rows into showcase_sensor.csv
+#                   without running predictions or triggering any alert
+# ---------------------------------------------------------------------------
+
+def seed_sensor_csv(data_path: str) -> None:
+    """
+    Read a stress-test CSV and write its raw sensor columns
+    (timestamp, waterlevel, soil_moisture, humidity) directly into
+    showcase_sensor.csv as rolling-window context.
+
+    Nothing is predicted. Nothing is written to showcase_predict.csv.
+    No alert is triggered. The live pipeline will see these rows as
+    pre-existing history when the next real Supabase row arrives.
+
+    Rows already present in showcase_sensor.csv (matched by timestamp)
+    are skipped so re-running is safe.
+    """
+    separator("Seed Mode — Writing Context Rows to showcase_sensor.csv")
+
+    if not os.path.exists(data_path):
+        sys.exit(f"\n  ERROR: Seed file not found.\n  Expected: {data_path}")
+
+    # Load the stress CSV — we only need the raw sensor columns
+    seed_df = pd.read_csv(data_path, parse_dates=["timestamp"])
+    seed_df = seed_df.sort_values("timestamp").reset_index(drop=True)
+
+    required = ["timestamp", "waterlevel", "soil_moisture", "humidity"]
+    missing  = [c for c in required if c not in seed_df.columns]
+    if missing:
+        sys.exit(f"\n  ERROR: Seed file missing columns: {missing}")
+
+    seed_df = seed_df[required].copy()
+
+    print(f"  Seed file   : {data_path}")
+    print(f"  Seed rows   : {len(seed_df):,}")
+    print(f"  Date range  : {seed_df['timestamp'].min()} → {seed_df['timestamp'].max()}")
+
+    # Deduplicate against whatever is already in showcase_sensor.csv
+    existing_timestamps: set = set()
+    if os.path.exists(LIVE_SENSOR_FILE):
+        try:
+            existing_df = pd.read_csv(LIVE_SENSOR_FILE, usecols=["timestamp"])
+            existing_timestamps = set(existing_df["timestamp"].astype(str))
+            print(f"  Existing rows in showcase_sensor.csv : {len(existing_timestamps):,}")
+        except Exception as e:
+            print(f"  Could not read existing showcase_sensor.csv ({e}) — will append all rows")
+    else:
+        print(f"  showcase_sensor.csv does not exist yet — will create it.")
+
+    seed_df["timestamp_str"] = seed_df["timestamp"].astype(str)
+    new_rows = seed_df[~seed_df["timestamp_str"].isin(existing_timestamps)].drop(
+        columns=["timestamp_str"]
+    )
+
+    skipped = len(seed_df) - len(new_rows)
+    if skipped:
+        print(f"  Skipped {skipped:,} row(s) already present in showcase_sensor.csv")
+
+    if new_rows.empty:
+        print(f"  ✅  All seed rows already present — nothing to write.")
+        separator("SEED DONE — No changes made")
+        return
+
+    # Write to showcase_sensor.csv
+    os.makedirs(os.path.dirname(LIVE_SENSOR_FILE), exist_ok=True)
+
+    if not os.path.exists(LIVE_SENSOR_FILE):
+        new_rows.to_csv(LIVE_SENSOR_FILE, index=False)
+    else:
+        new_rows.to_csv(LIVE_SENSOR_FILE, mode="a", header=False, index=False)
+
+    print(f"  ✅  Wrote {len(new_rows):,} context row(s) → {LIVE_SENSOR_FILE}")
+    print(f"  showcase_sensor.csv now has context for rolling windows.")
+    print(f"  NO prediction was run. NO alert was triggered.")
+
+    separator("SEED DONE")
+    print(f"  Context rows written : {len(new_rows):,}")
+    print(f"  showcase_sensor.csv  : {LIVE_SENSOR_FILE}")
+    print(f"  Next step: insert 1 live Supabase row to trigger the alert.")
+    separator()
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +513,7 @@ def save_plot(results, watch_t, warn_t, danger_t,
 def run_pipeline(data_path=None, threshold_search=False) -> None:
     batch_mode = data_path is not None
     separator(f"Showcase Flood Prediction — XGBoost Inference")
-    print(f"  Input  : {'BATCH — ' + data_path if batch_mode else 'LIVE — showcase_merge.csv'}")
+    print(f"  Input  : {'BATCH — ' + data_path if batch_mode else 'LIVE — showcase_sensor.csv'}")
     print(f"  Output : showcase_predict.csv  +  showcase_predict.png")
 
     model, feature_cols, watch_t, warn_t = load_model()
@@ -475,14 +563,27 @@ def run_scheduled(interval_hours: int) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="showcase_predict — XGBoost inference on showcase_merge.csv"
+        description="showcase_predict — XGBoost inference on showcase_sensor.csv"
     )
-    parser.add_argument("--data",     type=str, default=None)
-    parser.add_argument("--schedule", action="store_true")
-    parser.add_argument("--interval", type=int, default=12)
+    parser.add_argument("--data",     type=str, default=None,
+                        help="Batch mode: predict on a CSV file (isolated output, no alert).")
+    parser.add_argument("--seed",     type=str, default=None,
+                        help=(
+                            "Seed mode: write a stress-test CSV's rows directly into "
+                            "showcase_sensor.csv as rolling-window context. "
+                            "No prediction is run and no alert is triggered. "
+                            "Run this before inserting a live Supabase row so the "
+                            "model has 30 days of history to compute rolling features on."
+                        ))
+    parser.add_argument("--schedule", action="store_true",
+                        help="Scheduled mode: run live inference every N hours.")
+    parser.add_argument("--interval", type=int, default=12,
+                        help="Hours between runs in --schedule mode (default: 12).")
     args = parser.parse_args()
 
-    if args.schedule:
+    if args.seed:
+        seed_sensor_csv(args.seed)
+    elif args.schedule:
         run_scheduled(args.interval)
     else:
         run_pipeline(data_path=args.data)

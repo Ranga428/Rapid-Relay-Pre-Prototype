@@ -18,6 +18,9 @@ Changes from original:
   - ingest_latest() returns (wrote: bool, supabase_has_new: bool) so the
     pipeline always continues even when a new Supabase row produces a
     duplicate entry.
+  - ingest_latest() accepts optional expected_count so showcase_start can
+    tell it how many rows Supabase should have — fixes the race condition
+    where the pipeline fires before Supabase makes the new row queryable.
   - COL_SOIL corrected to "Moisture" to match actual Supabase schema.
   - Rows are ingested as-is (no daily aggregation).
   - Deduplication is row-count based — every new Supabase row appended is
@@ -83,7 +86,7 @@ DIKE_HEIGHT_M = 4.039
 HW_WL_DRY    = 3.819
 HW_WL_WET    = 3.999
 PROXY_WL_DRY = 0.718
-PROXY_WL_WET = 2.197
+PROXY_WL_WET = 3.00
 
 DISTANCE_MIN_VALID_M = 0.05
 DISTANCE_MAX_VALID_M = 4.039
@@ -95,8 +98,8 @@ SOIL_PROXY_WET = 0.463
 
 HUMIDITY_HW_MIN    = 78.5
 HUMIDITY_HW_MAX    = 88.78
-HUMIDITY_PROXY_MIN = 0.15
-HUMIDITY_PROXY_MAX = 6.87
+HUMIDITY_PROXY_MIN = 0.05
+HUMIDITY_PROXY_MAX = 8.50
 
 # ===========================================================================
 # CONFIG
@@ -117,6 +120,10 @@ _SELECT = '"Date", "Time", "Soil Moisture", "Humidity", "Final Distance"'
 
 # Default polling interval in seconds for --watch --poll fallback mode
 DEFAULT_POLL_INTERVAL = 60
+
+# Settling retry config — used in ingest_latest() when expected_count is given
+_SETTLE_WAIT_S    = 2   # seconds between retries
+_SETTLE_TIMEOUT_S = 30  # give up after this many seconds
 
 log = logging.getLogger("showcase_sensor_ingest")
 
@@ -266,13 +273,22 @@ def _rows_to_df(data: list[dict]) -> pd.DataFrame:
     return df[["timestamp", "waterlevel", "soil_moisture", "humidity"]]
 
 
-def fetch_rows_since(after_timestamp: str | None) -> pd.DataFrame:
+def fetch_rows_since(after_timestamp: str | None) -> tuple[pd.DataFrame, int]:
     """
     Fetch rows from Supabase.
 
     If after_timestamp is None, fetches ALL rows (full sync).
     If after_timestamp is provided, fetches only rows after that date
     (legacy cutoff behaviour — still used by ingest_date).
+
+    Returns
+    -------
+    (df, raw_count)
+        df        : parsed + null-filtered DataFrame
+        raw_count : number of raw dicts returned by Supabase SELECT
+                    *before* any null-Date/Time rows are dropped.
+                    Use this to compare against expected_count, which
+                    also comes from a raw Supabase row-count query.
     """
     PAGE_SIZE = 1000
     all_rows: list[dict] = []
@@ -303,8 +319,9 @@ def fetch_rows_since(after_timestamp: str | None) -> pd.DataFrame:
             break
         offset += PAGE_SIZE
 
-    log.info("Total raw rows fetched from Supabase: %d", len(all_rows))
-    return _rows_to_df(all_rows)
+    raw_count = len(all_rows)
+    log.info("Total raw rows fetched from Supabase: %d", raw_count)
+    return _rows_to_df(all_rows), raw_count
 
 
 def fetch_rows_for_date(target_date: str) -> pd.DataFrame:
@@ -473,7 +490,8 @@ def append_raw_rows_to_csv(rows: pd.DataFrame, dry_run: bool = False) -> int:
 # Public API
 # ---------------------------------------------------------------------------
 
-def ingest_latest(dry_run: bool = False) -> tuple[bool, bool]:
+def ingest_latest(dry_run: bool = False,
+                  expected_count: int | None = None) -> tuple[bool, bool]:
     """
     Full-sync ingest. Fetches ALL rows from Supabase, calibrates them
     individually (no daily aggregation), then appends rows not yet in
@@ -481,6 +499,17 @@ def ingest_latest(dry_run: bool = False) -> tuple[bool, bool]:
 
     Every new Supabase row appended triggers a pipeline run, regardless of
     whether its timestamp duplicates an existing row.
+
+    Parameters
+    ----------
+    dry_run        : if True, preview output without writing to disk
+    expected_count : when provided (passed by showcase_start after it detected
+                     a count increase), ingest_latest will retry the Supabase
+                     fetch until the fetched raw row count reaches
+                     expected_count or the settling timeout is hit.
+                     This closes the race-condition window where the pipeline
+                     fires before Supabase has made the new row(s) queryable
+                     via SELECT.
 
     Returns
     -------
@@ -497,8 +526,45 @@ def ingest_latest(dry_run: bool = False) -> tuple[bool, bool]:
     existing_count = _existing_row_count(SENSOR_CSV)
     log.info("CSV currently has %d row(s).", existing_count)
 
-    # Fetch ALL rows from Supabase (no date cutoff)
-    raw = fetch_rows_since(after_timestamp=None)
+    # ── Settling retry loop ────────────────────────────────────────────────
+    # showcase_start detects a new row via row-count polling and immediately
+    # calls ingest_latest.  Due to Supabase replication/read lag, the SELECT
+    # query may still return the OLD count for a few seconds.  We retry until
+    # the raw SELECT count (before null filtering) matches expected_count,
+    # or we hit the timeout.
+    #
+    # IMPORTANT: compare raw_count (pre-null-filter) against expected_count,
+    # which also comes from a raw Supabase count query.  Using len(df) would
+    # always fall short when there are permanently-null rows in the table.
+    settle_elapsed = 0
+
+    while True:
+        raw, raw_count = fetch_rows_since(after_timestamp=None)
+
+        if expected_count is None or raw_count >= expected_count:
+            # No expectation set, or Supabase is consistent — proceed.
+            break
+
+        if settle_elapsed >= _SETTLE_TIMEOUT_S:
+            log.warning(
+                "Settling timeout (%ds): expected %d raw rows from Supabase "
+                "but only fetched %d — proceeding with what we have.",
+                _SETTLE_TIMEOUT_S, expected_count, raw_count,
+            )
+            break
+
+        log.info(
+            "Supabase not yet consistent: expected %d raw rows, got %d — "
+            "retrying in %ds (elapsed=%ds).",
+            expected_count, raw_count, _SETTLE_WAIT_S, settle_elapsed,
+        )
+        print(
+            f"  ⏳  Waiting for Supabase row to become queryable "
+            f"(got {raw_count} raw rows, expected {expected_count}, "
+            f"elapsed={settle_elapsed}s)..."
+        )
+        time.sleep(_SETTLE_WAIT_S)
+        settle_elapsed += _SETTLE_WAIT_S
 
     if raw.empty:
         log.info("No rows in Supabase — nothing to do.")
@@ -606,7 +672,9 @@ def _watch_realtime(dry_run: bool = False,
 
         def _do_ingest():
             try:
-                wrote, _ = ingest_latest(dry_run=dry_run)
+                # Use expected_count=None here — Realtime fires AFTER the row
+                # is committed, so it should be immediately queryable.
+                wrote, _ = ingest_latest(dry_run=dry_run, expected_count=None)
                 if wrote:
                     print(f"  [realtime] ✅  showcase_sensor.csv updated.")
                 else:
@@ -695,7 +763,7 @@ def _watch_polling(poll_interval: int = DEFAULT_POLL_INTERVAL,
 def ingest_date(target_date: str, dry_run: bool = False) -> bool:
     if not USE_HARDWARE:
         return False
-    raw = fetch_rows_for_date(target_date)
+    raw = fetch_rows_for_date(target_date)   # returns plain df (no raw_count needed)
     if raw.empty:
         log.warning("No Supabase rows found for %s.", target_date)
         return False
