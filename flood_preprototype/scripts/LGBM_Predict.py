@@ -53,17 +53,13 @@ from feature_engineering import build_features, SENSOR_FEATURE_COLUMNS
 # CONFIG
 # ===========================================================================
 
-MODEL_FILE       = r"..\model\flood_lgbm_sensor.pkl"
-OUTPUT_DIR       = r"..\predictions"
-LIVE_SENSOR_FILE = os.path.join(
-    SCRIPT_DIR, r"..\data\sensor\combined_sensor_context.csv"
-)
-FLOOD_LOG_PATH = os.path.join(
-    SCRIPT_DIR, r"..\data\flood_event_log.csv"
-)
+MMODEL_FILE       = os.path.join(SCRIPT_DIR, "..", "model",       "flood_lgbm_sensor.pkl")
+OUTPUT_DIR       = os.path.join(SCRIPT_DIR, "..", "predictions")
+LIVE_SENSOR_FILE = os.path.join(SCRIPT_DIR, "..", "data", "sensor", "combined_sensor_context.csv")
+FLOOD_LOG_PATH   = os.path.join(SCRIPT_DIR, "..", "data",          "flood_event_log.csv")
 
-PREDICTIONS_CSV = os.path.join(OUTPUT_DIR, "flood_lgbm_sensor_predictions.csv")
-PLOT_FILE       = os.path.join(OUTPUT_DIR, "flood_lgbm_sensor_predictions.png")
+PREDICTIONS_CSV  = os.path.join(OUTPUT_DIR, "flood_lgbm_sensor_predictions.csv")
+PLOT_FILE        = os.path.join(OUTPUT_DIR, "flood_lgbm_sensor_predictions.png")
 
 LAST_TRAINING_DATE      = "2024-12-31"
 DEFAULT_ALERT_THRESHOLD = 0.50
