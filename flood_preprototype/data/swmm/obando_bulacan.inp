@@ -13,14 +13,14 @@ LINK_OFFSETS         DEPTH
 MIN_SLOPE            0
 ALLOW_PONDING        NO
 SKIP_STEADY_STATE    NO
-START_DATE           01/01/2024
+START_DATE           04/24/2026     ;; Matches your CSV start
 START_TIME           00:00:00
-REPORT_START_DATE    01/01/2024
+REPORT_START_DATE    04/24/2026
 REPORT_START_TIME    00:00:00
-END_DATE             01/31/2024
+END_DATE             05/23/2026     ;; Matches your CSV end
 END_TIME             23:00:00
-SWEEP_START          01/01
-SWEEP_END            12/31
+SWEEP_START          04/01
+SWEEP_END            06/01
 DRY_DAYS             0
 REPORT_STEP          01:00:00
 WET_STEP             00:05:00
@@ -32,7 +32,6 @@ MINIMUM_STEP         0.5
 INERTIAL_DAMPING     PARTIAL
 NORMAL_FLOW_LIMITED  BOTH
 FORCE_MAIN_EQUATION  H-W
-EVAP_INTERP          STEP
 
 [EVAPORATION]
 ;;Data Source    Parameters
@@ -92,14 +91,27 @@ C_MAIN           TRAPEZOIDAL  3.0              20         2          2          
 [TIMESERIES]
 ;;Name           Date       Time       Value
 ;;-------------- ---------- ---------- ----------
-;;  CLEAR scenario: ~1.5 mm/hr (dry season baseline)
-TS_RAIN          01/01/2024 00:00      1.5
-TS_RAIN          01/01/2024 06:00      1.8
-TS_RAIN          01/01/2024 12:00      1.2
-TS_RAIN          01/01/2024 18:00      0.8
-;;  Extend or replace with actual PAGASA rainfall records.
-;;  For stress-test scenarios, this timeseries is overridden
-;;  programmatically by stress_test_gen.py via pyswmm.
+;; Phase 1: CLEAR (April 24 - April 30) - Baseline flow
+TS_RAIN          04/24/2026 00:00      1.5
+TS_RAIN          04/30/2026 23:00      5.0
+
+;; Phase 2: WATCH (May 1 - May 7) - Rain starts picking up
+TS_RAIN          05/01/2026 00:00      15.0
+TS_RAIN          05/07/2026 23:00      35.0
+
+;; Phase 3: WARNING (May 8 - May 14) - Heavy continuous rain
+TS_RAIN          05/08/2026 00:00      60.0
+TS_RAIN          05/14/2026 23:00      100.0
+
+;; Phase 4: DANGER (May 15 - May 20) - The extreme peak
+TS_RAIN          05/15/2026 00:00      150.0
+TS_RAIN          05/18/2026 12:00      300.0   ;; Absolute peak of the flood
+TS_RAIN          05/20/2026 23:00      150.0
+
+;; Phase 5: RECEDING (May 21 - May 23) - Storm passes, channel drains
+TS_RAIN          05/21/2026 00:00      50.0
+TS_RAIN          05/22/2026 00:00      10.0
+TS_RAIN          05/23/2026 23:00      1.5
 
 [REPORT]
 ;;Reporting Options

@@ -146,10 +146,10 @@ SWMM_RAINGAUGE    = "RG_OBANDO"   # rain gauge whose timeseries we override
 # ---------------------------------------------------------------------------
 
 TIER_RAINFALL_MM_HR = {
-    "clear":   0.5,    # near-zero rainfall — deep dry season baseline
-    "watch":   10.0,
-    "warning": 35.0,   # slightly more aggressive than before
-    "danger":  90.0,   # typhoon-level forcing — extreme event
+    "clear":   5.0,    
+    "watch":   50.0,
+    "warning": 150.0,  
+    "danger":  300.0,  # Massive flood level just to force the graph to move
 }
 
 # ---------------------------------------------------------------------------
