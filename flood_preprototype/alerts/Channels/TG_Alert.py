@@ -1,4 +1,4 @@
-#TG_Alert.py
+# TG_Alert.py
 
 import os
 import json
@@ -15,13 +15,16 @@ load_dotenv(dotenv_path=_ENV_PATH)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-PREDICTIONS_CSV = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "predictions", "flood_rf_sensor_predictions.csv"))
+# Default CSV path — can be overridden via --csv flag or csv_path argument
+DEFAULT_PREDICTIONS_CSV = os.path.abspath(
+    os.path.join(SCRIPT_DIR, "..", "..", "predictions", "flood_rf_sensor_predictions.csv")
+)
+
 STATE_PATH = os.path.join(SCRIPT_DIR, "last_telegram_sent.json")
 
 # --- Constants ---
 SKIP_TIERS = {"CLEAR", "LOW", "NORMAL"}
 
-# Telegram supports emojis natively, so these will look great in the chat!
 TIER_MESSAGE = {
     "WATCH": (
         "🟡 **MAGMASID (WATCH)** — Obando, Bulacan\n"
@@ -76,12 +79,20 @@ def _save_last_sent(timestamp: str) -> None:
         print(f"  ⚠️  Could not save state file: {e}")
 
 # --- Data Readers ---
-def read_latest_prediction() -> dict | None:
-    if not os.path.exists(PREDICTIONS_CSV):
-        print("  ❌ Predictions CSV not found.")
+def read_latest_prediction(csv_path: str = None) -> dict | None:
+    """
+    Read the last row (by timestamp) from the predictions CSV.
+
+    Parameters
+    ----------
+    csv_path : optional path to a CSV file. Defaults to DEFAULT_PREDICTIONS_CSV.
+    """
+    path = csv_path or DEFAULT_PREDICTIONS_CSV
+    if not os.path.exists(path):
+        print(f"  ❌ Predictions CSV not found: {path}")
         return None
     try:
-        df = pd.read_csv(PREDICTIONS_CSV)
+        df = pd.read_csv(path)
         if df.empty:
             print("  ❌ Predictions CSV is empty.")
             return None
@@ -100,14 +111,11 @@ def read_latest_prediction() -> dict | None:
 def send_telegram_alert(token, chat_id, message_content) -> bool:
     """Sends a message to a Telegram Group Chat."""
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    
-    # We use parse_mode="Markdown" so the asterisks (*) in the message make the text bold
     payload = {
         "chat_id": chat_id,
         "text": message_content,
         "parse_mode": "Markdown"
     }
-
     try:
         response = requests.post(url, json=payload, timeout=10)
         response.raise_for_status()
@@ -118,7 +126,7 @@ def send_telegram_alert(token, chat_id, message_content) -> bool:
         if e.response is not None:
             print(f"  🔍 Telegram API Error: {e.response.text}")
         return False
-    
+
 # --- Standard Channel Interface ---
 def send(tier: str, probability: float, timestamp: str, check_duplicate: bool = True) -> bool:
     """
@@ -126,14 +134,10 @@ def send(tier: str, probability: float, timestamp: str, check_duplicate: bool = 
 
     Parameters
     ----------
-    tier        : "CLEAR", "WATCH", "WARNING", or "DANGER"
-    probability : float 0.0–1.0
-    timestamp   : date string e.g. "2025-07-14"
+    tier            : "CLEAR", "WATCH", "WARNING", or "DANGER"
+    probability     : float 0.0–1.0
+    timestamp       : date string e.g. "2025-07-14"
     check_duplicate : if True, skips if this timestamp was already sent
-
-    Returns
-    -------
-    bool — True if message was sent successfully, False if skipped or failed.
     """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("  [TG_Alert] Missing credentials — skipping.")
@@ -154,9 +158,7 @@ def send(tier: str, probability: float, timestamp: str, check_duplicate: bool = 
         print(f"  [TG_Alert] Unknown tier '{tier}' — skipping.")
         return False
 
-    prob_pct = f"{probability:.1%}"
-    final_message = template.format(prob_pct=prob_pct, timestamp=timestamp)
-
+    final_message = template.format(prob_pct=f"{probability:.1%}", timestamp=timestamp)
     success = send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, final_message)
 
     if success:
@@ -164,31 +166,45 @@ def send(tier: str, probability: float, timestamp: str, check_duplicate: bool = 
 
     return success
 
+
 # --- Main Execution ---
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Telegram alert channel.")
+    parser.add_argument(
+        "--csv", default=None, metavar="PATH",
+        help="Override the CSV file to read from (default: flood_rf_sensor_predictions.csv).",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Send the alert even if it was already sent for this timestamp.",
+    )
+    args = parser.parse_args()
+
     print("\n🚀 Starting Telegram Alert Routine...")
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("  ❌ Missing Telegram credentials in .env file.")
         exit(1)
 
-    prediction = read_latest_prediction()
+    prediction = read_latest_prediction(csv_path=args.csv)
     if not prediction:
         exit(1)
 
     tier = prediction["tier"]
     prob = prediction["probability"]
-    ts = prediction["timestamp"]
+    ts   = prediction["timestamp"]
 
     print(f"  ℹ️  Latest Data — Tier: {tier} | Prob: {prob:.1%} | Time: {ts}")
 
     if tier in SKIP_TIERS:
         print(f"  ⏭️  No alert needed — tier is {tier}.")
-        _save_last_sent(ts) 
+        _save_last_sent(ts)
         exit(0)
 
     last_sent = _load_last_sent()
-    if last_sent == ts:
+    if last_sent == ts and not args.force:  # Added "and not args.force"
         print(f"  ⏭️  Skipped — Telegram alert already sent for timestamp: {ts}")
         exit(0)
 

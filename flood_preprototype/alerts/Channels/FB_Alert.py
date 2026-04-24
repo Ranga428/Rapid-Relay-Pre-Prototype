@@ -39,6 +39,9 @@ Usage
     # Post from latest CSV row (real data, skips if already posted)
     python FB_Alert.py --post
 
+    # Post from a specific CSV file
+    python FB_Alert.py --post --csv path/to/custom.csv
+
     # Test manually with fake data (no duplicate check)
     python FB_Alert.py --test
     python FB_Alert.py --test --tier DANGER
@@ -68,8 +71,8 @@ TOKEN   = os.getenv("FB_PAGE_TOKEN")
 
 VERSION = "v23.0"
 
-# CSV is two levels up from this file, inside predictions/
-CSV_PATH = os.path.abspath(
+# Default CSV path — can be overridden via --csv flag or csv_path argument
+DEFAULT_CSV_PATH = os.path.abspath(
     os.path.join(
         SCRIPT_DIR, "..", "..",
         "predictions",
@@ -123,20 +126,11 @@ TIER_MESSAGE = {
 }
 
 
-# Tiers that carry no flood risk — skip posting entirely
-SKIP_TIERS = {"CLEAR", "LOW", "NORMAL"}
-
-
 def _load_last_posted() -> str | None:
-    """
-    Read last_posted.json and return the last posted timestamp string.
-    Returns None if the file doesn't exist or is unreadable.
-    """
     try:
         if not os.path.exists(STATE_PATH):
             return None
         with open(STATE_PATH, "r") as f:
-            import json
             data = json.load(f)
             return data.get("last_posted_timestamp")
     except Exception as e:
@@ -145,9 +139,7 @@ def _load_last_posted() -> str | None:
 
 
 def _save_last_posted(timestamp: str) -> None:
-    """Write the successfully posted timestamp to last_posted.json."""
     try:
-        import json
         with open(STATE_PATH, "w") as f:
             json.dump({"last_posted_timestamp": timestamp}, f, indent=2)
         print(f"  💾 State saved — last posted: {timestamp}")
@@ -156,7 +148,6 @@ def _save_last_posted(timestamp: str) -> None:
 
 
 def _check_credentials() -> bool:
-    """Verify PAGE_ID and TOKEN are loaded. Print helpful error if not."""
     if not PAGE_ID or not TOKEN:
         print("  ❌ Missing credentials.")
         print(f"  📂 .env path checked: {os.path.abspath(_ENV_PATH)}")
@@ -166,7 +157,6 @@ def _check_credentials() -> bool:
 
 
 def build_message(tier: str, probability: float, timestamp: str) -> str:
-    """Build the Facebook post message string for the given tier."""
     template = TIER_MESSAGE.get(tier, TIER_MESSAGE["WARNING"])
     return template.format(
         prob_pct  = f"{probability:.1%}",
@@ -174,21 +164,26 @@ def build_message(tier: str, probability: float, timestamp: str) -> str:
     )
 
 
-def read_latest_from_csv() -> dict | None:
+def read_latest_from_csv(csv_path: str = None) -> dict | None:
     """
     Read the last row (by timestamp) from the predictions CSV.
+
+    Parameters
+    ----------
+    csv_path : optional path to a CSV file. Defaults to DEFAULT_CSV_PATH.
 
     Returns a dict with keys: tier, probability, timestamp
     Returns None if the CSV is missing, empty, or malformed.
     """
-    print(f"  📂 CSV path: {CSV_PATH}")
+    path = csv_path or DEFAULT_CSV_PATH
+    print(f"  📂 CSV path: {path}")
 
-    if not os.path.exists(CSV_PATH):
+    if not os.path.exists(path):
         print("  ❌ CSV not found.")
         return None
 
     try:
-        df = pd.read_csv(CSV_PATH)
+        df = pd.read_csv(path)
 
         if df.empty:
             print("  ❌ CSV is empty.")
@@ -233,7 +228,6 @@ def send(tier: str, probability: float, timestamp: str, check_duplicate: bool = 
     if not _check_credentials():
         return False
 
-    # Non-alert tiers — log and skip without calling the API
     if tier in SKIP_TIERS:
         print(f"  ⏭️  No post needed — tier is {tier} (prob: {probability:.1%}, ts: {timestamp})")
         _save_last_posted(timestamp)
@@ -279,7 +273,7 @@ def send(tier: str, probability: float, timestamp: str, check_duplicate: bool = 
 
 
 # ---------------------------------------------------------------------------
-# CLI test
+# CLI
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -293,13 +287,21 @@ if __name__ == "__main__":
         choices=["WATCH", "WARNING", "DANGER"],
         help="Tier to use with --test (default: WARNING).",
     )
+    parser.add_argument(
+        "--csv", default=None, metavar="PATH",
+        help="Override the CSV file to read from (default: flood_rf_sensor_predictions.csv).",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Send the alert even if it was already sent for this timestamp.",
+    )
     args = parser.parse_args()
 
     if args.post:
         print(f"\n  🚀 FB_Alert --post — reading latest CSV row")
         print(f"  ℹ️  PAGE_ID loaded : {'✅' if PAGE_ID else '❌ MISSING'}")
         print(f"  ℹ️  TOKEN loaded   : {'✅' if TOKEN else '❌ MISSING'}")
-        row = read_latest_from_csv()
+        row = read_latest_from_csv(csv_path=args.csv)
         if row is None:
             print("\n  ❌ FAILED — could not read CSV.")
         else:
@@ -307,7 +309,7 @@ if __name__ == "__main__":
                 tier=row["tier"],
                 probability=row["probability"],
                 timestamp=row["timestamp"],
-                check_duplicate=True,
+                check_duplicate=not args.force,
             )
             print(f"\n  {'✅ SUCCESS' if ok else '❌ FAILED'}")
 
@@ -317,6 +319,8 @@ if __name__ == "__main__":
         print(f"  ℹ️  PAGE_ID loaded : {'✅' if PAGE_ID else '❌ MISSING'}")
         print(f"  ℹ️  TOKEN loaded   : {'✅' if TOKEN else '❌ MISSING'}")
         print(f"  📂 .env resolved  : {os.path.abspath(_ENV_PATH)}")
+        if args.csv:
+            print(f"  ℹ️  --csv ignored  : --test uses fake data, not CSV")
         ok = send(tier=args.tier, probability=0.55, timestamp=str(date.today()))
         print(f"\n  {'✅ SUCCESS' if ok else '❌ FAILED'}")
 

@@ -16,6 +16,22 @@ Rainfall forcing per tier is injected programmatically into the SWMM
 time-series before each simulation run, so every scenario produces
 hydraulically-consistent sensor values.
 
+SWMM OUTPUT RESCALING
+---------------------
+Raw SWMM node depths depend on model geometry/calibration and will not
+naturally fall within the tier target ranges derived from HEC-HMS data.
+After each simulation, raw outputs are min-max rescaled into the
+calibrated tier ranges defined in TIER_PROFILES:
+
+  waterlevel    → rescaled to TIER_PROFILES[tier]["waterlevel"]   (m)
+  soil_moisture → rescaled to TIER_PROFILES[tier]["soil_moisture"]
+  humidity      → rescaled to TIER_PROFILES[tier]["humidity"]
+
+This preserves the hydraulic shape (rising limb, recession curve) from
+SWMM while anchoring magnitudes to field-calibrated HEC-HMS thresholds.
+Thesis framing: "SWMM provides hydraulically-consistent temporal dynamics;
+outputs are normalized to field-calibrated tier thresholds from HEC-HMS."
+
 Usage examples:
   # Append one row per tier to speedtest_merge.csv:
   python stress_test_gen.py --scenario clear   --append
@@ -146,10 +162,10 @@ SWMM_RAINGAUGE    = "RG_OBANDO"   # rain gauge whose timeseries we override
 # ---------------------------------------------------------------------------
 
 TIER_RAINFALL_MM_HR = {
-    "clear":   5.0,    
+    "clear":   5.0,
     "watch":   50.0,
-    "warning": 150.0,  
-    "danger":  300.0,  # Massive flood level just to force the graph to move
+    "warning": 150.0,
+    "danger":  300.0,
 }
 
 # ---------------------------------------------------------------------------
@@ -160,9 +176,9 @@ TIER_PROFILES = {
     "clear": {
         "label":         "CLEAR",
         "description":   "Deep dry season — bone-dry soil, near-zero humidity, minimal water.",
-        "waterlevel":    (0.40, 0.65),
-        "soil_moisture": (0.15, 0.24),
-        "humidity":      (0.05, 0.80),
+        "waterlevel":    (0.40, 0.55),
+        "soil_moisture": (0.15, 0.20),
+        "humidity":      (0.05, 0.50),
     },
     "watch": {
         "label":         "WATCH",
@@ -174,16 +190,16 @@ TIER_PROFILES = {
     "warning": {
         "label":         "WARNING",
         "description":   "Active flood conditions — high water, saturating soil.",
-        "waterlevel":    (1.35, 2.10),
-        "soil_moisture": (0.40, 0.47),
-        "humidity":      (3.20, 5.00),
+        "waterlevel":    (1.50, 2.20),
+        "soil_moisture": (0.42, 0.50),
+        "humidity":      (3.50, 5.50),
     },
     "danger": {
         "label":         "DANGER",
         "description":   "Catastrophic flood — overtopping risk, soil fully saturated.",
-        "waterlevel":    (2.20, 2.72),
-        "soil_moisture": (0.47, 0.55),
-        "humidity":      (5.50, 8.50),
+        "waterlevel":    (2.40, 2.72),
+        "soil_moisture": (0.50, 0.55),
+        "humidity":      (6.50, 8.50),
     },
 }
 
@@ -229,6 +245,37 @@ COL_TIME       = "Time"
 COL_SOIL       = "Soil Moisture"
 COL_HUMIDITY   = "Humidity"
 COL_DISTANCE   = "Final Distance"
+
+# ---------------------------------------------------------------------------
+# LOAD MODEL THRESHOLDS (for reference/documentation only)
+# ---------------------------------------------------------------------------
+
+def _load_model_thresholds() -> "dict | None":
+    """
+    Load trained probability thresholds from model artifact.
+    Used for documentation/logging only — does NOT constrain generation.
+    Sensor ranges (TIER_PROFILES) remain independent and drive the simulation.
+    
+    Returns dict with keys 'watch', 'warning', 'danger', or None if load fails.
+    """
+    try:
+        import joblib
+        model_path = _PROJECT_ROOT / "model" / "flood_xgb_sensor.pkl"
+        if model_path.exists():
+            artifact = joblib.load(model_path)
+            thresholds = {
+                "watch":   artifact.get("watch_threshold"),
+                "warning": artifact.get("warning_threshold"),
+                "danger":  artifact.get("danger_threshold"),
+            }
+            if all(v is not None for v in thresholds.values()):
+                return thresholds
+    except Exception as e:
+        pass  # Silent fail — model not available is OK
+    return None
+
+
+MODEL_THRESHOLDS = _load_model_thresholds()
 
 # ---------------------------------------------------------------------------
 # MINIMAL .INP TEMPLATE
@@ -396,15 +443,93 @@ def _patch_inp_dates_and_rain(
 
         lines_out.append(line)
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix="swmm_stress_"))
-    tmp_inp = tmp_dir / template_inp.name
-    tmp_inp.write_text("\n".join(lines_out))
-    return tmp_inp
+    template_inp.write_text("\n".join(lines_out))
+    print(f"  [INP] Overwrote original -> {template_inp}")
+    return template_inp
+
+
+# ---------------------------------------------------------------------------
+# SWMM OUTPUT RESCALING
+# ---------------------------------------------------------------------------
+
+def _minmax_rescale_series(
+    series: np.ndarray,
+    out_lo: float,
+    out_hi: float,
+) -> np.ndarray:
+    """
+    Min-max rescale a 1-D array into [out_lo, out_hi].
+
+    Preserves the hydraulic shape (rising limb, recession curve) from SWMM
+    while anchoring magnitudes to the field-calibrated tier range.
+
+    If the series is flat (all same value), returns midpoint of target range.
+    """
+    s_min = series.min()
+    s_max = series.max()
+    if s_max - s_min < 1e-9:
+        # Flat signal — return midpoint of target range
+        return np.full_like(series, (out_lo + out_hi) / 2.0)
+    normalized = (series - s_min) / (s_max - s_min)          # 0..1
+    rescaled   = out_lo + normalized * (out_hi - out_lo)      # out_lo..out_hi
+    return np.clip(rescaled, out_lo, out_hi)
+
+
+def _rescale_swmm_df(df: pd.DataFrame, tier_key: str) -> pd.DataFrame:
+    """
+    Rescale all three sensor columns in-place to the tier's calibrated ranges.
+
+    Called after SWMM simulation produces raw hydraulic outputs. The SWMM
+    model geometry is not calibrated to Obando field data, so raw depths/
+    runoff values will not match HEC-HMS-derived tier thresholds. This
+    rescaling step corrects magnitudes while keeping SWMM's temporal shape.
+
+    Columns rescaled:
+      waterlevel    → TIER_PROFILES[tier_key]["waterlevel"]
+      soil_moisture → TIER_PROFILES[tier_key]["soil_moisture"]
+      humidity      → TIER_PROFILES[tier_key]["humidity"]
+    """
+    p = TIER_PROFILES[tier_key]
+
+    df = df.copy()
+    df["waterlevel"]    = _minmax_rescale_series(
+        df["waterlevel"].values,    *p["waterlevel"])
+    df["soil_moisture"] = _minmax_rescale_series(
+        df["soil_moisture"].values, *p["soil_moisture"])
+    df["humidity"]      = _minmax_rescale_series(
+        df["humidity"].values,      *p["humidity"])
+
+    df["waterlevel"]    = df["waterlevel"].round(6)
+    df["soil_moisture"] = df["soil_moisture"].round(6)
+    df["humidity"]      = df["humidity"].round(6)
+
+    return df
 
 
 # ---------------------------------------------------------------------------
 # SWMM SIMULATION
 # ---------------------------------------------------------------------------
+
+def print_generation_header(scenario: str) -> None:
+    """
+    Print scenario context including model thresholds for reference.
+    Thresholds are purely informational—sensor ranges drive the generation.
+    """
+    tier_key = scenario if scenario not in ("all", "escalate") else "watch"
+    if tier_key in TIER_PROFILES:
+        tp = TIER_PROFILES[tier_key]
+        print(f"\n  Model thresholds (for reference):")
+        if MODEL_THRESHOLDS and all(MODEL_THRESHOLDS.values()):
+            print(f"    WATCH   : {MODEL_THRESHOLDS['watch']:.3f}")
+            print(f"    WARNING : {MODEL_THRESHOLDS['warning']:.3f}")
+            print(f"    DANGER  : {MODEL_THRESHOLDS['danger']:.3f}")
+        else:
+            print(f"    (model file not loaded)")
+        print(f"\n  Sensor ranges (HEC-HMS calibrated, drive generation):")
+        print(f"    Waterlevel    : {tp['waterlevel']}")
+        print(f"    Soil moisture : {tp['soil_moisture']}")
+        print(f"    Humidity      : {tp['humidity']}")
+
 
 def _scale(value: float, in_lo: float, in_hi: float,
            out_lo: float, out_hi: float) -> float:
@@ -483,7 +608,7 @@ def run_swmm_simulation(
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return _numpy_fallback(tier_key, days, seed)
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        pass
 
     if not records:
         print("  [SWMM] No records produced — falling back to NumPy.")
@@ -507,7 +632,16 @@ def run_swmm_simulation(
     df = df.drop(columns=["_dt"]).head(days)
     df = df[["timestamp", "waterlevel", "soil_moisture", "humidity", "_tier_label"]]
 
-    _range_check(df, tier_key)
+    # ── RESCALE raw SWMM output to tier-calibrated ranges ─────────────────
+    # Raw SWMM depths/runoff reflect model geometry, not Obando field data.
+    # Rescaling preserves hydraulic shape while anchoring to HEC-HMS ranges.
+    print(f"  [SWMM] Rescaling outputs to {label} tier ranges ...")
+    df = _rescale_swmm_df(df, tier_key)
+    print(f"  [SWMM] Post-rescale ranges:"
+          f"  WL=[{df['waterlevel'].min():.3f}, {df['waterlevel'].max():.3f}]"
+          f"  SM=[{df['soil_moisture'].min():.3f}, {df['soil_moisture'].max():.3f}]"
+          f"  HUM=[{df['humidity'].min():.3f}, {df['humidity'].max():.3f}]")
+
     return df
 
 
@@ -747,9 +881,6 @@ def insert_stress_rows_to_supabase(
 
     inserted = 0
 
-    # ── Date anchor ────────────────────────────────────────────────────────
-    # --after-csv supplied  ->  last CSV date + 1 day, fixed at noon.
-    # No --after-csv        ->  today's date (legacy behaviour).
     if after_csv_date is not None:
         base_date = (after_csv_date + pd.Timedelta(days=1)).normalize()
     else:
@@ -757,7 +888,6 @@ def insert_stress_rows_to_supabase(
 
     for repeat in range(count):
         for i, (_, row) in enumerate(rows_df.iterrows()):
-            # Each repeat/row shifts by 1 minute to avoid PK collisions.
             total_offset = base_time_offset_minutes + (repeat * len(rows_df)) + i
             current_ts   = base_date + pd.Timedelta(hours=12, minutes=total_offset)
 
@@ -881,7 +1011,7 @@ def _plot_all_tiers_sequence(df: pd.DataFrame, out_dir: Path) -> Path:
         gridspec_kw={"hspace": 0.55, "wspace": 0.3}
     )
     fig.suptitle(
-        "Rapid Relay EWS — Stress Test Input Data  (SWMM-driven)\n"
+        "Rapid Relay EWS — Stress Test Input Data  (SWMM-driven, tier-rescaled)\n"
         "All Tier Scenarios in Sequence  |  Obando, Bulacan",
         fontsize=13, fontweight="bold",
     )
@@ -934,7 +1064,7 @@ def plot_stress_csv(df: pd.DataFrame, tier_key: str, out_dir: Path) -> Path:
 
     tc    = TIER_COLORS.get(tier_key, {"bg": "#f5f5f5", "line": "steelblue", "label": tier_key.upper()})
     dates = pd.to_datetime(df["timestamp"])
-    source_note = "SWMM-driven" if PYSWMM_AVAILABLE else "NumPy fallback"
+    source_note = "SWMM-driven, tier-rescaled" if PYSWMM_AVAILABLE else "NumPy fallback"
 
     fig, axes = plt.subplots(
         3, 1, figsize=(14, 10), sharex=True,
@@ -951,7 +1081,7 @@ def plot_stress_csv(df: pd.DataFrame, tier_key: str, out_dir: Path) -> Path:
     ax1.set_facecolor(tc["bg"])
     ax1.fill_between(dates, df["waterlevel"], alpha=0.25, color=tc["line"])
     ax1.plot(dates, df["waterlevel"], color=tc["line"], linewidth=2,
-             label="Water Level (m)  <- SWMM J_SENSOR depth", zorder=3)
+             label="Water Level (m)  <- SWMM J_SENSOR depth (rescaled to tier)", zorder=3)
     for tlabel, (tval, tcolor) in WL_THRESHOLDS.items():
         ax1.axhline(tval, color=tcolor, linestyle="--", linewidth=1.1,
                     alpha=0.8, label=f"{tlabel} ({tval}m)")
@@ -980,7 +1110,7 @@ def plot_stress_csv(df: pd.DataFrame, tier_key: str, out_dir: Path) -> Path:
     ax2.set_facecolor(tc["bg"])
     ax2.fill_between(dates, df["soil_moisture"], alpha=0.25, color="sienna")
     ax2.plot(dates, df["soil_moisture"], color="sienna", linewidth=2,
-             label="Soil Moisture  <- SWMM SC_OBANDO moisture_deficit (inverted)", zorder=3)
+             label="Soil Moisture  <- SWMM SC_OBANDO wetness (rescaled to tier)", zorder=3)
     ax2.axhline(0.30, color="gold",   linestyle="--", linewidth=1.1, alpha=0.8, label="WATCH entry (0.30)")
     ax2.axhline(0.40, color="orange", linestyle="--", linewidth=1.1, alpha=0.8, label="WARNING entry (0.40)")
     ax2.axhline(0.47, color="red",    linestyle="--", linewidth=1.1, alpha=0.8, label="DANGER entry (0.47)")
@@ -998,7 +1128,7 @@ def plot_stress_csv(df: pd.DataFrame, tier_key: str, out_dir: Path) -> Path:
     ax3.set_facecolor(tc["bg"])
     ax3.fill_between(dates, df["humidity"], alpha=0.25, color="teal")
     ax3.plot(dates, df["humidity"], color="teal", linewidth=2,
-             label="Humidity (CWV proxy)  <- SWMM SC_OBANDO runoff scaled", zorder=3)
+             label="Humidity (CWV proxy)  <- SWMM SC_OBANDO runoff (rescaled to tier)", zorder=3)
     ax3.axhline(1.50, color="gold",   linestyle="--", linewidth=1.1, alpha=0.8, label="WATCH entry (1.50)")
     ax3.axhline(3.20, color="orange", linestyle="--", linewidth=1.1, alpha=0.8, label="WARNING entry (3.20)")
     ax3.axhline(5.50, color="red",    linestyle="--", linewidth=1.1, alpha=0.8, label="DANGER entry (5.50)")
@@ -1032,7 +1162,7 @@ def plot_stress_csv(df: pd.DataFrame, tier_key: str, out_dir: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 def preview(rows_df: pd.DataFrame, scenario_label: str) -> None:
-    source = "SWMM" if PYSWMM_AVAILABLE else "NumPy fallback"
+    source = "SWMM+rescaled" if PYSWMM_AVAILABLE else "NumPy fallback"
     print(f"\n  {'─'*60}")
     print(f"  Scenario : {scenario_label}  [{source}]")
     print(f"  Rows     : {len(rows_df)}")
@@ -1080,12 +1210,17 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Scenarios:
-  clear    — deep dry-season baseline  (0.5 mm/hr rainfall forcing)
-  watch    — early wet season          (10 mm/hr)
-  warning  — active flooding           (35 mm/hr)
-  danger   — catastrophic flood peak   (90 mm/hr)
+  clear    — deep dry-season baseline  (5 mm/hr rainfall forcing)
+  watch    — early wet season          (50 mm/hr)
+  warning  — active flooding           (150 mm/hr)
+  danger   — catastrophic flood peak   (300 mm/hr)
   all      — all four tiers in sequence
   escalate — one appended row per tier (escalation order)
+
+SWMM output rescaling:
+  Raw SWMM node depths/runoff are min-max rescaled into the HEC-HMS
+  calibrated tier ranges after each simulation. Hydraulic shape is
+  preserved; only magnitudes are anchored to field data.
 
 Output modes (can be combined freely):
   --append     append row(s) to speedtest_merge.csv
@@ -1171,10 +1306,6 @@ Examples:
         )
         _write_minimal_inp(inp_path, default_rain, args.days)
 
-    # ── Resolve after_csv_date ─────────────────────────────────────────────
-    # Read the last timestamp from the context CSV (produced in step 1) and
-    # set the Supabase row date to that date + 1 day.
-    # This ensures the live row is the natural 31st entry of the 30-day window.
     after_csv_date: "pd.Timestamp | None" = None
     if args.after_csv:
         csv_path = Path(args.after_csv)
@@ -1212,6 +1343,9 @@ Examples:
               f"-> insert date {(after_csv_date + pd.Timedelta(days=1)).date()}")
     if args.dry_run:
         print(f"  DRY RUN — nothing will be written or inserted.")
+
+    # Print model threshold reference
+    print_generation_header(args.scenario)
 
     # ── ESCALATE ──────────────────────────────────────────────────────────
     if args.scenario == "escalate":

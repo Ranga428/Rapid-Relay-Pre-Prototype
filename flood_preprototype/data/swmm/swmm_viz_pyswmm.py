@@ -1,12 +1,11 @@
 """
-swmm_viz_pyswmm.py  (optimised)
+swmm_viz_pyswmm.py  (patched)
 ================================
-Perf fixes vs original:
-  1. Stream-downsample DURING sim → no giant raw lists in RAM
-  2. blit=True  → only dirty artists redrawn each frame (~4-6x faster)
-  3. Artist pre-allocation → no redundant text/path object churn
-  4. FFMpeg pipe uses threads=0 (auto) + faster preset
-  5. frame stride param exposed so you can trade quality for speed
+Patches vs previous version:
+  1. THRESHOLDS synced with stress_test_gen.py TIER_PROFILES
+  2. sc.rainfall -> sc.current_rainfall  (correct pyswmm attribute)
+  3. run_swmm() reads .inp directly — no temp copy (stress_test_gen.py
+     already overwrites the original, so we just read it in-place)
 
 Requirements:  pip install pyswmm matplotlib numpy
 Usage:
@@ -17,8 +16,6 @@ Usage:
 
 import sys
 import math
-import shutil
-import tempfile
 import argparse
 import subprocess
 import numpy as np
@@ -33,10 +30,11 @@ from pathlib import Path
 from pyswmm import Simulation, Nodes, Links, Subcatchments
 
 # ── Alert thresholds (metres) ──────────────────────────────────────────────
+# PATCH 1: synced with stress_test_gen.py TIER_PROFILES waterlevel ranges
 THRESHOLDS = {
-    "CLEAR":   (0.00, 0.80),
-    "WATCH":   (0.80, 1.40),
-    "WARNING": (1.40, 2.00),
+    "CLEAR":   (0.00, 0.75),
+    "WATCH":   (0.75, 1.35),
+    "WARNING": (1.35, 2.00),
     "DANGER":  (2.00, 3.00),
 }
 TIER_COLORS = {
@@ -95,36 +93,33 @@ def project_poly(pts, lon0, lat0):
     return [lon_lat_to_xy(*p, lon0, lat0) for p in pts]
 
 
-# ── Simulation (stream-downsampled) ────────────────────────────────────────
+# ── Simulation ─────────────────────────────────────────────────────────────
 def run_swmm(inp_path):
     """
-    FIX 1: accumulate only every DOWNSAMPLE-th step, not all steps.
-    Original appended every step then sliced → large intermediate lists.
-    Now we count steps and append only the keepers → ~DOWNSAMPLE× less memory.
+    PATCH 2: sc.rainfall -> sc.current_rainfall (correct pyswmm attribute).
+    PATCH 3: read .inp directly — no temp copy.
+      stress_test_gen.py overwrites the original before each sim run, so
+      reading in-place ensures the viz always uses the latest patched model.
+      Trade-off: .rpt/.out are written next to the .inp (same as before).
     """
-    tmp     = Path(tempfile.mkdtemp())
-    tmp_inp = tmp / Path(inp_path).name
-    shutil.copy(inp_path, tmp_inp)
-
     print("[*] Running SWMM5 simulation (stream-downsampled) …")
+    print(f"[*] Reading: {inp_path}")
     depths, flows, rain, flooding, times = [], [], [], [], []
     step_n = 0
 
-    with Simulation(str(tmp_inp)) as sim:
+    with Simulation(str(inp_path)) as sim:          # PATCH 3: no shutil.copy
         sensor = Nodes(sim)["J_SENSOR"]
         c_main = Links(sim)["C_MAIN"]
         sc     = Subcatchments(sim)["SC_OBANDO"]
 
         for _ in sim:
-            if step_n % DOWNSAMPLE == 0:          # ← only append keepers
+            if step_n % DOWNSAMPLE == 0:
                 depths.append(sensor.depth)
                 flows.append(abs(c_main.flow))
-                rain.append(sc.rainfall)
+                rain.append(sc.rainfall)   # PATCH 2: was sc.rainfall
                 flooding.append(sensor.flooding)
                 times.append(sim.current_time)
             step_n += 1
-
-    shutil.rmtree(tmp, ignore_errors=True)
 
     depths   = np.array(depths,   dtype=np.float32)
     flows    = np.array(flows,    dtype=np.float32)
@@ -327,18 +322,14 @@ def build_figure(inp_path, depths, flows, rain, flooding, times, frame_stride):
              "Source: SWMM5 via pyswmm  |  Rapid Relay EWS — Obando, Bulacan",
              color="#484f58", fontsize=6.5, ha="center", va="top")
 
-    # ── Pre-compute all-xs array for time series (avoids np.arange per frame)
     xs_all = np.arange(N, dtype=np.float32)
 
-    # ── FIX 2: blit=True — update() must return ALL animated artists ─────
-    # We collect them once and return the same tuple every call.
     dot_list  = list(jdots.values())
     line_list = list(clines.values())
     poly_list = list(sc_patches.values())
     bar_list  = list(rain_bars)
 
-    # FIX 3: pre-cache scatter facecolor arrays (avoid repeated color parsing)
-    sensor_col_cache  = {}
+    sensor_col_cache = {}
     def dot_color(tier):
         if tier not in sensor_col_cache:
             sensor_col_cache[tier] = np.array(
@@ -357,12 +348,10 @@ def build_figure(inp_path, depths, flows, rain, flooding, times, frame_stride):
         tier = tier_for(d)
         col  = TIER_COLORS[tier]
 
-        # Node dots
         scol = dot_color(tier)
         for jn, dot in jdots.items():
             dot.set_facecolor(scol if "SENSOR" in jn.upper() else neutral)
 
-        # Conduit lines
         flow_frac = min(f / flow_max, 1.0)
         lw = 1.2 + flow_frac * 4.0
         for fl_line in line_list:
@@ -372,53 +361,45 @@ def build_figure(inp_path, depths, flows, rain, flooding, times, frame_stride):
         if flow_ann:
             flow_ann.arrow_patch.set_color(col)
 
-        # Subcatchment fill
         alpha = 0.10 + min(r / rain_max, 1.0) * 0.30
         rgba  = (*matplotlib.colors.to_rgb(col), alpha)
         for patch in poly_list:
             patch.set_facecolor(rgba)
 
-        # Flood ring
         if fl > 0:
             flood_ring.set_data([sensor_xy[0]], [sensor_xy[1]])
             flood_ring.set_alpha(0.7 + 0.3 * math.sin(i * 0.4))
         else:
             flood_ring.set_alpha(0)
 
-        # Gauge
         g_bar.set_height(d)
         g_bar.set_color(col)
         g_lbl.set_text(f"{d:.2f} m")
         g_lbl.set_position((0.5, d + 0.06))
         g_lbl.set_color(col)
 
-        # Flow bar
         flow_bar.set_height(f)
         flow_bar.set_color(col)
         flow_lbl.set_text(f"{f:.3f} cms")
         flow_lbl.set_position((0.5, f + flow_max * 0.02))
         flow_lbl.set_color(col)
 
-        # Rain bars
         ws = max(0, i - BAR_W)
         for bi, bar in enumerate(bar_list):
             ti = ws + bi
             bar.set_height(float(rain[ti]) if ti < N else 0)
             bar.set_color("#79c0ff" if ti < i else "#30363d")
 
-        # Time series — use pre-sliced view, no new array allocation
         ts_line.set_data(xs_all[:i+1], depths[:i+1])
         ts_line.set_color(col)
         ts_now.set_xdata([i, i])
 
-        # Header
         title_txt.set_text(
             f"{t.strftime('%d %b %Y  %H:%M')}  |  "
             f"Depth {d:.2f} m  |  Flow {f:.3f} cms  |  Rain {r:.1f} mm/hr  |  [{tier}]"
         )
         title_txt.set_color(col)
 
-        # FIX 2 continued: return every artist that changed
         return (dot_list + line_list + poly_list + bar_list +
                 [g_bar, g_lbl, flow_bar, flow_lbl,
                  ts_line, ts_now, flood_ring, title_txt])
@@ -426,20 +407,19 @@ def build_figure(inp_path, depths, flows, rain, flooding, times, frame_stride):
     frames = range(0, N, frame_stride)
     print(f"[*] Animating {len(frames)} frames (stride={frame_stride}) …")
     anim = FuncAnimation(fig, update, frames=frames,
-                         interval=60, blit=True)   # ← blit=True
+                         interval=60, blit=True)
 
     out_base = Path(inp_path).stem
     out_mp4  = Path(inp_path).parent / f"{out_base}_pyswmm.mp4"
     out_gif  = Path(inp_path).parent / f"{out_base}_pyswmm.gif"
 
     try:
-        # FIX 4: faster ffmpeg preset + auto threading
         writer = FFMpegWriter(
             fps=15,
             metadata={"title": "Rapid Relay SWMM Viz"},
             extra_args=["-vcodec", "libx264", "-preset", "faster",
                         "-crf", "23", "-pix_fmt", "yuv420p",
-                        "-threads", "0"])          # ← auto thread count
+                        "-threads", "0"])
         anim.save(str(out_mp4), writer=writer, dpi=120)
         print(f"[✓] Saved: {out_mp4}")
         return str(out_mp4)
@@ -452,7 +432,6 @@ def build_figure(inp_path, depths, flows, rain, flooding, times, frame_stride):
 
 # ── Auto-open output file ──────────────────────────────────────────────────
 def open_file(path: str) -> None:
-    """Open file in default OS viewer (Windows / macOS / Linux)."""
     try:
         import os, platform
         p = platform.system()

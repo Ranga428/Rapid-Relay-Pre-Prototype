@@ -33,7 +33,8 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 # =========================================================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-CSV_PATH = os.path.abspath(
+# Default CSV path — can be overridden via --csv flag or csv_path argument
+DEFAULT_CSV_PATH = os.path.abspath(
     os.path.join(
         SCRIPT_DIR,
         "..", "..",
@@ -47,16 +48,24 @@ BATCH_SIZE = 500  # safe batch size for Supabase
 # =========================================================
 # SYNC CSV → SUPABASE (FULL UPSERT)
 # =========================================================
-def sync_predictions_to_supabase():
+def sync_predictions_to_supabase(csv_path: str = None):
+    """
+    Full sync: upsert all rows from the CSV into Supabase.
+
+    Parameters
+    ----------
+    csv_path : optional path to a CSV file. Defaults to DEFAULT_CSV_PATH.
+    """
+    path = csv_path or DEFAULT_CSV_PATH
     try:
         print("  🚀 Starting full sync operation")
-        print("  📂 CSV PATH:", CSV_PATH)
+        print("  📂 CSV PATH:", path)
 
-        if not os.path.exists(CSV_PATH):
+        if not os.path.exists(path):
             print("  ❌ CSV not found")
             return
 
-        df = pd.read_csv(CSV_PATH)
+        df = pd.read_csv(path)
 
         if df.empty:
             print("  ⚠️ CSV is empty")
@@ -64,16 +73,13 @@ def sync_predictions_to_supabase():
 
         print(f"  📊 CSV rows loaded: {len(df)}")
 
-        # Validate columns
         required_cols = ["timestamp", "flood_probability", "risk_tier"]
         for col in required_cols:
             if col not in df.columns:
                 raise ValueError(f"Missing column: {col}")
 
-        # Convert timestamp (timezone-safe)
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
-        # Build records
         records = []
         for _, row in df.iterrows():
             records.append({
@@ -84,16 +90,12 @@ def sync_predictions_to_supabase():
 
         print(f"  🚀 Preparing to sync {len(records)} rows")
 
-        # Batch UPSERT
         total_inserted = 0
-
         for i in range(0, len(records), BATCH_SIZE):
             batch = records[i:i + BATCH_SIZE]
-
             supabase.table("flood_predictions") \
                 .upsert(batch, on_conflict="timestamp") \
                 .execute()
-
             total_inserted += len(batch)
             print(f"  ✓ Batch inserted: {total_inserted}/{len(records)}")
 
@@ -106,33 +108,38 @@ def sync_predictions_to_supabase():
 # SYNC CSV → SUPABASE (NEW ROW UPSERT)
 # =========================================================
 
-def append_new_predictions_to_supabase():
+def append_new_predictions_to_supabase(csv_path: str = None):
+    """
+    Append-only sync: insert only rows not already in Supabase.
+
+    Parameters
+    ----------
+    csv_path : optional path to a CSV file. Defaults to DEFAULT_CSV_PATH.
+    """
+    path = csv_path or DEFAULT_CSV_PATH
     try:
         print("  🚀 Starting append operation (new rows only)")
-        print("  📂 CSV PATH:", CSV_PATH)
+        print("  📂 CSV PATH:", path)
 
-        if not os.path.exists(CSV_PATH):
+        if not os.path.exists(path):
             print("  ❌ CSV not found")
             return
 
-        df = pd.read_csv(CSV_PATH)
+        df = pd.read_csv(path)
         if df.empty:
             print("  ⚠️ CSV is empty")
             return
 
         print(f"  📊 CSV rows loaded: {len(df)}")
 
-        # Validate columns
         required_cols = ["timestamp", "flood_probability", "risk_tier"]
         for col in required_cols:
             if col not in df.columns:
                 raise ValueError(f"Missing column: {col}")
 
-        # Convert timestamp
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         df["timestamp_iso"] = df["timestamp"].apply(lambda ts: ts.isoformat())
 
-        # Fetch existing timestamps from Supabase
         existing = supabase.table("flood_predictions") \
             .select("timestamp") \
             .execute()
@@ -140,7 +147,6 @@ def append_new_predictions_to_supabase():
         existing_timestamps = {row["timestamp"] for row in existing.data}
         print(f"  ℹ️ Existing records in Supabase: {len(existing_timestamps)}")
 
-        # Filter new rows only
         new_rows = df[~df["timestamp_iso"].isin(existing_timestamps)]
         if new_rows.empty:
             print("  ✅ No new rows to insert")
@@ -148,7 +154,6 @@ def append_new_predictions_to_supabase():
 
         print(f"  🚀 New rows to insert: {len(new_rows)}")
 
-        # Build records
         records = []
         for _, row in new_rows.iterrows():
             records.append({
@@ -157,7 +162,6 @@ def append_new_predictions_to_supabase():
                 "risk_tier": row["risk_tier"]
             })
 
-        # Batch insert
         total_inserted = 0
         for i in range(0, len(records), BATCH_SIZE):
             batch = records[i:i + BATCH_SIZE]
@@ -179,20 +183,14 @@ if __name__ == "__main__":
 
     parser.add_argument("--sync", action="store_true",
                         help="Perform full CSV → Supabase sync (UPSERT)")
-    
+    parser.add_argument(
+        "--csv", default=None, metavar="PATH",
+        help="Override the CSV file to read from (default: flood_xgb_sensor_predictions.csv).",
+    )
+
     args = parser.parse_args()
 
     if args.sync:
-        sync_predictions_to_supabase()
+        sync_predictions_to_supabase(csv_path=args.csv)
     else:
-        append_new_predictions_to_supabase()
-
-    #sync_predictions_to_supabase()
-    #append_new_predictions_to_supabase()
-
-    # Comment this out in production
-    #send_to_supabase(
-   #    tier="WARNING",
-   #     probability=0.82,
-   #     timestamp="2025-07-01"
-   # )
+        append_new_predictions_to_supabase(csv_path=args.csv)

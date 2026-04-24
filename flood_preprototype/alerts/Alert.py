@@ -112,7 +112,7 @@ CHANNELS = [
 ]
 
 
-def dispatch_alert(tier: str, probability: float, timestamp: str) -> dict:
+def dispatch_alert(tier: str, probability: float, timestamp: str, force: bool = False) -> dict:
     """
     Fire all configured alert channels for the given prediction.
 
@@ -121,6 +121,7 @@ def dispatch_alert(tier: str, probability: float, timestamp: str) -> dict:
     tier        : "CLEAR", "WATCH", "WARNING", or "DANGER"
     probability : float 0.0-1.0
     timestamp   : date string e.g. "2025-07-14"
+    force       : bool, whether to send the alert even if it was already sent for this timestamp
 
     Returns
     -------
@@ -147,7 +148,7 @@ def dispatch_alert(tier: str, probability: float, timestamp: str) -> dict:
                     tier=tier,
                     probability=probability,
                     timestamp=timestamp,
-                    check_duplicate=True,
+                    check_duplicate=not force,
                 )
             else:
                 results[label] = module.send(
@@ -163,11 +164,20 @@ def dispatch_alert(tier: str, probability: float, timestamp: str) -> dict:
     if tier in ALERT_TIERS:
         for label, module in CHANNELS:
             try:
-                results[label] = module.send(
-                    tier=tier,
-                    probability=probability,
-                    timestamp=timestamp,
-                )
+                # Add check specifically for Telegram to pass the force flag
+                if label == "telegram":
+                    results[label] = module.send(
+                        tier=tier,
+                        probability=probability,
+                        timestamp=timestamp,
+                        check_duplicate=not force, # Bypasses the duplicate check if force=True
+                    )
+                else:
+                    results[label] = module.send(
+                        tier=tier,
+                        probability=probability,
+                        timestamp=timestamp,
+                    )
             except Exception as e:
                 print(f"  [Alert] {label} raised an exception: {e}")
                 results[label] = False
@@ -188,10 +198,24 @@ def dispatch_alert(tier: str, probability: float, timestamp: str) -> dict:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import argparse
     from Channels.FB_Alert import read_latest_from_csv
 
+    parser = argparse.ArgumentParser(description="Rapid Relay — Alert dispatcher")
+    parser.add_argument(
+        "--csv", default=None, metavar="PATH",
+        help="Override CSV to read latest prediction from.",
+    )
+    # 1. Add the force argument here
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Force send the alert to Telegram even if already sent.",
+    )
+    args = parser.parse_args()
+    csv_path = os.path.abspath(args.csv) if args.csv else None
+
     print("\n  🚀 Alert.py — reading latest CSV row")
-    row = read_latest_from_csv()
+    row = read_latest_from_csv(csv_path=csv_path)
 
     if row is None:
         print("  ❌ Could not read CSV. Aborting.")
@@ -200,6 +224,7 @@ if __name__ == "__main__":
             tier=row["tier"],
             probability=row["probability"],
             timestamp=row["timestamp"],
+            force=args.force, # 2. Pass it into the function
         )
         print(f"\n  Channel results:")
         for ch, ok in results.items():
